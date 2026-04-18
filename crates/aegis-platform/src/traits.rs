@@ -7,6 +7,32 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlatformTarget {
+    Windows,
+    Linux,
+    Macos,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelTransport {
+    Driver,
+    EBpf,
+    SystemExtension,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlatformDescriptor {
+    pub target: PlatformTarget,
+    pub kernel_transport: KernelTransport,
+    pub degrade_levels: u8,
+    pub supports_registry: bool,
+    pub supports_amsi: bool,
+    pub supports_etw_integrity: bool,
+    pub supports_bpf_integrity: bool,
+    pub supports_container_sensor: bool,
+}
+
 pub trait PlatformSensor: Send + Sync {
     fn start(&mut self, config: &SensorConfig) -> Result<()>;
     fn stop(&mut self) -> Result<()>;
@@ -47,4 +73,10 @@ pub trait PlatformProtection: Send + Sync {
     fn check_etw_integrity(&self) -> Result<EtwStatus>;
     fn check_amsi_integrity(&self) -> Result<AmsiStatus>;
     fn check_bpf_integrity(&self) -> Result<BpfStatus>;
+}
+
+pub trait PlatformRuntime:
+    PlatformSensor + PlatformResponse + PreemptiveBlock + KernelIntegrity + PlatformProtection
+{
+    fn descriptor(&self) -> PlatformDescriptor;
 }

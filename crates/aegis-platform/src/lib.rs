@@ -1,7 +1,8 @@
 mod mock;
 mod traits;
 
-pub use mock::MockPlatform;
+pub use mock::{MockAction, MockPlatform};
 pub use traits::{
-    KernelIntegrity, PlatformProtection, PlatformResponse, PlatformSensor, PreemptiveBlock,
+    KernelIntegrity, KernelTransport, PlatformDescriptor, PlatformProtection, PlatformResponse,
+    PlatformRuntime, PlatformSensor, PlatformTarget, PreemptiveBlock,
 };
