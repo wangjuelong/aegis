@@ -50,6 +50,11 @@
   - `agent.db` 版本元数据
   - migration 目录与执行器
 - 依赖：P01
+- 完成记录（2026-04-18）：
+  - 已建立 `AgentConfig` / `PolicyVersion` / `ConfVersion` / `StorageConfig` / `RuntimeConfig`
+  - 已建立 `AgentDb`、`schema_migrations`、`schema_metadata` 与 `active_config` / `config_snapshots`
+  - 已建立 `crates/aegis-core/migrations/0001_agent_base.sql`
+  - 已通过配置 roundtrip、非法 `conf_version`、schema migration 与配置落库测试
 
 ### P03：统一事件模型与 Lineage 模型
 
