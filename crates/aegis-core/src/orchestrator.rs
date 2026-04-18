@@ -64,4 +64,3 @@ mod tests {
         assert_eq!(summary.tenant_id, "local-tenant");
     }
 }
-

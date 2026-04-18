@@ -6,4 +6,3 @@ fn main() -> Result<()> {
     info!("aegis-watchdog skeleton started");
     Ok(())
 }
-

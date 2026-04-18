@@ -48,4 +48,3 @@ pub trait PlatformProtection: Send + Sync {
     fn check_amsi_integrity(&self) -> Result<AmsiStatus>;
     fn check_bpf_integrity(&self) -> Result<BpfStatus>;
 }
-

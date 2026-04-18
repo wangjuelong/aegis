@@ -241,4 +241,3 @@ pub struct AgentHealth {
     pub dropped_events_total: u64,
     pub lineage_counters: LineageCounters,
 }
-

@@ -166,4 +166,3 @@ impl PlatformProtection for MockPlatform {
         Ok(BpfStatus { healthy: true })
     }
 }
-
