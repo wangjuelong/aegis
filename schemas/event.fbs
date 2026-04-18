@@ -1,0 +1,18 @@
+namespace aegis.sensor;
+
+table EventHeader {
+  version:uint16;
+  event_type:uint16;
+  priority:uint16;
+  payload_len:uint32;
+  sequence_id:uint64;
+  timestamp_ns:uint64;
+}
+
+table RawEvent {
+  header:EventHeader;
+  payload:[ubyte];
+}
+
+root_type RawEvent;
+

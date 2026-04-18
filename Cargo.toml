@@ -1,0 +1,27 @@
+[workspace]
+members = [
+  "crates/aegis-agentd",
+  "crates/aegis-core",
+  "crates/aegis-model",
+  "crates/aegis-platform",
+  "crates/aegis-updater",
+  "crates/aegis-watchdog",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.82"
+version = "0.1.0"
+license = "Apache-2.0"
+authors = ["wangjuelong <juelongwang@163.com>"]
+
+[workspace.dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+uuid = { version = "1.11", features = ["serde", "v7"] }
+
