@@ -78,6 +78,11 @@
   - 核心 channel 连接
   - health / config / comms / response 任务入口
 - 依赖：P01、P02、P03
+- 完成记录（2026-04-18）：
+  - 已建立 `BootstrapArtifacts`、发送/接收端拆分与运行时队列容量拓扑
+  - 已建立 `sensor-dispatch`、`comms-tx-high`、`comms-tx-normal`、`telemetry-drain`、`response-executor`、`health-reporter`、`config-watcher`
+  - 已建立 `RuntimeHandle` 与优雅退出流程，并接入 `agentd` 启停骨架
+  - 已通过 runtime bootstrap 与 graceful shutdown 测试
 
 ### P05：Ring Buffer / Spill / Dispatch 基础实现
 
