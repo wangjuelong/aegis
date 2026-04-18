@@ -20,6 +20,7 @@ authors = ["wangjuelong <juelongwang@163.com>"]
 anyhow = "1.0"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 thiserror = "2.0"
 tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
 toml = "0.8"

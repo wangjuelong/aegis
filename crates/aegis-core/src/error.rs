@@ -14,6 +14,9 @@ pub enum CoreError {
     #[error("config serialize failed: {0}")]
     ConfigSerialize(#[from] toml::ser::Error),
 
+    #[error("json serialization failed: {0}")]
+    Json(#[from] serde_json::Error),
+
     #[error("sqlite failed: {0}")]
     Sqlite(#[from] rusqlite::Error),
 

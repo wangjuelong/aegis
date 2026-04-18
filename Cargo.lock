@@ -21,6 +21,7 @@ dependencies = [
  "anyhow",
  "rusqlite",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "toml",
