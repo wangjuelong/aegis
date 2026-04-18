@@ -35,6 +35,11 @@
   - proto 与 flatbuffers schema 骨架
   - 基础 CI / Makefile / `.gitignore`
 - 依赖：P00
+- 完成记录（2026-04-18）：
+  - 已建立 `Cargo` workspace 与 `agentd` / `watchdog` / `updater` 二进制骨架
+  - 已建立 `aegis-model` / `aegis-platform` / `aegis-core` 基础 crate 与平台 trait/mock harness
+  - 已建立 `proto/agent/v1/agent_service.proto` 与 `schemas/event.fbs`
+  - 已通过 `cargo check --workspace` 与 `cargo test --workspace`
 
 ### P02：统一配置模型与 Schema 版本框架
 

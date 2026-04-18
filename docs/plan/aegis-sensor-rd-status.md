@@ -11,8 +11,8 @@
 | 工作包 | 名称 | 状态 | 备注 |
 |--------|------|------|------|
 | P00 | 详细计划与执行基线 | done | 已完成详细分解与执行状态文档 |
-| P01 | Rust Workspace 与基础工程骨架 | doing | 当前正在落地 |
-| P02 | 统一配置模型与 Schema 版本框架 | todo | 依赖 P01 |
+| P01 | Rust Workspace 与基础工程骨架 | done | 已建立 workspace、基础 crate、proto/schema 骨架，并通过 `cargo check --workspace` 与 `cargo test --workspace` |
+| P02 | 统一配置模型与 Schema 版本框架 | doing | 当前进入配置模型、schema 版本与迁移框架实现 |
 | P03 | 统一事件模型与 Lineage 模型 | todo | 依赖 P01 |
 | P04 | Core Orchestrator 与通道拓扑 | todo | 依赖 P01-P03 |
 | P05 | Ring Buffer / Spill / Dispatch 基础实现 | todo | 依赖 P03-P04 |
