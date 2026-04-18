@@ -122,6 +122,11 @@
   - mock 实现
   - 契约测试
 - 依赖：P01、P03
+- 完成记录（2026-04-18）：
+  - 已建立 `PlatformDescriptor`、`PlatformTarget`、`KernelTransport`、`PlatformRuntime`
+  - 已将 `MockPlatform` 扩展为可注入事件、记录动作、返回隐藏进程和导出 descriptor
+  - 已建立 Windows/Linux/macOS 三类 mock descriptor
+  - 已通过事件注入、响应动作记录、隐藏进程返回等平台层测试
 
 ### P08：Windows 平台采集基线
 
