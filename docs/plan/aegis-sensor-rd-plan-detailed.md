@@ -107,6 +107,12 @@
   - `AdaptiveWhitelist`
   - `HealthReporter`
 - 依赖：P04、P05
+- 完成记录（2026-04-18）：
+  - 已建立 `ProcessTree`，支持进程创建、退出、祖先链与快照
+  - 已建立 `HashCache` / `HashingPolicy`，支持 SHA-256 与阈值内 BLAKE3 预筛
+  - 已建立 `AdaptiveWhitelist`，支持 TTL 清理与容量淘汰
+  - 已建立 `HealthReporter`，支持以 lineage counter 生成健康快照
+  - 已通过进程树、哈希缓存、自适应白名单、健康快照测试
 
 ### P07：平台 Trait 细化与 Mock Harness
 

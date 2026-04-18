@@ -16,8 +16,8 @@
 | P03 | 统一事件模型与 Lineage 模型 | done | 已建立统一事件/遥测/故事线/富化/lineage checkpoint 模型，并通过模型层测试 |
 | P04 | Core Orchestrator 与通道拓扑 | done | 已建立运行时通道、后台任务拓扑、shutdown 协调器，并通过运行时测试 |
 | P05 | Ring Buffer / Spill / Dispatch 基础实现 | done | 已建立 4-lane 缓冲、Spill 存储、dispatch 转换与恢复测试 |
-| P06 | ProcessTree / Hashing / AdaptiveWhitelist / Health | doing | 当前进入进程树、哈希缓存、反馈白名单与健康指标基础实现 |
-| P07 | 平台 Trait 细化与 Mock Harness | todo | 依赖 P01 |
+| P06 | ProcessTree / Hashing / AdaptiveWhitelist / Health | done | 已建立进程树、哈希缓存、自适应白名单与健康快照模块，并通过模块测试 |
+| P07 | 平台 Trait 细化与 Mock Harness | doing | 当前进入平台 trait 能力细化与 mock harness 收口 |
 | P08 | Windows 平台采集基线 | todo | 依赖 P07 |
 | P09 | Linux 平台采集基线 | todo | 依赖 P07 |
 | P10 | macOS 平台采集基线 | todo | 依赖 P07 |
