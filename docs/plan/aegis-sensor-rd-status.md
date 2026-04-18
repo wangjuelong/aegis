@@ -13,8 +13,8 @@
 | P00 | 详细计划与执行基线 | done | 已完成详细分解与执行状态文档 |
 | P01 | Rust Workspace 与基础工程骨架 | done | 已建立 workspace、基础 crate、proto/schema 骨架，并通过 `cargo check --workspace` 与 `cargo test --workspace` |
 | P02 | 统一配置模型与 Schema 版本框架 | done | 已建立 `AgentConfig`、`conf_version`、`agent.db` schema metadata、迁移执行器，并通过配置/迁移测试 |
-| P03 | 统一事件模型与 Lineage 模型 | doing | 当前进入统一事件、遥测、storyline 与 lineage checkpoint 模型细化 |
-| P04 | Core Orchestrator 与通道拓扑 | todo | 依赖 P01-P03 |
+| P03 | 统一事件模型与 Lineage 模型 | done | 已建立统一事件/遥测/故事线/富化/lineage checkpoint 模型，并通过模型层测试 |
+| P04 | Core Orchestrator 与通道拓扑 | doing | 当前进入主事件循环、任务编排与 graceful shutdown 结构化实现 |
 | P05 | Ring Buffer / Spill / Dispatch 基础实现 | todo | 依赖 P03-P04 |
 | P06 | ProcessTree / Hashing / AdaptiveWhitelist / Health | todo | 依赖 P04-P05 |
 | P07 | 平台 Trait 细化与 Mock Harness | todo | 依赖 P01 |

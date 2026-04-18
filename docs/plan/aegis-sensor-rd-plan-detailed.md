@@ -64,6 +64,11 @@
   - ECS/OCSF 兼容字段骨架
   - lineage checkpoint 类型
 - 依赖：P01
+- 完成记录（2026-04-18）：
+  - 已建立 `HostContext`、多态 `EventPayload`、`EventEnrichment`、`SyscallOrigin`
+  - 已建立 `NormalizedEvent` / `TelemetryEvent` / `Storyline` / `StorylineContext`
+  - 已建立 `LineageTrace`、`LineageCheckpoint`、`LineageCounters` 与 `TelemetryIntegrity`
+  - 已通过统一事件构造与遥测转换测试
 
 ### P04：Core Orchestrator 与通道拓扑
 
