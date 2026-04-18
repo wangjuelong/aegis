@@ -92,6 +92,11 @@
   - spill 存储布局
   - `SensorDispatch`
 - 依赖：P03、P04
+- 完成记录（2026-04-18）：
+  - 已建立 `FourLaneBuffer` 与 `LanePriority`，支持高优先级优先消费
+  - 已建立 `SpillStore`，按 lane 持久化 `jsonl` overflow 记录
+  - 已建立 `RawSensorEvent` 与 `SensorDispatch`，支持 raw → normalized 转换与 spill recover
+  - 已通过优先级消费、溢出 spill、spill recover 测试
 
 ### P06：ProcessTree / Hashing / AdaptiveWhitelist / Health
 
