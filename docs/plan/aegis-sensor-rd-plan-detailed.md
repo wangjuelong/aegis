@@ -426,6 +426,12 @@
   - 建立 approval proof 校验和命令执行前置检查
 - 验收：
   - 测试覆盖签名校验、scope 违规、replay 拒绝、审批证明失败
+- 完成记录（2026-04-19）：
+  - 已在 `aegis-model` 建立 `EventBatch`、`UplinkMessage`、`DownlinkMessage`、`HeartbeatRequest/Response`、`ArtifactChunk`、`UpdateChunk` 等传输消息模型
+  - 已建立 `ServerCommand` / `SignedServerCommand` / `TargetScope` 结构，覆盖 AGENT、TENANT、AGENT_SET、GLOBAL 作用域
+  - 已建立 `TelemetryBatchBuilder`、`HeartbeatBuilder`、`CommandReplayLedger` 与 `CommandValidator`
+  - 已实现签名命令验签、`target_scope` 校验、`command_id` 去重账本与审批证明校验
+  - 已通过上行批处理、签名校验、scope 违规、replay 拒绝与审批证明失败测试
 
 ### P23：WAL / Forensic Journal / Emergency Audit Ring
 
