@@ -3,7 +3,10 @@ use aegis_core::config::AppConfig;
 use aegis_core::health::HealthReporter;
 use aegis_core::orchestrator::Orchestrator;
 use aegis_core::plugin_host::PluginHost;
-use aegis_core::self_protection::{DerivedKeyTier, KeyDerivationService, ProtectionPosture};
+use aegis_core::self_protection::{
+    linux_tpm_attestation_status_from_config, verify_linux_tpm_attestation_roundtrip,
+    DerivedKeyTier, KeyDerivationService, ProtectionPosture,
+};
 use aegis_core::transport_drivers::TransportAgentContext;
 use aegis_core::upgrade::{
     AgentRuntimeSnapshot, DiagnoseCertificateStatus, DiagnoseCollector, DiagnoseConnectionStatus,
@@ -273,6 +276,11 @@ fn diagnose_storage_security(
                 DerivedKeyTier::TelemetryWal,
                 1,
             );
+            let mut key_protection = DiagnoseKeyProtectionStatus::from_runtime(
+                service.protection_status(),
+                rollback_status,
+            );
+            apply_linux_tpm_attestation_self_check(config, &mut key_protection);
             (
                 DiagnoseWalStatus {
                     telemetry_segments,
@@ -282,20 +290,23 @@ fn diagnose_storage_security(
                     key_version: material.version,
                     quarantined_segments,
                 },
-                DiagnoseKeyProtectionStatus::from_runtime(
-                    service.protection_status(),
-                    rollback_status,
-                ),
+                key_protection,
             )
         }
         Err(error) => {
             let mut key_protection = DiagnoseKeyProtectionStatus::default();
+            let (attestation_quote_ready, attestation_pcrs, attestation_error) =
+                linux_tpm_attestation_status_from_config(config);
+            key_protection.attestation_quote_ready = attestation_quote_ready;
+            key_protection.attestation_pcrs = attestation_pcrs;
+            key_protection.attestation_error = attestation_error;
             key_protection.rollback_anchor = rollback_status.anchor_kind;
             key_protection.rollback_floor_issued_at_ms = rollback_status.floor_issued_at_ms;
             key_protection.rollback_fs_cross_check_ms = rollback_status.fs_cross_check_ms;
             key_protection.rollback_cross_check_ok = rollback_status.cross_check_ok;
             key_protection.rollback_error = rollback_status.last_error.clone();
             key_protection.key_provider_error = Some(error.to_string());
+            apply_linux_tpm_attestation_self_check(config, &mut key_protection);
             (
                 DiagnoseWalStatus {
                     telemetry_segments,
@@ -308,6 +319,36 @@ fn diagnose_storage_security(
                 key_protection,
             )
         }
+    }
+}
+
+fn apply_linux_tpm_attestation_self_check(
+    config: &AppConfig,
+    key_protection: &mut DiagnoseKeyProtectionStatus,
+) {
+    if !key_protection.attestation_quote_ready {
+        return;
+    }
+
+    if let Err(error) =
+        verify_linux_tpm_attestation_roundtrip(config, b"aegis-diagnose-attestation")
+    {
+        key_protection.attestation_quote_ready = false;
+        key_protection.degraded = true;
+        merge_diagnose_error(
+            &mut key_protection.attestation_error,
+            format!("linux tpm attestation self-check failed: {error}"),
+        );
+    }
+}
+
+fn merge_diagnose_error(target: &mut Option<String>, next: String) {
+    match target {
+        Some(current) if !current.is_empty() => {
+            current.push_str("; ");
+            current.push_str(&next);
+        }
+        _ => *target = Some(next),
     }
 }
 

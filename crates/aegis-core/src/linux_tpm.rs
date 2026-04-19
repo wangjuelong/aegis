@@ -20,6 +20,9 @@ pub(crate) struct LinuxTpmRuntime {
     pub(crate) hardware_present: bool,
     pub(crate) nv_tools_ready: bool,
     pub(crate) sealed_object_tools_ready: bool,
+    pub(crate) quote_tools_ready: bool,
+    pub(crate) attestation_ak_path: Option<PathBuf>,
+    pub(crate) attestation_pcrs: Option<String>,
     pub(crate) master_key_sealed_object_path: Option<PathBuf>,
     pub(crate) master_key_index: Option<String>,
     pub(crate) rollback_index: Option<String>,
@@ -39,8 +42,40 @@ impl LinuxTpmRuntime {
         self.hardware_present && self.sealed_object_tools_ready
     }
 
+    pub(crate) fn quote_available(&self) -> bool {
+        self.hardware_present && self.quote_tools_ready
+    }
+
     pub(crate) fn master_key_configured(&self) -> bool {
         self.master_key_sealed_object_path.is_some() || self.master_key_index.is_some()
+    }
+
+    pub(crate) fn attestation_configured(&self) -> bool {
+        self.attestation_ak_path.is_some() || self.attestation_pcrs.is_some()
+    }
+
+    pub(crate) fn attestation_enabled(&self) -> bool {
+        self.quote_available()
+            && self.attestation_ak_path.is_some()
+            && self.attestation_pcrs.is_some()
+    }
+
+    pub(crate) fn attestation_status_error(&self) -> Option<String> {
+        if !self.attestation_configured() {
+            return None;
+        }
+        if self.attestation_ak_path.is_none() || self.attestation_pcrs.is_none() {
+            return Some(
+                "linux tpm attestation requires both ak path and pcr selection".to_string(),
+            );
+        }
+        if !self.quote_available() {
+            return Some(
+                "linux tpm attestation is configured but quote tools or device are unavailable"
+                    .to_string(),
+            );
+        }
+        None
     }
 
     pub(crate) fn rollback_configured(&self) -> bool {
@@ -87,11 +122,22 @@ pub(crate) fn detect_linux_tpm_runtime(security: &SecurityConfig) -> LinuxTpmRun
     ]
     .into_iter()
     .all(|tool| resolve_tool(security, tool).is_some());
+    let quote_tools_ready = [
+        "tpm2_createek",
+        "tpm2_createak",
+        "tpm2_quote",
+        "tpm2_checkquote",
+    ]
+    .into_iter()
+    .all(|tool| resolve_tool(security, tool).is_some());
 
     LinuxTpmRuntime {
         hardware_present,
         nv_tools_ready,
         sealed_object_tools_ready,
+        quote_tools_ready,
+        attestation_ak_path: security.linux_tpm_attestation_ak_path.clone(),
+        attestation_pcrs: sanitize_pcrs(security.linux_tpm_attestation_pcrs.as_deref()),
         master_key_sealed_object_path: security.linux_tpm_master_key_sealed_object_path.clone(),
         master_key_index: sanitize_index(security.linux_tpm_master_key_nv_index.as_deref()),
         rollback_index: sanitize_index(security.linux_tpm_rollback_nv_index.as_deref()),
@@ -181,9 +227,194 @@ pub(crate) fn persist_rollback_floor_to_tpm(
     )
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LinuxTpmQuoteBundle {
+    pub(crate) pcrs: String,
+    pub(crate) qualification: Vec<u8>,
+    pub(crate) ak_public: Vec<u8>,
+    pub(crate) message: Vec<u8>,
+    pub(crate) signature: Vec<u8>,
+    pub(crate) pcr: Vec<u8>,
+}
+
+pub(crate) fn generate_attestation_quote(
+    security: &SecurityConfig,
+    qualification: &[u8],
+) -> Result<LinuxTpmQuoteBundle> {
+    let runtime = detect_linux_tpm_runtime(security);
+    if !runtime.quote_available() {
+        bail!("linux tpm quote runtime unavailable");
+    }
+    let ak_base_path = runtime
+        .attestation_ak_path
+        .as_deref()
+        .ok_or_else(|| anyhow!("linux tpm attestation ak path not configured"))?;
+    let pcrs = runtime
+        .attestation_pcrs
+        .clone()
+        .ok_or_else(|| anyhow!("linux tpm attestation pcr selection not configured"))?;
+
+    let parent = ak_base_path
+        .parent()
+        .ok_or_else(|| anyhow!("attestation ak path has no parent directory"))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create attestation ak dir {}", parent.display()))?;
+
+    let temp_dir = temp_runtime_dir("quote")?;
+    let ek_ctx = temp_dir.join("ek.ctx");
+    let ek_pub = temp_dir.join("ek.pub");
+    let ak_ctx = temp_dir.join("ak.ctx");
+    let qualification_path = temp_dir.join("qualification.bin");
+    let message_path = temp_dir.join("quote.msg");
+    let signature_path = temp_dir.join("quote.sig");
+    let pcr_path = temp_dir.join("quote.pcr");
+    let (ak_public_path, ak_private_path, ak_name_path) =
+        attestation_key_artifact_paths(ak_base_path);
+    fs::write(&qualification_path, qualification).with_context(|| {
+        format!(
+            "write attestation quote qualification {}",
+            qualification_path.display()
+        )
+    })?;
+
+    let result = (|| -> Result<LinuxTpmQuoteBundle> {
+        let mut create_ek = build_tool_command(security, "tpm2_createek")?;
+        create_ek.arg("-c").arg(&ek_ctx).arg("-u").arg(&ek_pub);
+        if let Some(auth) = hierarchy_auth() {
+            create_ek.arg("-P").arg(auth);
+        }
+        run_command(create_ek, "create tpm endorsement key for quote")?;
+
+        let mut create_ak = build_tool_command(security, "tpm2_createak")?;
+        create_ak
+            .arg("-C")
+            .arg(&ek_ctx)
+            .arg("-c")
+            .arg(&ak_ctx)
+            .arg("-u")
+            .arg(&ak_public_path)
+            .arg("-r")
+            .arg(&ak_private_path)
+            .arg("-n")
+            .arg(&ak_name_path)
+            .arg("-G")
+            .arg("rsa")
+            .arg("-g")
+            .arg("sha256")
+            .arg("-s")
+            .arg("rsassa");
+        run_command(create_ak, "create tpm attestation key")?;
+
+        let mut quote = build_tool_command(security, "tpm2_quote")?;
+        quote
+            .arg("-c")
+            .arg(&ak_ctx)
+            .arg("-l")
+            .arg(&pcrs)
+            .arg("-q")
+            .arg(&qualification_path)
+            .arg("-m")
+            .arg(&message_path)
+            .arg("-s")
+            .arg(&signature_path)
+            .arg("-o")
+            .arg(&pcr_path);
+        run_command(quote, "generate tpm attestation quote")?;
+
+        Ok(LinuxTpmQuoteBundle {
+            pcrs,
+            qualification: qualification.to_vec(),
+            ak_public: fs::read(&ak_public_path).with_context(|| {
+                format!("read attestation ak public {}", ak_public_path.display())
+            })?,
+            message: fs::read(&message_path).with_context(|| {
+                format!("read attestation quote message {}", message_path.display())
+            })?,
+            signature: fs::read(&signature_path).with_context(|| {
+                format!(
+                    "read attestation quote signature {}",
+                    signature_path.display()
+                )
+            })?,
+            pcr: fs::read(&pcr_path)
+                .with_context(|| format!("read attestation quote pcr {}", pcr_path.display()))?,
+        })
+    })();
+
+    best_effort_flush_context(security, &ak_ctx);
+    best_effort_flush_context(security, &ek_ctx);
+    let _ = fs::remove_dir_all(&temp_dir);
+    result
+}
+
+pub(crate) fn verify_attestation_quote(
+    security: &SecurityConfig,
+    quote: &LinuxTpmQuoteBundle,
+) -> Result<()> {
+    let runtime = detect_linux_tpm_runtime(security);
+    if !runtime.quote_available() {
+        bail!("linux tpm quote runtime unavailable");
+    }
+
+    let temp_dir = temp_runtime_dir("checkquote")?;
+    let ak_public_path = temp_dir.join("ak.pub");
+    let qualification_path = temp_dir.join("qualification.bin");
+    let message_path = temp_dir.join("quote.msg");
+    let signature_path = temp_dir.join("quote.sig");
+    let pcr_path = temp_dir.join("quote.pcr");
+
+    let result = (|| -> Result<()> {
+        fs::write(&ak_public_path, &quote.ak_public)
+            .with_context(|| format!("write attestation ak public {}", ak_public_path.display()))?;
+        fs::write(&qualification_path, &quote.qualification).with_context(|| {
+            format!(
+                "write attestation quote qualification {}",
+                qualification_path.display()
+            )
+        })?;
+        fs::write(&message_path, &quote.message).with_context(|| {
+            format!("write attestation quote message {}", message_path.display())
+        })?;
+        fs::write(&signature_path, &quote.signature).with_context(|| {
+            format!(
+                "write attestation quote signature {}",
+                signature_path.display()
+            )
+        })?;
+        fs::write(&pcr_path, &quote.pcr)
+            .with_context(|| format!("write attestation quote pcr {}", pcr_path.display()))?;
+
+        let mut checkquote = build_tool_command(security, "tpm2_checkquote")?;
+        checkquote
+            .arg("-u")
+            .arg(&ak_public_path)
+            .arg("-m")
+            .arg(&message_path)
+            .arg("-s")
+            .arg(&signature_path)
+            .arg("-f")
+            .arg(&pcr_path)
+            .arg("-g")
+            .arg("sha256")
+            .arg("-q")
+            .arg(&qualification_path);
+        run_command(checkquote, "verify tpm attestation quote")?;
+        Ok(())
+    })();
+
+    let _ = fs::remove_dir_all(&temp_dir);
+    result
+}
+
 fn sanitize_index(index: Option<&str>) -> Option<String> {
     index
         .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn sanitize_pcrs(pcrs: Option<&str>) -> Option<String> {
+    pcrs.map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
 }
@@ -333,6 +564,14 @@ fn sealed_object_artifact_paths(base_path: &Path) -> (PathBuf, PathBuf) {
     (
         path_with_suffix(base_path, ".pub"),
         path_with_suffix(base_path, ".priv"),
+    )
+}
+
+fn attestation_key_artifact_paths(base_path: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    (
+        path_with_suffix(base_path, ".pub"),
+        path_with_suffix(base_path, ".priv"),
+        path_with_suffix(base_path, ".name"),
     )
 }
 
@@ -553,6 +792,10 @@ impl TestTpmHarness {
             "tpm2_nvdefine",
             "tpm2_nvread",
             "tpm2_nvwrite",
+            "tpm2_createek",
+            "tpm2_createak",
+            "tpm2_quote",
+            "tpm2_checkquote",
             "tpm2_createprimary",
             "tpm2_create",
             "tpm2_load",
@@ -580,6 +823,10 @@ fn test_tool_script(tool: &str, store_dir: &Path) -> String {
 set -eu
 STORE="{store}"
 tool="{tool}"
+
+to_hex() {{
+  od -An -tx1 -v "$1" | tr -d ' \n'
+}}
 
 case "$tool" in
   tpm2_nvreadpublic)
@@ -661,6 +908,136 @@ case "$tool" in
     else
       cat > "$STORE/$index.bin"
     fi
+    ;;
+  tpm2_createek)
+    context=
+    public=
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -c)
+          context="$2"
+          shift 2
+          ;;
+        -u)
+          public="$2"
+          shift 2
+          ;;
+        *)
+          shift
+          ;;
+      esac
+    done
+    printf 'ek' > "$context"
+    printf 'ek-public' > "$public"
+    ;;
+  tpm2_createak)
+    context=
+    public=
+    private=
+    name=
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -c)
+          context="$2"
+          shift 2
+          ;;
+        -u)
+          public="$2"
+          shift 2
+          ;;
+        -r)
+          private="$2"
+          shift 2
+          ;;
+        -n)
+          name="$2"
+          shift 2
+          ;;
+        *)
+          shift
+          ;;
+      esac
+    done
+    printf 'ak' > "$context"
+    printf 'ak-public' > "$public"
+    printf 'ak-private' > "$private"
+    printf 'ak-name' > "$name"
+    ;;
+  tpm2_quote)
+    qualification=
+    message=
+    signature=
+    pcr=
+    pcr_list=
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -q)
+          qualification="$2"
+          shift 2
+          ;;
+        -m)
+          message="$2"
+          shift 2
+          ;;
+        -s)
+          signature="$2"
+          shift 2
+          ;;
+        -o)
+          pcr="$2"
+          shift 2
+          ;;
+        -l)
+          pcr_list="$2"
+          shift 2
+          ;;
+        *)
+          shift
+          ;;
+      esac
+    done
+    qualification_hex=$(to_hex "$qualification")
+    printf 'quote:%s:%s' "$pcr_list" "$qualification_hex" > "$message"
+    printf 'sig:%s:%s' "$pcr_list" "$qualification_hex" > "$signature"
+    printf 'pcr:%s' "$pcr_list" > "$pcr"
+    ;;
+  tpm2_checkquote)
+    qualification=
+    message=
+    signature=
+    pcr=
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -q)
+          qualification="$2"
+          shift 2
+          ;;
+        -m)
+          message="$2"
+          shift 2
+          ;;
+        -s)
+          signature="$2"
+          shift 2
+          ;;
+        -f)
+          pcr="$2"
+          shift 2
+          ;;
+        *)
+          shift
+          ;;
+      esac
+    done
+    qualification_hex=$(to_hex "$qualification")
+    pcr_spec=$(cut -d: -f2- "$pcr" 2>/dev/null || true)
+    if [ -z "$pcr_spec" ]; then
+      pcr_spec=$(cut -d: -f2- < "$pcr")
+    fi
+    expected_message="quote:$pcr_spec:$qualification_hex"
+    expected_signature="sig:$pcr_spec:$qualification_hex"
+    [ "$(cat "$message")" = "$expected_message" ] || exit 1
+    [ "$(cat "$signature")" = "$expected_signature" ] || exit 1
     ;;
   tpm2_createprimary)
     context=
@@ -751,8 +1128,9 @@ esac
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        detect_linux_tpm_runtime, load_or_initialize_master_key_from_tpm,
-        load_or_initialize_rollback_floor_from_tpm, persist_rollback_floor_to_tpm, TestTpmHarness,
+        detect_linux_tpm_runtime, generate_attestation_quote,
+        load_or_initialize_master_key_from_tpm, load_or_initialize_rollback_floor_from_tpm,
+        persist_rollback_floor_to_tpm, verify_attestation_quote, TestTpmHarness,
     };
     use crate::config::SecurityConfig;
     use std::{env, fs};
@@ -763,6 +1141,8 @@ mod tests {
         let security = SecurityConfig {
             linux_tpm_tools_dir: Some(harness.tools_dir),
             linux_tpm_device_path: Some(harness.device_path),
+            linux_tpm_attestation_ak_path: Some(env::temp_dir().join("aegis-attestation-ak")),
+            linux_tpm_attestation_pcrs: Some("sha256:0,7".to_string()),
             linux_tpm_master_key_nv_index: Some("0x1500016".to_string()),
             linux_tpm_rollback_nv_index: Some("0x1500017".to_string()),
             ..SecurityConfig::default()
@@ -770,8 +1150,49 @@ mod tests {
 
         let runtime = detect_linux_tpm_runtime(&security);
         assert!(runtime.available());
+        assert!(runtime.attestation_enabled());
         assert!(runtime.master_key_enabled());
         assert!(runtime.rollback_enabled());
+    }
+
+    #[test]
+    fn attestation_quote_round_trips_through_tpm_quote() {
+        let harness = TestTpmHarness::install("attestation-quote");
+        let security = SecurityConfig {
+            linux_tpm_tools_dir: Some(harness.tools_dir),
+            linux_tpm_device_path: Some(harness.device_path),
+            linux_tpm_attestation_ak_path: Some(
+                env::temp_dir().join("aegis-attestation-quote/attestation-ak"),
+            ),
+            linux_tpm_attestation_pcrs: Some("sha256:0,7".to_string()),
+            ..SecurityConfig::default()
+        };
+
+        let quote = generate_attestation_quote(&security, b"quote-nonce").expect("generate quote");
+        assert_eq!(quote.pcrs, "sha256:0,7");
+        verify_attestation_quote(&security, &quote).expect("verify quote");
+    }
+
+    #[test]
+    fn attestation_runtime_reports_missing_quote_tools() {
+        let harness = TestTpmHarness::install("attestation-missing-tools");
+        fs::remove_file(harness.tools_dir.join("tpm2_quote")).expect("remove quote tool");
+        let security = SecurityConfig {
+            linux_tpm_tools_dir: Some(harness.tools_dir),
+            linux_tpm_device_path: Some(harness.device_path),
+            linux_tpm_attestation_ak_path: Some(
+                env::temp_dir().join("aegis-attestation-missing-tools/attestation-ak"),
+            ),
+            linux_tpm_attestation_pcrs: Some("sha256:0,7".to_string()),
+            ..SecurityConfig::default()
+        };
+
+        let runtime = detect_linux_tpm_runtime(&security);
+        assert!(!runtime.attestation_enabled());
+        assert_eq!(
+            runtime.attestation_status_error().as_deref(),
+            Some("linux tpm attestation is configured but quote tools or device are unavailable")
+        );
     }
 
     #[test]

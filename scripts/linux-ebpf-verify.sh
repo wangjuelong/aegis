@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-HOST=${AEGIS_LINUX_HOST:-192.168.1.15}
+HOST=${AEGIS_LINUX_HOST:-192.168.1.6}
 USER_NAME=${AEGIS_LINUX_USER:-ubuntu}
 PASSWORD=${AEGIS_LINUX_PASSWORD:-ubuntu}
 REMOTE_PIN_ROOT=${AEGIS_REMOTE_PIN_ROOT:-/sys/fs/bpf/edr}

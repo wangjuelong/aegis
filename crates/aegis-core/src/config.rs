@@ -169,6 +169,10 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub linux_tpm_master_key_sealed_object_path: Option<PathBuf>,
     #[serde(default)]
+    pub linux_tpm_attestation_ak_path: Option<PathBuf>,
+    #[serde(default)]
+    pub linux_tpm_attestation_pcrs: Option<String>,
+    #[serde(default)]
     pub linux_tpm_master_key_nv_index: Option<String>,
     #[serde(default)]
     pub linux_tpm_rollback_nv_index: Option<String>,
@@ -185,6 +189,8 @@ impl Default for SecurityConfig {
             linux_tpm_tools_dir: None,
             linux_tpm_device_path: None,
             linux_tpm_master_key_sealed_object_path: None,
+            linux_tpm_attestation_ak_path: None,
+            linux_tpm_attestation_pcrs: None,
             linux_tpm_master_key_nv_index: None,
             linux_tpm_rollback_nv_index: None,
             linux_tpm_auto_provision_nv: false,
@@ -331,6 +337,8 @@ mod tests {
             .security
             .linux_tpm_master_key_sealed_object_path
             .is_none());
+        assert!(restored.security.linux_tpm_attestation_ak_path.is_none());
+        assert!(restored.security.linux_tpm_attestation_pcrs.is_none());
         assert!(restored.security.linux_tpm_master_key_nv_index.is_none());
         assert!(restored.security.linux_tpm_rollback_nv_index.is_none());
         assert!(!restored.security.linux_tpm_auto_provision_nv);

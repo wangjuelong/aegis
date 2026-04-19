@@ -1,6 +1,9 @@
 use crate::config::AgentConfig;
 use crate::error::CoreError;
-use crate::linux_tpm::{detect_linux_tpm_runtime, load_or_initialize_master_key_from_tpm};
+use crate::linux_tpm::{
+    detect_linux_tpm_runtime, generate_attestation_quote, load_or_initialize_master_key_from_tpm,
+    verify_attestation_quote,
+};
 use aegis_model::Severity;
 use getrandom::fill as getrandom_fill;
 use hkdf::Hkdf;
@@ -113,6 +116,9 @@ pub struct KeyProtectionStatus {
     pub degraded: bool,
     pub memory_lock_supported: bool,
     pub memory_lock_enabled: bool,
+    pub attestation_quote_ready: bool,
+    pub attestation_pcrs: Option<String>,
+    pub attestation_error: Option<String>,
     pub last_error: Option<String>,
 }
 
@@ -195,6 +201,9 @@ impl KeyDerivationService {
                 degraded: true,
                 memory_lock_supported: memory_lock.supported,
                 memory_lock_enabled: memory_lock.enabled,
+                attestation_quote_ready: false,
+                attestation_pcrs: None,
+                attestation_error: None,
                 last_error: memory_lock.last_error,
             },
         }
@@ -258,9 +267,27 @@ impl KeyDerivationService {
     }
 }
 
+pub fn linux_tpm_attestation_status_from_config(
+    config: &AgentConfig,
+) -> (bool, Option<String>, Option<String>) {
+    linux_attestation_status(&detect_linux_tpm_runtime(&config.security))
+}
+
+pub fn verify_linux_tpm_attestation_roundtrip(
+    config: &AgentConfig,
+    qualification: &[u8],
+) -> Result<(), CoreError> {
+    let quote = generate_attestation_quote(&config.security, qualification)
+        .map_err(|error| CoreError::Crypto(error.to_string()))?;
+    verify_attestation_quote(&config.security, &quote)
+        .map_err(|error| CoreError::Crypto(error.to_string()))
+}
+
 fn load_master_key(config: &AgentConfig) -> Result<(Vec<u8>, KeyProtectionStatus), CoreError> {
     let mut last_error = None;
     let tpm_runtime = detect_linux_tpm_runtime(&config.security);
+    let (attestation_quote_ready, attestation_pcrs, attestation_error) =
+        linux_attestation_status(&tpm_runtime);
 
     if tpm_runtime.master_key_enabled() {
         match load_or_initialize_master_key_from_tpm(&config.security) {
@@ -273,6 +300,9 @@ fn load_master_key(config: &AgentConfig) -> Result<(Vec<u8>, KeyProtectionStatus
                         degraded: false,
                         memory_lock_supported: false,
                         memory_lock_enabled: false,
+                        attestation_quote_ready,
+                        attestation_pcrs,
+                        attestation_error,
                         last_error: None,
                     },
                 ));
@@ -308,6 +338,9 @@ fn load_master_key(config: &AgentConfig) -> Result<(Vec<u8>, KeyProtectionStatus
                         degraded: true,
                         memory_lock_supported: false,
                         memory_lock_enabled: false,
+                        attestation_quote_ready,
+                        attestation_pcrs,
+                        attestation_error,
                         last_error: None,
                     },
                 ));
@@ -330,6 +363,9 @@ fn load_master_key(config: &AgentConfig) -> Result<(Vec<u8>, KeyProtectionStatus
                         degraded: true,
                         memory_lock_supported: false,
                         memory_lock_enabled: false,
+                        attestation_quote_ready,
+                        attestation_pcrs,
+                        attestation_error,
                         last_error,
                     },
                 ));
@@ -344,6 +380,16 @@ fn load_master_key(config: &AgentConfig) -> Result<(Vec<u8>, KeyProtectionStatus
     Err(CoreError::Crypto(last_error.unwrap_or_else(|| {
         "no master key provider available".to_string()
     })))
+}
+
+fn linux_attestation_status(
+    tpm_runtime: &crate::linux_tpm::LinuxTpmRuntime,
+) -> (bool, Option<String>, Option<String>) {
+    (
+        tpm_runtime.attestation_enabled(),
+        tpm_runtime.attestation_pcrs.clone(),
+        tpm_runtime.attestation_status_error(),
+    )
 }
 
 fn load_master_key_from_keyring(config: &AgentConfig) -> Result<Vec<u8>, CoreError> {
