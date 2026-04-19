@@ -1,4 +1,8 @@
 use crate::config::{CommunicationConfig, SecurityConfig};
+use crate::linux_tpm::{
+    detect_linux_tpm_runtime, load_or_initialize_rollback_floor_from_tpm,
+    persist_rollback_floor_to_tpm,
+};
 use crate::transport_drivers::{build_transport_drivers, TransportAgentContext};
 use aegis_model::{
     AgentHealth, ApproverEntry, ArtifactChunk, CommunicationChannelHealth,
@@ -609,6 +613,7 @@ enum CommandReplayLedgerBackend {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RollbackProtectionAnchor {
     TpmNvCounter,
+    TpmNvIndex,
     OsStoreCrossChecked,
     FileBackedCrossChecked,
     Ephemeral,
@@ -645,6 +650,7 @@ struct RollbackAnchorRecord {
 
 pub struct CommandReplayLedger {
     backend: CommandReplayLedgerBackend,
+    security: SecurityConfig,
     rollback_status: RollbackProtectionStatus,
 }
 
@@ -652,6 +658,7 @@ impl Default for CommandReplayLedger {
     fn default() -> Self {
         Self {
             backend: CommandReplayLedgerBackend::Memory(HashMap::new()),
+            security: SecurityConfig::default(),
             rollback_status: RollbackProtectionStatus::default(),
         }
     }
@@ -670,6 +677,7 @@ impl CommandReplayLedger {
         let rollback_status = load_or_initialize_rollback_status(&path, security)?;
         Ok(Self {
             backend: CommandReplayLedgerBackend::Sqlite(path),
+            security: security.clone(),
             rollback_status,
         })
     }
@@ -724,6 +732,7 @@ impl CommandReplayLedger {
                     .map_err(|_| CommandValidationError::PersistenceFailure)?;
                 advance_rollback_status(
                     &mut self.rollback_status,
+                    &self.security,
                     path.as_path(),
                     issued_at_ms,
                     now_ms,
@@ -781,6 +790,32 @@ fn load_or_initialize_rollback_status(
         floor_issued_at_ms: None,
         updated_at_ms: now_ms,
     };
+    let tpm_runtime = detect_linux_tpm_runtime(security);
+    let mut last_error = None;
+
+    if tpm_runtime.rollback_enabled() {
+        match load_or_initialize_rollback_floor_from_tpm(security) {
+            Ok(floor_issued_at_ms) => {
+                return Ok(RollbackProtectionStatus {
+                    anchor_kind: RollbackProtectionAnchor::TpmNvIndex,
+                    floor_issued_at_ms,
+                    fs_cross_check_ms: None,
+                    cross_check_ok: false,
+                    degraded: false,
+                    last_error: None,
+                });
+            }
+            Err(error) => append_status_error(
+                &mut last_error,
+                format!("linux tpm rollback anchor unavailable: {error}"),
+            ),
+        }
+    } else if tpm_runtime.available() && security.linux_tpm_rollback_nv_index.is_none() {
+        append_status_error(
+            &mut last_error,
+            "linux tpm available but rollback nv index is not configured",
+        );
+    }
 
     if security.use_os_credential_store {
         match load_or_initialize_rollback_record_from_keyring(path, &default_record) {
@@ -793,11 +828,10 @@ fn load_or_initialize_rollback_status(
                 );
                 let cross_check_ok =
                     keyring_record.floor_issued_at_ms == sidecar_record.floor_issued_at_ms;
-                let mut last_error = None;
                 if !cross_check_ok {
-                    last_error = Some(
-                        "rollback anchor mismatch detected between credential store and sidecar"
-                            .to_string(),
+                    append_status_error(
+                        &mut last_error,
+                        "rollback anchor mismatch detected between credential store and sidecar",
                     );
                     sidecar_record = RollbackAnchorRecord {
                         floor_issued_at_ms,
@@ -816,6 +850,10 @@ fn load_or_initialize_rollback_status(
                 });
             }
             Err(error) => {
+                append_status_error(
+                    &mut last_error,
+                    format!("credential store unavailable: {error}"),
+                );
                 if security.allow_file_fallback {
                     let (record, fs_cross_check_ms) =
                         load_or_initialize_rollback_record_from_sidecar(path, &default_record)?;
@@ -825,12 +863,15 @@ fn load_or_initialize_rollback_status(
                         fs_cross_check_ms,
                         cross_check_ok: fs_cross_check_ms.is_some(),
                         degraded: true,
-                        last_error: Some(format!(
-                            "credential store unavailable, fallback to file anchor: {error}"
-                        )),
+                        last_error,
                     });
                 }
-                bail!("credential store unavailable and file fallback disabled: {error}");
+                bail!(
+                    "{}",
+                    last_error.unwrap_or_else(|| {
+                        format!("credential store unavailable and file fallback disabled: {error}")
+                    })
+                );
             }
         }
     }
@@ -843,12 +884,13 @@ fn load_or_initialize_rollback_status(
         fs_cross_check_ms,
         cross_check_ok: fs_cross_check_ms.is_some(),
         degraded: true,
-        last_error: None,
+        last_error,
     })
 }
 
 fn advance_rollback_status(
     status: &mut RollbackProtectionStatus,
+    security: &SecurityConfig,
     path: &Path,
     issued_at_ms: i64,
     now_ms: i64,
@@ -863,6 +905,11 @@ fn advance_rollback_status(
     };
 
     match status.anchor_kind {
+        RollbackProtectionAnchor::TpmNvIndex => {
+            persist_rollback_floor_to_tpm(security, record.floor_issued_at_ms)?;
+            status.fs_cross_check_ms = None;
+            status.cross_check_ok = false;
+        }
         RollbackProtectionAnchor::OsStoreCrossChecked => {
             persist_rollback_record_to_keyring(path, &record)?;
             persist_rollback_record_to_sidecar(path, &record)?;
@@ -881,6 +928,16 @@ fn advance_rollback_status(
 
     status.floor_issued_at_ms = record.floor_issued_at_ms;
     Ok(())
+}
+
+fn append_status_error(target: &mut Option<String>, next: impl AsRef<str>) {
+    match target {
+        Some(current) if !current.is_empty() => {
+            current.push_str("; ");
+            current.push_str(next.as_ref());
+        }
+        _ => *target = Some(next.as_ref().to_string()),
+    }
 }
 
 fn rollback_anchor_sidecar_path(path: &Path) -> PathBuf {
@@ -1324,10 +1381,12 @@ fn policy_version_rank(version: &str) -> u64 {
 mod tests {
     use super::{
         canonical_command_hash, AgentIdentity, CommandReplayLedger, CommandValidationError,
-        CommandValidator, CommunicationRuntime, HeartbeatBuilder, TelemetryBatchBuilder,
-        TransportDriver,
+        CommandValidator, CommunicationRuntime, HeartbeatBuilder, RollbackProtectionAnchor,
+        TelemetryBatchBuilder, TransportDriver,
     };
     use crate::config::SecurityConfig;
+    #[cfg(unix)]
+    use crate::linux_tpm::TestTpmHarness;
     use aegis_model::{
         AgentHealth, ApprovalPolicy, ApprovalProof, ApproverEntry, CommunicationChannelKind,
         DownlinkMessage, EventPayload, EventType, FileContext, HeartbeatResponse, NormalizedEvent,
@@ -1704,6 +1763,7 @@ mod tests {
             use_os_credential_store: false,
             allow_file_fallback: true,
             memory_lock_best_effort: false,
+            ..SecurityConfig::default()
         };
         let mut first = CommandReplayLedger::new_persistent_with_security(path.clone(), &security)
             .expect("create ledger");
@@ -1720,6 +1780,39 @@ mod tests {
         assert_eq!(error, CommandValidationError::RollbackProtectionTriggered);
         assert_eq!(reopened.rollback_status().floor_issued_at_ms, Some(8_000));
         assert!(reopened.rollback_status().cross_check_ok);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_replay_ledger_uses_linux_tpm_nv_anchor_when_configured() {
+        let harness = TestTpmHarness::install("rollback-ledger");
+        let path = temp_path("command-replay-tpm.db");
+        let security = SecurityConfig {
+            use_os_credential_store: false,
+            allow_file_fallback: true,
+            memory_lock_best_effort: false,
+            linux_tpm_tools_dir: Some(harness.tools_dir),
+            linux_tpm_device_path: Some(harness.device_path),
+            linux_tpm_rollback_nv_index: Some("0x1500200".to_string()),
+            linux_tpm_auto_provision_nv: true,
+            ..SecurityConfig::default()
+        };
+
+        let mut first = CommandReplayLedger::new_persistent_with_security(path.clone(), &security)
+            .expect("create tpm ledger");
+        first
+            .register(Uuid::now_v7(), 8_000, 20_000, 1_000)
+            .expect("first register");
+
+        let reopened = CommandReplayLedger::new_persistent_with_security(path, &security)
+            .expect("reopen tpm ledger");
+        assert_eq!(
+            reopened.rollback_status().anchor_kind,
+            RollbackProtectionAnchor::TpmNvIndex
+        );
+        assert_eq!(reopened.rollback_status().floor_issued_at_ms, Some(8_000));
+        assert!(!reopened.rollback_status().degraded);
+        assert!(!reopened.rollback_status().cross_check_ok);
     }
 
     #[test]

@@ -21,7 +21,7 @@
 | P06 | ProcessTree / Hashing / AdaptiveWhitelist / Health | done | 已建立进程树、哈希缓存、自适应白名单与健康快照模块，并通过模块测试 |
 | P07 | 平台 Trait 细化与 Mock Harness | done | 已建立平台描述、能力矩阵和可注入/可断言的 mock harness，并通过平台层测试 |
 | P08 | Windows 平台采集基线 | done | 已建立 Windows provider 基线、能力矩阵、事件注入与平台测试 |
-| P09 | Linux 平台采集基线 | done | 已建立 Linux provider 基线、4 级降级模型、容器感知事件注入与平台测试 |
+| P09 | Linux 平台采集基线 | done | 已建立 Linux provider 基线、4 级降级模型，并补齐真实 host capability probing、`/proc` 进程差分、auth log 采集、信号级响应、隔离/取证物料落盘与 Linux 容器验证 |
 | P10 | macOS 平台采集基线 | done | 已建立 macOS provider 基线、授权状态机、订阅集与平台测试 |
 | P11 | IOC / Rule VM / Temporal | done | 已建立分层 IOC 索引、栈式 Rule VM、时间窗口缓冲与核心测试 |
 | P12 | YARA / Script Decode / AMSI Interlock | done | 已建立 YARA 调度缓存、脚本解码流水线、AMSI 快速分流与测试 |
@@ -48,10 +48,10 @@
 | G00 | 缺口审计与执行基线重建 | baseline | 已完成第一轮 gap 文档基线，但结论仍然偏乐观 |
 | G01 | 高危操作执行链路加固 | superseded | 已由 C01 / C02 收口，原始 gap 基线不再作为当前判断依据 |
 | G02 | 通信回退运行时与诊断扩展 | superseded | 已由 C02 收口，原始 gap 基线不再作为当前判断依据 |
-| G03 | WAL 加密、恢复与证据链加固 | baseline | 已有 WAL 加密与校验能力，但仍与文档中的硬件绑定/正式密钥契约不一致 |
+| G03 | WAL 加密、恢复与证据链加固 | baseline | 已有 WAL 加密与校验能力；Linux TPM NV-backed 主密钥与 rollback anchor 已落地，剩余差距主要收缩到 Windows/macOS 正式硬件根信任与 Linux sealed object/attestation |
 | G04 | 插件宿主、Watchdog 与 Updater 热更新链路 | superseded | 已由 C03 / C04 收口，原始 gap 基线不再作为当前判断依据 |
 | G05 | 容器、Sidecar 与 Serverless 运行时接入 | baseline | 契约与桥接对象已在，但不属于本轮完整性收口重点 |
-| G06 | 平台执行基线收口 | baseline | 平台状态快照已存在，但真实内核/系统集成不在当前仓库内闭合 |
+| G06 | 平台执行基线收口 | baseline | Linux 用户态运行时已收口，且已补齐 eBPF 资产/装载/attach contract 状态机与 Linux TPM-backed key/rollback provider；剩余为 Linux 真实 BPF 资产与强制执行、Windows 驱动链路、macOS System Extension 系统级集成 |
 
 ## 第二轮 Agent 完整性收口状态
 
@@ -70,3 +70,11 @@
 | C06 | 密钥保护、回滚保护与敏感内存强化 | done | 已由 `dccb1ce` 接入主密钥 provider、rollback floor、敏感内存锁页/零化与 `key_protection` 诊断状态，并通过 `cargo test --workspace` 与 `cargo run -p aegis-agentd -- --diagnose` |
 | C07 | WAL / Journal ACK-gated replay 正式闭环 | done | 已由 `3e34dcc` 打通 `PendingBatchStore` / `uplink-replay`、统一 ACK-gated `sequence_id` 前沿、`replay` 诊断输出与响应审计 `ForensicJournal` 关联，并通过 `cargo test --workspace` 与 `cargo run -p aegis-agentd -- --diagnose` |
 | C08 | 升级产物传输与运行时更新闭环 | done | 已由 `99ef1a0` 打通 heartbeat 升级公告、`update-manager` 主任务、真实 `pull_update` / `upload_artifact` 闭环、`update-state.json` 生命周期状态与 updater/`--diagnose` 共享状态面，并通过 `cargo test --workspace` 与 `AEGIS_STATE_ROOT=$(mktemp -d) cargo run -p aegis-agentd -- --diagnose` |
+
+## Linux 平台补录
+
+| 工作包 | 名称 | 状态 | 备注 |
+|--------|------|------|------|
+| L01 | Linux 用户态真实运行时与响应落地 | done | 已将 `crates/aegis-platform/src/linux.rs` 从纯 stub 升级为真实主机探测、`/proc` 进程差分、auth log 增量采集、信号级响应、隔离/取证 manifest 落盘，并通过 `cargo test -p aegis-platform` 以及 Linux 容器内 `rust:bookworm` 基线下的 `cargo test -p aegis-core -p aegis-platform` |
+| L02 | Linux eBPF 资产发现、loader 与 attach contract 状态机 | done | 已补齐 `manifest.json` 驱动的 bundle discovery、pin root 规划、已存在 pin/link 识别、受控 `bpftool prog loadall` 装载路径、attachment/link contract，以及 `check_kernel_code` / `check_bpf_integrity` 对资产/加载/附着状态的真实反映，并通过 `cargo test -p aegis-platform` |
+| L03 | Linux TPM-backed key protection / rollback anchor | done | 已在 `aegis-core` 接入 Linux TPM tools/device/NV index provider、`HardwareBound` 主密钥路径、TPM NV-backed rollback floor 与降级状态回传，并通过 `cargo test -p aegis-core` |

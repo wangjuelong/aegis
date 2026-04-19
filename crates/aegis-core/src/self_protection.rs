@@ -1,5 +1,6 @@
 use crate::config::AgentConfig;
 use crate::error::CoreError;
+use crate::linux_tpm::{detect_linux_tpm_runtime, load_or_initialize_master_key_from_tpm};
 use aegis_model::Severity;
 use getrandom::fill as getrandom_fill;
 use hkdf::Hkdf;
@@ -259,6 +260,34 @@ impl KeyDerivationService {
 
 fn load_master_key(config: &AgentConfig) -> Result<(Vec<u8>, KeyProtectionStatus), CoreError> {
     let mut last_error = None;
+    let tpm_runtime = detect_linux_tpm_runtime(&config.security);
+
+    if tpm_runtime.master_key_enabled() {
+        match load_or_initialize_master_key_from_tpm(&config.security) {
+            Ok(key) => {
+                return Ok((
+                    key,
+                    KeyProtectionStatus {
+                        active_tier: KeyProtectionTier::HardwareBound,
+                        hardware_root_available: true,
+                        degraded: false,
+                        memory_lock_supported: false,
+                        memory_lock_enabled: false,
+                        last_error: None,
+                    },
+                ));
+            }
+            Err(error) => merge_status_error(
+                &mut last_error,
+                Some(format!("linux tpm master key unavailable: {error}")),
+            ),
+        }
+    } else if tpm_runtime.available() && config.security.linux_tpm_master_key_nv_index.is_none() {
+        merge_status_error(
+            &mut last_error,
+            Some("linux tpm available but master key nv index is not configured".to_string()),
+        );
+    }
 
     if config.security.use_os_credential_store {
         match load_master_key_from_keyring(config) {
@@ -267,7 +296,7 @@ fn load_master_key(config: &AgentConfig) -> Result<(Vec<u8>, KeyProtectionStatus
                     key,
                     KeyProtectionStatus {
                         active_tier: KeyProtectionTier::OsCredentialStore,
-                        hardware_root_available: false,
+                        hardware_root_available: tpm_runtime.available(),
                         degraded: true,
                         memory_lock_supported: false,
                         memory_lock_enabled: false,
@@ -289,7 +318,7 @@ fn load_master_key(config: &AgentConfig) -> Result<(Vec<u8>, KeyProtectionStatus
                     key,
                     KeyProtectionStatus {
                         active_tier: KeyProtectionTier::FileBackedFallback,
-                        hardware_root_available: false,
+                        hardware_root_available: tpm_runtime.available(),
                         degraded: true,
                         memory_lock_supported: false,
                         memory_lock_enabled: false,
@@ -557,6 +586,8 @@ mod tests {
         KeyProtectionTier, ProtectionPosture, SelfProtectionManager, TamperSignal,
     };
     use crate::config::AgentConfig;
+    #[cfg(unix)]
+    use crate::linux_tpm::TestTpmHarness;
     use aegis_model::Severity;
     use std::path::PathBuf;
     use uuid::Uuid;
@@ -644,6 +675,35 @@ mod tests {
             .state_root
             .join("secure/master-key.bin")
             .exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_backed_key_derivation_prefers_linux_tpm_when_configured() {
+        let harness = TestTpmHarness::install("self-protection");
+        let mut config = AgentConfig::default();
+        config.security.use_os_credential_store = false;
+        config.security.allow_file_fallback = true;
+        config.security.memory_lock_best_effort = false;
+        config.security.linux_tpm_tools_dir = Some(harness.tools_dir);
+        config.security.linux_tpm_device_path = Some(harness.device_path);
+        config.security.linux_tpm_master_key_nv_index = Some("0x1500100".to_string());
+        config.security.linux_tpm_auto_provision_nv = true;
+
+        let first = KeyDerivationService::from_config(&config).expect("load tpm-backed key");
+        let second = KeyDerivationService::from_config(&config).expect("reload tpm-backed key");
+        let first_key =
+            first.derive_material("tenant-a", "agent-1", DerivedKeyTier::TelemetryWal, 1);
+        let second_key =
+            second.derive_material("tenant-a", "agent-1", DerivedKeyTier::TelemetryWal, 1);
+
+        assert_eq!(first_key.key_bytes, second_key.key_bytes);
+        assert_eq!(
+            first.protection_status().active_tier,
+            KeyProtectionTier::HardwareBound
+        );
+        assert!(first.protection_status().hardware_root_available);
+        assert!(!first.protection_status().degraded);
     }
 
     #[test]

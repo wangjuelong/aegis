@@ -45,7 +45,7 @@ use aegis_model::{
     RuntimePolicyContract, RuntimeProviderKind, Severity, Storyline, StorylineContext,
     TelemetryEvent, ThreatIntelHit, UpdateRequest, UplinkMessage,
 };
-use aegis_platform::{MacosPlatform, PlatformRuntime};
+use aegis_platform::PlatformRuntime;
 use anyhow::{anyhow, Result};
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
@@ -2729,7 +2729,7 @@ fn build_runtime_platform() -> Arc<dyn PlatformRuntime> {
     }
     #[cfg(target_os = "macos")]
     {
-        Arc::new(MacosPlatform::default())
+        Arc::new(aegis_platform::MacosPlatform::default())
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -2803,6 +2803,50 @@ mod tests {
     };
     use ed25519_dalek::{Signer, SigningKey};
     use sha2::Digest;
+    use std::process::{Child, Command, Stdio};
+
+    struct TestTargetProcess {
+        child: Child,
+    }
+
+    impl TestTargetProcess {
+        fn spawn() -> Self {
+            #[cfg(unix)]
+            let child = Command::new("sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn unix test target");
+
+            #[cfg(windows)]
+            let child = Command::new("cmd")
+                .args(["/C", "ping -n 30 127.0.0.1 > NUL"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn windows test target");
+
+            Self { child }
+        }
+
+        fn pid(&self) -> u32 {
+            self.child.id()
+        }
+
+        fn cleanup(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    impl Drop for TestTargetProcess {
+        fn drop(&mut self) {
+            self.cleanup();
+        }
+    }
 
     fn temp_state_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("aegis-{name}-{}", Uuid::now_v7()))
@@ -2998,14 +3042,14 @@ mod tests {
         )
     }
 
-    fn malicious_script_event() -> NormalizedEvent {
+    fn malicious_script_event(pid: u32) -> NormalizedEvent {
         let mut event = NormalizedEvent::new(
             42,
             EventType::Script,
             Priority::High,
             Severity::Medium,
             ProcessContext {
-                pid: 7331,
+                pid,
                 name: "powershell.exe".to_string(),
                 cmdline: "powershell -enc SQBFAFgA".to_string(),
                 exe_hash: Some("deadbeef".to_string()),
@@ -3076,9 +3120,10 @@ mod tests {
         let artifacts = orchestrator.bootstrap().expect("bootstrap should work");
         let event_tx = artifacts.channels.event_tx.clone();
         let runtime = orchestrator.start(artifacts).expect("runtime should start");
+        let target = TestTargetProcess::spawn();
 
         event_tx
-            .send(malicious_script_event())
+            .send(malicious_script_event(target.pid()))
             .await
             .expect("send malicious event");
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -3404,10 +3449,12 @@ mod tests {
         let handle = runtime
             .loopback_handle(CommunicationChannelKind::Grpc)
             .expect("grpc loopback handle");
+        let target = TestTargetProcess::spawn();
 
         let command = make_command(
             "kill-process",
-            serde_json::to_vec(&KillProcessCommand { pid: 4242 }).expect("serialize kill command"),
+            serde_json::to_vec(&KillProcessCommand { pid: target.pid() })
+                .expect("serialize kill command"),
             ApprovalPolicy {
                 min_approvers: 0,
                 approvers: Vec::new(),

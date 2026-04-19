@@ -162,6 +162,16 @@ pub struct SecurityConfig {
     pub use_os_credential_store: bool,
     pub allow_file_fallback: bool,
     pub memory_lock_best_effort: bool,
+    #[serde(default)]
+    pub linux_tpm_tools_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub linux_tpm_device_path: Option<PathBuf>,
+    #[serde(default)]
+    pub linux_tpm_master_key_nv_index: Option<String>,
+    #[serde(default)]
+    pub linux_tpm_rollback_nv_index: Option<String>,
+    #[serde(default)]
+    pub linux_tpm_auto_provision_nv: bool,
 }
 
 impl Default for SecurityConfig {
@@ -170,6 +180,11 @@ impl Default for SecurityConfig {
             use_os_credential_store: true,
             allow_file_fallback: true,
             memory_lock_best_effort: true,
+            linux_tpm_tools_dir: None,
+            linux_tpm_device_path: None,
+            linux_tpm_master_key_nv_index: None,
+            linux_tpm_rollback_nv_index: None,
+            linux_tpm_auto_provision_nv: false,
         }
     }
 }
@@ -307,6 +322,11 @@ mod tests {
         assert_eq!(restored.storage.agent_db_path, config.storage.agent_db_path);
         assert!(!restored.communication.development_allow_loopback);
         assert!(restored.security.use_os_credential_store);
+        assert!(restored.security.linux_tpm_tools_dir.is_none());
+        assert!(restored.security.linux_tpm_device_path.is_none());
+        assert!(restored.security.linux_tpm_master_key_nv_index.is_none());
+        assert!(restored.security.linux_tpm_rollback_nv_index.is_none());
+        assert!(!restored.security.linux_tpm_auto_provision_nv);
     }
 
     #[test]

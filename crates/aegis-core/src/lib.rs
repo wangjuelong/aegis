@@ -12,6 +12,7 @@ pub mod hashing;
 pub mod health;
 pub mod high_risk_ops;
 pub mod ioc;
+mod linux_tpm;
 pub mod migrations;
 pub mod ml;
 pub mod orchestrator;

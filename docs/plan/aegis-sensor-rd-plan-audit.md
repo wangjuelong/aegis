@@ -35,7 +35,9 @@
 - `TelemetryWal` / `ForensicJournal` 的 ACK-gated replay、待确认窗口与 `replay` 诊断状态已由 C07（提交 `3e34dcc`）收口
 - `upload_artifact` / `pull_update`、`update-state.json` 生命周期状态与 updater/`--diagnose` 共享状态面已由 C08（提交 `99ef1a0`）收口
 - 至此，第三轮在当前仓库内可闭合的 agent 差距已全部收口
-- 平台真实内核/系统集成与 TPM/Secure Enclave 绑定仍属于外部工程
+- Linux 平台用户态运行时已在 2026-04-19 的补录中完成真实 host capability probing、`/proc` 进程差分、auth log 采集、信号级响应、隔离/取证物料落盘与 Linux 容器验证
+- Linux 平台同日已继续补齐 eBPF 资产发现、pin root 规划、受控 `bpftool prog loadall` 装载状态机与 BPF 完整性状态表达
+- 剩余平台差距已收缩为：Linux 内核侧 `eBPF/LSM` 实际 attach 与强制执行、Windows/macOS 系统级集成，以及 TPM/Secure Enclave 正式硬件绑定
 
 ## 2. 审计方法
 
@@ -118,24 +120,27 @@
 
 ### 5.1 功能缺失
 
-从“计划覆盖”维度看，终态能力项仍在研发文档中；但从“仓库代码实现”维度看，在 `C08` 完成后，**仓库内已无新的 agent 研发缺口**。当前仍未落地的仅剩仓库外部工程：
+从“计划覆盖”维度看，终态能力项仍在研发文档中；从“仓库代码实现”维度看，在 `C08` 完成后，仓库内 agent 主链已闭合，且 Linux 平台用户态运行时已于 2026-04-19 进一步收口。当前仍未落地的仅剩：
 
-- 三平台真实内核/系统集成未落地
-- TPM / Secure Enclave / OS keystore 的正式硬件绑定仍未落地
+- Linux 内核侧真实 `.bpf.o` 资产、`tracepoint/kprobe/LSM` attach 物料，以及实际 attach、强制执行与特权安装链路
+- Windows 驱动 / ELAM / WFP / Minifilter 的真实系统级交付
+- macOS ESF / Network Extension / System Extension 的真实系统级交付
+- Windows/macOS 正式硬件根信任，以及 Linux sealed object / attestation 级别 TPM 绑定
 
 ### 5.2 功能妥协
 
-当前主要妥协已从第一轮的“骨架化闭环”收缩到仓库边界本身。当前事实妥协只剩：
+当前主要妥协已从第一轮的“骨架化闭环”收缩到系统级交付边界。当前事实妥协只剩：
 
-- 驱动 / System Extension / eBPF/LSM 等系统级集成仍未进入当前仓库
-- TPM / Secure Enclave / OS keystore 的正式硬件根信任仍未进入当前仓库
+- Linux 侧虽已具备真实用户态探测、响应、eBPF loader/pin/link 状态机与 attach contract，但真实 `.bpf.o` 资产和内核侧强制策略应用仍未正式进入当前仓库
+- Windows / macOS 仍未进入驱动、System Extension、签名和授权链路的真实系统级交付
+- Windows/macOS 正式硬件根信任仍未进入当前仓库，Linux TPM 当前仍停留在 NV index provider，而非 sealed object / attestation
 
 ### 5.3 设计妥协
 
 设计上保留了终态目标，但实现层仍存在以下事实上的降级：
 
-- 真实平台集成仍降为 in-memory provider 注入
-- 真实高危执行仍未进入跨平台系统级强制执行面
+- Linux 已不再是纯 in-memory provider 注入，且 TPM-backed key/rollback provider 已落地，但真实高危执行仍主要停留在用户态信号、文件物料和 firewall manifest 层，内核态强制执行未闭合
+- Windows / macOS 真实平台集成仍主要停留在基线/注入与状态表达层，尚未进入系统级强制执行面
 
 ## 6. 收口计划
 
