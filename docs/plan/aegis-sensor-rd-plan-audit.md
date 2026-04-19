@@ -37,7 +37,7 @@
 - 至此，第三轮在当前仓库内可闭合的 agent 差距已全部收口
 - Linux 平台用户态运行时已在 2026-04-19 的补录中完成真实 host capability probing、`/proc` 进程差分、auth log 采集、信号级响应、隔离/取证物料落盘与 Linux 容器验证
 - Linux 平台同日已继续补齐 eBPF 资产发现、pin root 规划、受控 `bpftool prog loadall` 装载状态机与 BPF 完整性状态表达
-- 剩余平台差距已收缩为：Windows/macOS 系统级集成，以及 Windows/macOS 正式硬件根信任与 Linux PCR policy session / 更高阶 attestation 级别 TPM 绑定
+- 剩余平台差距已收缩为：Windows/macOS 系统级集成，以及 Windows/macOS 正式硬件根信任与 Linux 更高阶 attestation 级别 TPM 绑定
 
 ## 2. 审计方法
 
@@ -122,7 +122,6 @@
 
 从“计划覆盖”维度看，终态能力项仍在研发文档中；从“仓库代码实现”维度看，在 `C08` 完成后，仓库内 agent 主链已闭合，且 Linux 平台用户态运行时已于 2026-04-19 进一步收口。当前仍未落地的仅剩：
 
-- Linux TPM PCR policy session 级别硬件根信任
 - Linux 更高阶 remote attestation / verifier 分离信任链
 - Windows 驱动 / ELAM / WFP / Minifilter 的真实系统级交付
 - macOS ESF / Network Extension / System Extension 的真实系统级交付
@@ -132,15 +131,15 @@
 
 当前主要妥协已从第一轮的“骨架化闭环”收缩到系统级交付边界。当前事实妥协只剩：
 
-- Linux 侧已具备真实用户态探测、响应、eBPF 资产、loader/pin/link 状态机、特权安装/验证脚本、sealed-object 主密钥路径与 quote/checkquote 基线，且新测试机 `192.168.1.6` 上的 eBPF 强制执行 smoke test、TPM sealed-object `create/unseal` 与 TPM quote/checkquote 真机验收均已收口
+- Linux 侧已具备真实用户态探测、响应、eBPF 资产、loader/pin/link 状态机、特权安装/验证脚本、sealed-object 主密钥路径、PCR policy session 与 quote/checkquote 基线，且新测试机 `192.168.1.6` 上的 eBPF 强制执行 smoke test、TPM sealed-object `create/unseal`、TPM quote/checkquote 与 TPM PCR policy session 真机验收均已收口
 - Windows / macOS 仍未进入驱动、System Extension、签名和授权链路的真实系统级交付
-- Windows/macOS 正式硬件根信任仍未进入当前仓库，Linux TPM 虽已具备 sealed-object 主密钥路径、NV fallback 与 quote/checkquote 基线，但 PCR policy session 与更高阶 attestation 信任链仍未进入当前仓库
+- Windows/macOS 正式硬件根信任仍未进入当前仓库，Linux TPM 虽已具备 sealed-object 主密钥路径、NV fallback、PCR policy session 与 quote/checkquote 基线，但更高阶 attestation 信任链仍未进入当前仓库
 
 ### 5.3 设计妥协
 
 设计上保留了终态目标，但实现层仍存在以下事实上的降级：
 
-- Linux 已不再是纯 in-memory provider 注入，且 TPM-backed key/rollback provider、sealed-object 主路径、quote/checkquote 基线与内核态强制执行真机验收均已落地；剩余差距仅在 PCR policy session 与更高阶 attestation 级别硬件根信任
+- Linux 已不再是纯 in-memory provider 注入，且 TPM-backed key/rollback provider、sealed-object 主路径、PCR policy session、quote/checkquote 基线与内核态强制执行真机验收均已落地；剩余差距仅在更高阶 attestation 级别硬件根信任
 - Windows / macOS 真实平台集成仍主要停留在基线/注入与状态表达层，尚未进入系统级强制执行面
 
 ## 6. 收口计划

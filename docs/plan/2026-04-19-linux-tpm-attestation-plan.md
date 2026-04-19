@@ -97,6 +97,12 @@
 
 ### 工作包 B：PCR policy session 绑定的 sealed-object 主密钥路径
 
+**状态**
+
+- 已完成（代码提交：`a61d5f7`）
+- 已通过本地 `cargo test -p aegis-core linux_tpm -- --nocapture`、`cargo test -p aegis-core`、`cargo check -p aegis-agentd`、`AEGIS_STATE_ROOT=$(mktemp -d) cargo run -p aegis-agentd -- --diagnose`
+- 已通过真机 `192.168.1.6` 上的 `scripts/linux-tpm-policy-verify.sh`
+
 **目标**
 
 - sealed-object 主密钥可选绑定到指定 PCR 集合
@@ -161,8 +167,8 @@
 1. 建立本计划文档
 2. 完成工作包 A 代码并提交（已完成：`f7db639`）
 3. 完成工作包 A 文档并提交
-4. 完成工作包 B 代码并提交
-5. 完成工作包 B 文档并提交
+4. 完成工作包 B 代码并提交（已完成：`a61d5f7`）
+5. 完成工作包 B 文档并提交（本次提交）
 6. 全量验证
 7. 合并到 `main`
 8. 推送 `main`
@@ -177,6 +183,6 @@
 - `cargo test -p aegis-platform`
 - 所有新增脚本 `bash -n` 通过
 - 文档中的 Linux 剩余差距已明确缩减为：
-  - attestation / quote 的更高阶远端信任链
+  - 更高阶 remote attestation / verifier 分离信任链
   - Secure Boot / IMA / EVM 等更强测量链
   - 更高阶生产部署或发行工程项

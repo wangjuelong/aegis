@@ -48,10 +48,10 @@
 | G00 | 缺口审计与执行基线重建 | baseline | 已完成第一轮 gap 文档基线，但结论仍然偏乐观 |
 | G01 | 高危操作执行链路加固 | superseded | 已由 C01 / C02 收口，原始 gap 基线不再作为当前判断依据 |
 | G02 | 通信回退运行时与诊断扩展 | superseded | 已由 C02 收口，原始 gap 基线不再作为当前判断依据 |
-| G03 | WAL 加密、恢复与证据链加固 | baseline | 已有 WAL 加密与校验能力；Linux TPM NV-backed 主密钥、sealed-object 路径与 quote/checkquote 基线已落地，剩余差距主要收缩到 Windows/macOS 正式硬件根信任与 Linux PCR policy session / 更高阶 attestation |
+| G03 | WAL 加密、恢复与证据链加固 | baseline | 已有 WAL 加密与校验能力；Linux TPM NV-backed 主密钥、sealed-object 路径、PCR policy session 与 quote/checkquote 基线已落地，剩余差距主要收缩到 Windows/macOS 正式硬件根信任与 Linux 更高阶 attestation |
 | G04 | 插件宿主、Watchdog 与 Updater 热更新链路 | superseded | 已由 C03 / C04 收口，原始 gap 基线不再作为当前判断依据 |
 | G05 | 容器、Sidecar 与 Serverless 运行时接入 | baseline | 契约与桥接对象已在，但不属于本轮完整性收口重点 |
-| G06 | 平台执行基线收口 | baseline | Linux 用户态运行时、eBPF 资产/装载/attach contract、TPM-backed key/rollback provider、sealed-object 与 quote/checkquote 基线已收口；剩余为 Linux PCR policy session、Windows 驱动链路与 macOS System Extension 系统级集成 |
+| G06 | 平台执行基线收口 | baseline | Linux 用户态运行时、eBPF 资产/装载/attach contract、TPM-backed key/rollback provider、sealed-object、PCR policy session 与 quote/checkquote 基线已收口；剩余为 Linux 更高阶 attestation、Windows 驱动链路与 macOS System Extension 系统级集成 |
 
 ## 第二轮 Agent 完整性收口状态
 
@@ -81,3 +81,4 @@
 | L04 | Linux 真实 eBPF 资产与特权安装/验证链路 | done | 已入仓 `packaging/linux-ebpf/` 真实 `process/file/network` BPF 资产、`autoattach`/`pinmaps` 运行时模型，以及 `scripts/linux-ebpf-{sync,install,verify,uninstall}.sh`；本地 `bash -n` 与 `cargo test -p aegis-platform` 通过，并已在测试机 `192.168.1.6` 上安装依赖、启用 `bpf` LSM、完成真实编译、装载、pin/link/map 校验和 `linux-ebpf-verify.sh` 强制执行 smoke test |
 | L05 | Linux TPM sealed-object 主密钥路径 | done | 已在 `aegis-core` 接入 sealed-object 主路径、sealed 优先 / NV fallback 逻辑、`TPM2TOOLS_TCTI` 设备绑定，并修正真实 `tpm2-tools` sealing 参数兼容性；本地 `cargo test -p aegis-core linux_tpm -- --nocapture` 通过，且测试机 `192.168.1.6` 已安装 `tpm2-tools` 并通过 `scripts/linux-tpm-sealed-verify.sh` 的 `create/unseal` 真机 roundtrip |
 | L06 | Linux TPM quote / checkquote attestation 基线 | done | 已在 `aegis-core` 接入 quote/checkquote 运行时、AK/PCR 配置、`--diagnose` attestation 状态与自检路径；本地已通过 `cargo check -p aegis-agentd`、`cargo test -p aegis-core linux_tpm -- --nocapture`、`AEGIS_STATE_ROOT=$(mktemp -d) cargo run -p aegis-agentd -- --diagnose`，测试机 `192.168.1.6` 已通过 `scripts/linux-tpm-quote-verify.sh` 的正反向真机验收 |
+| L07 | Linux TPM PCR policy session sealed-object 绑定 | done | 已在 `aegis-core` 接入 `linux_tpm_master_key_pcrs`、policy digest 创建与 `session:<ctx>` 解封逻辑；本地已通过 `cargo test -p aegis-core linux_tpm -- --nocapture`、`cargo test -p aegis-core`、`cargo check -p aegis-agentd`、`AEGIS_STATE_ROOT=$(mktemp -d) cargo run -p aegis-agentd -- --diagnose`，测试机 `192.168.1.6` 已通过 `scripts/linux-tpm-policy-verify.sh` 的正反向真机验收 |

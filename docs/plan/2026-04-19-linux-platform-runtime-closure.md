@@ -19,11 +19,12 @@
 - Linux 真实 eBPF 资产、`autoattach`/`pinmaps` 装载模型与特权安装/验证脚本
 - Linux TPM sealed-object 主密钥路径与 NV fallback
 - Linux TPM quote/checkquote attestation baseline
+- Linux TPM PCR policy session sealed-object binding
 - Linux 容器环境下的测试验证
 
 本次**不谎称完成**以下事项：
 
-- Linux TPM PCR policy session 与更高阶 remote attestation 级别硬件根信任
+- Linux 更高阶 remote attestation / verifier 分离信任链
 - Windows / macOS 的正式硬件根信任与系统级交付
 
 ## 2. 已交付能力
@@ -91,7 +92,7 @@ Linux 平台已新增面向内核侧集成的真实状态机：
 - 仓库已新增 `scripts/linux-tpm-sealed-verify.sh`，用于测试机上的 `createprimary/create/load/unseal` 真机 roundtrip 验收
 - 已修正 sealed-object 路径对真实 `tpm2-tools` 的参数兼容性问题：在 sealing input 模式下不再显式传 `-G keyedhash`
 - owner/index auth 通过环境变量注入，避免把敏感认证材料固化进配置文件
-- rollback anchor 仍基于 TPM NV index；PCR policy session 尚未进入当前仓库
+- rollback anchor 仍基于 TPM NV index；sealed-object 主路径现已支持可选 PCR policy 绑定
 
 ### 2.5 Linux TPM quote / checkquote attestation baseline
 
@@ -108,7 +109,21 @@ Linux 平台已新增面向内核侧集成的真实状态机：
 - 当前尚未进入 PCR policy session 绑定的 sealed-object 主密钥路径
 - 当前也未进入独立 verifier 的远端信任链闭环
 
-### 2.6 真实用户态事件采集
+### 2.6 Linux TPM PCR policy session sealed-object binding
+
+sealed-object 主密钥路径现已支持可选 PCR 绑定：
+
+- `SecurityConfig` 新增 `linux_tpm_master_key_pcrs`
+- create 路径会生成 PCR policy digest，并以 `-L policy.dat` 创建对象
+- unseal 路径会启动 `policy session`、执行 `tpm2_policypcr`，并通过 `-p session:<session.ctx>` 解封
+- 新增 `scripts/linux-tpm-policy-verify.sh`，覆盖正确 PCR 解封成功与错误 PCR 解封失败两条真机链路
+
+说明：
+
+- 当前 sealed-object 已不再只是“静态 create/unseal”，而是能受当前 PCR 状态约束
+- 当前仍未进入独立 verifier 的远端证明链闭环
+
+### 2.7 真实用户态事件采集
 
 `poll_events()` 不再只 drain 注入队列，现会先采集实时 Linux 事件：
 
@@ -116,7 +131,7 @@ Linux 平台已新增面向内核侧集成的真实状态机：
 - auth log 增量读取产生 `auth-log`
 - 注入事件仍保留，便于平台层单元测试
 
-### 2.7 真实响应与物料落盘
+### 2.8 真实响应与物料落盘
 
 以下动作已从“仅改内存快照”升级为真实用户态执行/落盘：
 
@@ -142,8 +157,9 @@ Linux 平台已新增面向内核侧集成的真实状态机：
 - `cargo test --workspace`
 - `cargo check -p aegis-agentd`
 - `cargo test -p aegis-core linux_tpm -- --nocapture`
+- `cargo test -p aegis-core`
 - `AEGIS_STATE_ROOT=$(mktemp -d) cargo run -p aegis-agentd -- --diagnose`
-- `bash -n scripts/linux-ebpf-install.sh scripts/linux-ebpf-verify.sh scripts/linux-ebpf-sync.sh scripts/linux-ebpf-uninstall.sh packaging/linux-ebpf/build.sh scripts/linux-tpm-sealed-verify.sh scripts/linux-tpm-quote-verify.sh`
+- `bash -n scripts/linux-ebpf-install.sh scripts/linux-ebpf-verify.sh scripts/linux-ebpf-sync.sh scripts/linux-ebpf-uninstall.sh packaging/linux-ebpf/build.sh scripts/linux-tpm-sealed-verify.sh scripts/linux-tpm-quote-verify.sh scripts/linux-tpm-policy-verify.sh`
 
 ### 3.2 Linux 容器验证
 
@@ -185,6 +201,7 @@ docker run --rm \
 - `scripts/linux-ebpf-verify.sh` 已通过最终强制执行 smoke test
 - `scripts/linux-tpm-sealed-verify.sh` 已通过 `createprimary/create/load/unseal` 真机 roundtrip
 - `scripts/linux-tpm-quote-verify.sh` 已通过 `createek/createak/quote/checkquote` 真机正反向校验
+- `scripts/linux-tpm-policy-verify.sh` 已通过 PCR policy session 的正反向真机校验
 
 补充说明：
 
@@ -196,7 +213,6 @@ docker run --rm \
 
 Linux 相关未完成项已收缩为：
 
-- Linux TPM PCR policy session 级别硬件根信任
 - 更高阶 remote attestation / verifier 分离信任链
 
 因此，Linux 平台现在可以诚实地标记为：
@@ -207,4 +223,5 @@ Linux 相关未完成项已收缩为：
 - Linux TPM-backed key protection / rollback anchor：已收口
 - Linux TPM sealed-object 主密钥路径：已收口
 - Linux TPM quote/checkquote attestation baseline：已收口
+- Linux TPM PCR policy session sealed-object binding：已收口
 - Linux 测试机最终强制执行验收：已收口
