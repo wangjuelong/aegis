@@ -46,10 +46,10 @@
 | 工作包 | 名称 | 状态 | 备注 |
 |--------|------|------|------|
 | G00 | 缺口审计与执行基线重建 | baseline | 已完成第一轮 gap 文档基线，但结论仍然偏乐观 |
-| G01 | 高危操作执行链路加固 | baseline | 模块原语已具备，但尚未接入主运行时命令链 |
-| G02 | 通信回退运行时与诊断扩展 | baseline | 仅完成 uplink 回退与诊断字段基础版，未形成 downlink/执行闭环 |
+| G01 | 高危操作执行链路加固 | superseded | 已由 C01 / C02 收口，原始 gap 基线不再作为当前判断依据 |
+| G02 | 通信回退运行时与诊断扩展 | superseded | 已由 C02 收口，原始 gap 基线不再作为当前判断依据 |
 | G03 | WAL 加密、恢复与证据链加固 | baseline | 已有 WAL 加密与校验能力，但仍与文档中的硬件绑定/正式密钥契约不一致 |
-| G04 | 插件宿主、Watchdog 与 Updater 热更新链路 | baseline | 当前仍停留在 demo/伪宿主级别，需第二轮收口 |
+| G04 | 插件宿主、Watchdog 与 Updater 热更新链路 | superseded | 已由 C03 / C04 收口，原始 gap 基线不再作为当前判断依据 |
 | G05 | 容器、Sidecar 与 Serverless 运行时接入 | baseline | 契约与桥接对象已在，但不属于本轮完整性收口重点 |
 | G06 | 平台执行基线收口 | baseline | 平台状态快照已存在，但真实内核/系统集成不在当前仓库内闭合 |
 
@@ -60,4 +60,4 @@
 | C01 | 运行时检测/决策/响应闭环 | done | 已打通 `sensor-dispatch -> detection-pool -> decision-router -> alert/response/telemetry`，并通过 `cargo test --workspace` |
 | C02 | 下行命令、持久化重放防护与高危执行链 | done | 已打通 `comms-rx -> validate -> execute -> ack`，并通过 `cargo test --workspace` |
 | C03 | 真实 `wasmtime` 插件宿主 | done | 已落地真实 `wasmtime` 宿主、fuel 预算和目录发现，并通过 `cargo test --workspace` |
-| C04 | watchdog、updater 与诊断面运行态化 | todo | 目标是用真实状态快照替代 demo 程序与静态诊断输出 |
+| C04 | watchdog、updater 与诊断面运行态化 | done | 已由 `88c6de2` 打通 agent/watchdog/update 三类状态快照与 `cargo run -p aegis-agentd -- --diagnose`、`cargo run -p aegis-watchdog -- --once`、`cargo run -p aegis-updater -- --once` |

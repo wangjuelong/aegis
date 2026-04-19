@@ -284,6 +284,43 @@ cargo run -p aegis-agentd -- --diagnose
   - `cargo run -p aegis-updater -- --once` 能验证传入清单
   - `cargo run -p aegis-agentd -- --diagnose` 返回的通信/插件/watchdog/runtime 字段来自状态快照
 
+**本次实际落地**
+
+- 代码提交：`88c6de2`
+- 实际改动文件收敛为：
+  - `Cargo.lock`
+  - `crates/aegis-agentd/src/main.rs`
+  - `crates/aegis-core/src/config.rs`
+  - `crates/aegis-core/src/upgrade.rs`
+  - `crates/aegis-updater/Cargo.toml`
+  - `crates/aegis-updater/src/main.rs`
+  - `crates/aegis-watchdog/src/main.rs`
+- `RuntimeStateStore` 已补齐 agent / watchdog / update 三类运行态快照的落盘与回读，并为 `DiagnoseBundle` 新增可选 `watchdog` 视图。
+- `aegis-agentd -- --diagnose` 已切换为优先读取持久化 agent 快照；若本机默认 `/var/lib/aegis` 不可写，会自动回退到仓库内 `target/aegis-dev/state`，并附带读取 `watchdog-state.json`。
+- `aegis-watchdog -- --once` 已改为从 agent 快照构建监测结果、执行 `WatchdogLinkMonitor`、落盘 `watchdog-state.json`，而不是输出静态示例对象。
+- `aegis-updater -- --once` 已改为读取或自动种入 `updates/manifest.json`、`artifact.bin`、`rollback.bin`，执行真实签名与摘要校验，并落盘 `update-state.json`。
+- `aegis-updater` 额外支持 `--manifest`、`--artifact`、`--rollback`、`--state-root` 参数，便于对外部 staged 文件做一次性验签。
+- `AgentConfig` 已补充 `with_state_root`，确保 CLI 在开发环境下能统一重绑定可写的运行态目录。
+
+**验证**
+
+```bash
+cargo fmt --all
+cargo test --workspace
+cargo run -p aegis-agentd -- --diagnose
+cargo run -p aegis-watchdog -- --once
+cargo run -p aegis-updater -- --once
+cargo run -p aegis-agentd -- --diagnose
+```
+
+**完成后仍保留的后续项**
+
+- 本轮仓库内 merge gate 已全部闭合。
+- 剩余事项仅为外部工程：
+  - `X01` 三平台真实内核/系统集成
+  - `X02` 硬件绑定密钥与内存强化
+  - `X03` 传输栈正式化
+
 ## 4. 外部工程工作包
 
 以下工作包必须保留，但不属于本轮 merge gate：
