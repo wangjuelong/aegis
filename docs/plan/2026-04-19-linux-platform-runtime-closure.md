@@ -18,11 +18,12 @@
 - Linux TPM NV index-backed 主密钥与 rollback anchor provider
 - Linux 真实 eBPF 资产、`autoattach`/`pinmaps` 装载模型与特权安装/验证脚本
 - Linux TPM sealed-object 主密钥路径与 NV fallback
+- Linux TPM quote/checkquote attestation baseline
 - Linux 容器环境下的测试验证
 
 本次**不谎称完成**以下事项：
 
-- Linux TPM policy session / attestation / quote 级别硬件根信任
+- Linux TPM PCR policy session 与更高阶 remote attestation 级别硬件根信任
 - Windows / macOS 的正式硬件根信任与系统级交付
 
 ## 2. 已交付能力
@@ -90,9 +91,24 @@ Linux 平台已新增面向内核侧集成的真实状态机：
 - 仓库已新增 `scripts/linux-tpm-sealed-verify.sh`，用于测试机上的 `createprimary/create/load/unseal` 真机 roundtrip 验收
 - 已修正 sealed-object 路径对真实 `tpm2-tools` 的参数兼容性问题：在 sealing input 模式下不再显式传 `-G keyedhash`
 - owner/index auth 通过环境变量注入，避免把敏感认证材料固化进配置文件
-- rollback anchor 仍基于 TPM NV index；policy session / attestation 尚未进入当前仓库
+- rollback anchor 仍基于 TPM NV index；PCR policy session 尚未进入当前仓库
 
-### 2.5 真实用户态事件采集
+### 2.5 Linux TPM quote / checkquote attestation baseline
+
+`aegis-core` 与 `aegis-agentd` 已新增 Linux TPM quote 基线能力：
+
+- `SecurityConfig` 新增 attestation AK 路径与 PCR 选择配置
+- `linux_tpm.rs` 新增 `tpm2_createek` / `tpm2_createak` / `tpm2_quote` / `tpm2_checkquote` 运行时探测与 quote roundtrip
+- `self_protection` / `--diagnose` 诊断面新增 attestation readiness、PCR 选择与自检错误输出
+- 新增 `scripts/linux-tpm-quote-verify.sh`，覆盖真机正向 `checkquote` 与错误 nonce 负向校验
+
+说明：
+
+- 当前 attestation 已进入“单机 quote/checkquote 闭环”阶段
+- 当前尚未进入 PCR policy session 绑定的 sealed-object 主密钥路径
+- 当前也未进入独立 verifier 的远端信任链闭环
+
+### 2.6 真实用户态事件采集
 
 `poll_events()` 不再只 drain 注入队列，现会先采集实时 Linux 事件：
 
@@ -100,7 +116,7 @@ Linux 平台已新增面向内核侧集成的真实状态机：
 - auth log 增量读取产生 `auth-log`
 - 注入事件仍保留，便于平台层单元测试
 
-### 2.6 真实响应与物料落盘
+### 2.7 真实响应与物料落盘
 
 以下动作已从“仅改内存快照”升级为真实用户态执行/落盘：
 
@@ -124,8 +140,10 @@ Linux 平台已新增面向内核侧集成的真实状态机：
 - `cargo test -p aegis-core`
 - `cargo test -p aegis-platform`
 - `cargo test --workspace`
+- `cargo check -p aegis-agentd`
 - `cargo test -p aegis-core linux_tpm -- --nocapture`
-- `bash -n scripts/linux-ebpf-install.sh scripts/linux-ebpf-verify.sh scripts/linux-ebpf-sync.sh scripts/linux-ebpf-uninstall.sh packaging/linux-ebpf/build.sh scripts/linux-tpm-sealed-verify.sh`
+- `AEGIS_STATE_ROOT=$(mktemp -d) cargo run -p aegis-agentd -- --diagnose`
+- `bash -n scripts/linux-ebpf-install.sh scripts/linux-ebpf-verify.sh scripts/linux-ebpf-sync.sh scripts/linux-ebpf-uninstall.sh packaging/linux-ebpf/build.sh scripts/linux-tpm-sealed-verify.sh scripts/linux-tpm-quote-verify.sh`
 
 ### 3.2 Linux 容器验证
 
@@ -166,6 +184,7 @@ docker run --rm \
 - `bpftool link show` 已确认 `tracepoint`、`kprobe` 与 `lsm/*` link 被创建
 - `scripts/linux-ebpf-verify.sh` 已通过最终强制执行 smoke test
 - `scripts/linux-tpm-sealed-verify.sh` 已通过 `createprimary/create/load/unseal` 真机 roundtrip
+- `scripts/linux-tpm-quote-verify.sh` 已通过 `createek/createak/quote/checkquote` 真机正反向校验
 
 补充说明：
 
@@ -177,7 +196,8 @@ docker run --rm \
 
 Linux 相关未完成项已收缩为：
 
-- Linux TPM attestation / quote / policy session 级别硬件根信任
+- Linux TPM PCR policy session 级别硬件根信任
+- 更高阶 remote attestation / verifier 分离信任链
 
 因此，Linux 平台现在可以诚实地标记为：
 
@@ -186,4 +206,5 @@ Linux 相关未完成项已收缩为：
 - 内核态真实资产与特权安装链：已收口
 - Linux TPM-backed key protection / rollback anchor：已收口
 - Linux TPM sealed-object 主密钥路径：已收口
+- Linux TPM quote/checkquote attestation baseline：已收口
 - Linux 测试机最终强制执行验收：已收口

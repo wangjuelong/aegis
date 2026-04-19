@@ -33,6 +33,12 @@
 
 ### 工作包 A：Linux TPM quote / checkquote 闭环
 
+**状态**
+
+- 已完成（代码提交：`f7db639`）
+- 已通过本地 `cargo check -p aegis-agentd`、`cargo test -p aegis-core linux_tpm -- --nocapture`、`AEGIS_STATE_ROOT=$(mktemp -d) cargo run -p aegis-agentd -- --diagnose`
+- 已通过真机 `192.168.1.6` 上的 `scripts/linux-tpm-quote-verify.sh`
+
 **目标**
 
 - `aegis-core` 具备生成 quote 与本地校验 quote 的能力
@@ -153,7 +159,7 @@
 按以下顺序执行并提交：
 
 1. 建立本计划文档
-2. 完成工作包 A 代码并提交
+2. 完成工作包 A 代码并提交（已完成：`f7db639`）
 3. 完成工作包 A 文档并提交
 4. 完成工作包 B 代码并提交
 5. 完成工作包 B 文档并提交

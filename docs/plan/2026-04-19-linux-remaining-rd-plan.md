@@ -34,7 +34,8 @@
 
 尚未完成：
 
-- Linux TPM attestation / quote / policy session 级别硬件根信任
+- Linux TPM PCR policy session 级别硬件根信任
+- 更高阶 remote attestation / verifier 分离信任链
 - 更高阶生产部署或发行工程项
 
 ## 3. 当前进度快照（2026-04-19 续）
@@ -43,7 +44,8 @@
 - B01：代码已完成。`packaging/linux-ebpf/` 已入仓真实 `process/file/network` BPF 资产、`build.sh`、`README.md` 和 manifest。
 - B02：done。已在新测试机 `192.168.1.6` 安装 `clang` / `llvm` / `libbpf-dev`，写入 `lsm=lockdown,capability,bpf,landlock,yama,apparmor` 并重启生效；`scripts/linux-ebpf-{sync,install,verify,uninstall}.sh` 已完成真实编译、装载、pin/link/map 校验与最终 verify smoke test。
 - B03：done。已修正 sealed-object 路径对真实 `tpm2-tools` 的参数兼容性问题（sealing input 不再显式传 `-G keyedhash`），并在新测试机 `192.168.1.6` 安装 `tpm2-tools` 后通过 `scripts/linux-tpm-sealed-verify.sh` 的 `create + unseal` 真机 roundtrip。
-- B04：done。环境文档、状态文档、审计文档与 Linux 收口记录已同步更新，本轮 Linux 剩余研发只剩 attestation / quote 与更高阶发行工程项。
+- B04：done。环境文档、状态文档、审计文档与 Linux 收口记录已同步更新，为后续 TPM attestation 收口提供了统一事实基线。
+- B05：done。`aegis-core` 已新增 Linux TPM quote/checkquote 运行时、诊断状态与自检路径；测试机 `192.168.1.6` 已通过 `scripts/linux-tpm-quote-verify.sh` 的正反向验收，Linux 剩余研发已缩减为 PCR policy session 与更高阶 attestation 信任链。
 
 ## 4. 执行规则
 
@@ -170,9 +172,10 @@ Linux 测试机来源：`docs/env/开发环境.md`
 
 仅当以下条件同时满足，才可将本轮 Linux 剩余计划标记为完成：
 
-- B00-B04 全部完成并提交
+- B00-B05 全部完成并提交
 - Linux 测试机完成 eBPF build/install/verify/uninstall
 - Linux 测试机完成 TPM sealed-object create/unseal 验证
+- Linux 测试机完成 TPM quote/checkquote 验证
 - 文档中的 Linux 剩余差距不再包含：
   - 真实 `.bpf.o` 资产缺失
   - 安装/装载/附着链路缺失
@@ -180,5 +183,5 @@ Linux 测试机来源：`docs/env/开发环境.md`
 
 若仍有剩余项，应只允许保留：
 
-- attestation / quote / 远端证明链
+- PCR policy session / 远端证明链
 - 更高阶生产部署或发行工程项
