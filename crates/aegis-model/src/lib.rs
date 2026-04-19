@@ -817,6 +817,54 @@ pub struct PluginHealthStatus {
     pub crash_count: u32,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotUpdateManifest {
+    pub artifact_id: String,
+    pub target_version: String,
+    pub rollout_channel: String,
+    pub target_conf_version: u32,
+    pub target_schema_version: i64,
+    pub artifact_sha256: String,
+    pub rollback_artifact_id: Option<String>,
+    pub rollback_artifact_sha256: Option<String>,
+    pub signature: Vec<u8>,
+    pub signing_key_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentSupervisorHeartbeat {
+    pub tenant_id: String,
+    pub agent_id: String,
+    pub plugin_count: usize,
+    pub degraded_plugins: usize,
+    pub active_update_id: Option<String>,
+    pub sent_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WatchdogHeartbeat {
+    pub tenant_id: String,
+    pub agent_id: String,
+    pub watchdog_id: String,
+    pub observed_agent_restart_epoch: u64,
+    pub unhealthy_plugins: usize,
+    pub sent_at_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum WatchdogAlertKind {
+    AgentMissedHeartbeat,
+    WatchdogMissedHeartbeat,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WatchdogAlert {
+    pub kind: WatchdogAlertKind,
+    pub message: String,
+    pub last_seen_ms: Option<i64>,
+    pub observed_at_ms: i64,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RuntimeProviderKind {
     AwsLambda,
@@ -931,12 +979,13 @@ pub struct CloudApiConnectorContract {
 #[cfg(test)]
 mod tests {
     use super::{
-        CloudApiConnectorContract, CloudApiRecord, CloudConnectorCursor, CloudLogSourceKind,
-        CommunicationChannelKind, CommunicationRuntimeStatus, EventBatch, EventPayload, EventType,
-        FileContext, NormalizedEvent, PluginHealthStatus, Priority, ProcessContext,
-        RuntimeHealthSignals, RuntimeHeartbeat, RuntimeMetadata, RuntimePolicyContract,
-        RuntimeProviderKind, RuntimeSdkEvent, RuntimeSignalKind, Severity, TelemetryEvent,
-        TelemetryIntegrity, UplinkMessage,
+        AgentSupervisorHeartbeat, CloudApiConnectorContract, CloudApiRecord, CloudConnectorCursor,
+        CloudLogSourceKind, CommunicationChannelKind, CommunicationRuntimeStatus, EventBatch,
+        EventPayload, EventType, FileContext, HotUpdateManifest, NormalizedEvent,
+        PluginHealthStatus, Priority, ProcessContext, RuntimeHealthSignals, RuntimeHeartbeat,
+        RuntimeMetadata, RuntimePolicyContract, RuntimeProviderKind, RuntimeSdkEvent,
+        RuntimeSignalKind, Severity, TelemetryEvent, TelemetryIntegrity, UplinkMessage,
+        WatchdogAlert, WatchdogAlertKind, WatchdogHeartbeat,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -1105,6 +1154,40 @@ mod tests {
             state: "running".to_string(),
             crash_count: 0,
         };
+        let manifest = HotUpdateManifest {
+            artifact_id: "artifact-42".to_string(),
+            target_version: "1.2.3".to_string(),
+            rollout_channel: "canary".to_string(),
+            target_conf_version: 2,
+            target_schema_version: 4,
+            artifact_sha256: "abc123".to_string(),
+            rollback_artifact_id: Some("artifact-41".to_string()),
+            rollback_artifact_sha256: Some("def456".to_string()),
+            signature: vec![1, 2, 3],
+            signing_key_id: "server-k1".to_string(),
+        };
+        let agent_supervisor = AgentSupervisorHeartbeat {
+            tenant_id: "tenant-a".to_string(),
+            agent_id: "agent-a".to_string(),
+            plugin_count: 1,
+            degraded_plugins: 0,
+            active_update_id: Some("artifact-42".to_string()),
+            sent_at_ms: 1_713_000_200_000,
+        };
+        let watchdog = WatchdogHeartbeat {
+            tenant_id: "tenant-a".to_string(),
+            agent_id: "agent-a".to_string(),
+            watchdog_id: "watchdog-local".to_string(),
+            observed_agent_restart_epoch: 3,
+            unhealthy_plugins: 0,
+            sent_at_ms: 1_713_000_200_100,
+        };
+        let alert = WatchdogAlert {
+            kind: WatchdogAlertKind::WatchdogMissedHeartbeat,
+            message: "watchdog heartbeat overdue".to_string(),
+            last_seen_ms: Some(1_713_000_199_000),
+            observed_at_ms: 1_713_000_205_000,
+        };
 
         assert_eq!(event.contract_version, heartbeat.contract_version);
         assert_eq!(heartbeat.policy_version, policy.policy_version);
@@ -1116,5 +1199,12 @@ mod tests {
         );
         assert_eq!(communication.active_channel, CommunicationChannelKind::Grpc);
         assert!(plugin.healthy);
+        assert_eq!(
+            manifest.rollback_artifact_id.as_deref(),
+            Some("artifact-41")
+        );
+        assert_eq!(agent_supervisor.plugin_count, 1);
+        assert_eq!(watchdog.observed_agent_restart_epoch, 3);
+        assert_eq!(alert.kind, WatchdogAlertKind::WatchdogMissedHeartbeat);
     }
 }

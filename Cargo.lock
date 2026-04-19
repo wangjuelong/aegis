@@ -71,7 +71,12 @@ dependencies = [
 name = "aegis-updater"
 version = "0.1.0"
 dependencies = [
+ "aegis-core",
+ "aegis-model",
  "anyhow",
+ "ed25519-dalek",
+ "hex",
+ "sha2",
  "tracing",
  "tracing-subscriber",
 ]
@@ -80,6 +85,8 @@ dependencies = [
 name = "aegis-watchdog"
 version = "0.1.0"
 dependencies = [
+ "aegis-core",
+ "aegis-model",
  "anyhow",
  "tracing",
  "tracing-subscriber",

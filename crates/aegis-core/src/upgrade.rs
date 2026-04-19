@@ -2,12 +2,15 @@ use crate::config::{AgentConfig, CURRENT_CONF_VERSION};
 use crate::migrations::{CURRENT_SCHEMA_VERSION, MIN_READER_SCHEMA_VERSION};
 use crate::self_protection::ProtectionPosture;
 use aegis_model::{
-    AgentHealth, CommunicationRuntimeStatus, PluginHealthStatus, RuntimeHealthSignals,
-    TelemetryIntegrity,
+    AgentHealth, AgentSupervisorHeartbeat, CommunicationRuntimeStatus, HotUpdateManifest,
+    PluginHealthStatus, RuntimeHealthSignals, TelemetryIntegrity, WatchdogAlert, WatchdogAlertKind,
+    WatchdogHeartbeat,
 };
 use anyhow::{bail, Result};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -128,6 +131,151 @@ impl RolloutGateEvaluator {
     }
 }
 
+pub struct HotUpdateManifestVerifier {
+    signing_keys: HashMap<String, VerifyingKey>,
+}
+
+impl HotUpdateManifestVerifier {
+    pub fn new() -> Self {
+        Self {
+            signing_keys: HashMap::new(),
+        }
+    }
+
+    pub fn register_signing_key(
+        &mut self,
+        key_id: impl Into<String>,
+        public_key_bytes: [u8; 32],
+    ) -> Result<()> {
+        let verifying_key = VerifyingKey::from_bytes(&public_key_bytes)?;
+        self.signing_keys.insert(key_id.into(), verifying_key);
+        Ok(())
+    }
+
+    pub fn verify_manifest(
+        &self,
+        manifest: &HotUpdateManifest,
+        artifact_bytes: &[u8],
+        rollback_artifact_bytes: Option<&[u8]>,
+    ) -> Result<()> {
+        let verifying_key = self
+            .signing_keys
+            .get(&manifest.signing_key_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown update signing key"))?;
+        if sha256_hex(artifact_bytes) != manifest.artifact_sha256 {
+            bail!("artifact digest mismatch");
+        }
+        match (
+            manifest.rollback_artifact_id.as_deref(),
+            manifest.rollback_artifact_sha256.as_deref(),
+        ) {
+            (Some(_), Some(expected_digest)) => {
+                let rollback_bytes = rollback_artifact_bytes
+                    .ok_or_else(|| anyhow::anyhow!("missing rollback artifact payload"))?;
+                if sha256_hex(rollback_bytes) != expected_digest {
+                    bail!("rollback artifact digest mismatch");
+                }
+            }
+            (Some(_), None) => bail!("rollback artifact digest missing"),
+            (None, Some(_)) => bail!("rollback digest provided without rollback artifact"),
+            (None, None) => {}
+        }
+
+        let signature = Signature::from_slice(&manifest.signature)
+            .map_err(|_| anyhow::anyhow!("invalid manifest signature"))?;
+        verifying_key
+            .verify(&Self::canonical_payload(manifest), &signature)
+            .map_err(|_| anyhow::anyhow!("invalid manifest signature"))?;
+        Ok(())
+    }
+
+    pub fn canonical_payload(manifest: &HotUpdateManifest) -> Vec<u8> {
+        #[derive(Serialize)]
+        struct CanonicalHotUpdateManifest<'a> {
+            artifact_id: &'a str,
+            target_version: &'a str,
+            rollout_channel: &'a str,
+            target_conf_version: u32,
+            target_schema_version: i64,
+            artifact_sha256: &'a str,
+            rollback_artifact_id: Option<&'a str>,
+            rollback_artifact_sha256: Option<&'a str>,
+            signing_key_id: &'a str,
+        }
+
+        serde_json::to_vec(&CanonicalHotUpdateManifest {
+            artifact_id: &manifest.artifact_id,
+            target_version: &manifest.target_version,
+            rollout_channel: &manifest.rollout_channel,
+            target_conf_version: manifest.target_conf_version,
+            target_schema_version: manifest.target_schema_version,
+            artifact_sha256: &manifest.artifact_sha256,
+            rollback_artifact_id: manifest.rollback_artifact_id.as_deref(),
+            rollback_artifact_sha256: manifest.rollback_artifact_sha256.as_deref(),
+            signing_key_id: &manifest.signing_key_id,
+        })
+        .expect("hot update manifest should serialize")
+    }
+}
+
+impl Default for HotUpdateManifestVerifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct WatchdogLinkMonitor {
+    grace_period_ms: i64,
+    last_agent: Option<AgentSupervisorHeartbeat>,
+    last_watchdog: Option<WatchdogHeartbeat>,
+}
+
+impl WatchdogLinkMonitor {
+    pub fn new(grace_period_ms: i64) -> Self {
+        Self {
+            grace_period_ms: grace_period_ms.max(1),
+            last_agent: None,
+            last_watchdog: None,
+        }
+    }
+
+    pub fn observe_agent(&mut self, heartbeat: AgentSupervisorHeartbeat) {
+        self.last_agent = Some(heartbeat);
+    }
+
+    pub fn observe_watchdog(&mut self, heartbeat: WatchdogHeartbeat) {
+        self.last_watchdog = Some(heartbeat);
+    }
+
+    pub fn evaluate(&self, now_ms: i64) -> Vec<WatchdogAlert> {
+        let mut alerts = Vec::new();
+
+        if let Some(agent) = &self.last_agent {
+            if now_ms.saturating_sub(agent.sent_at_ms) > self.grace_period_ms {
+                alerts.push(WatchdogAlert {
+                    kind: WatchdogAlertKind::AgentMissedHeartbeat,
+                    message: format!("agent heartbeat overdue for {}", agent.agent_id),
+                    last_seen_ms: Some(agent.sent_at_ms),
+                    observed_at_ms: now_ms,
+                });
+            }
+        }
+
+        if let Some(watchdog) = &self.last_watchdog {
+            if now_ms.saturating_sub(watchdog.sent_at_ms) > self.grace_period_ms {
+                alerts.push(WatchdogAlert {
+                    kind: WatchdogAlertKind::WatchdogMissedHeartbeat,
+                    message: format!("watchdog heartbeat overdue for {}", watchdog.watchdog_id),
+                    last_seen_ms: Some(watchdog.sent_at_ms),
+                    observed_at_ms: now_ms,
+                });
+            }
+        }
+
+        alerts
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiagnoseConnectionStatus {
     pub control_plane_url: String,
@@ -221,16 +369,18 @@ impl DiagnoseCollector {
 mod tests {
     use super::{
         CanaryGateDecision, CanaryGateThresholds, CanaryObservation, DiagnoseCertificateStatus,
-        DiagnoseCollector, DiagnoseSensorStatus, DiagnoseWalStatus, RolloutGateEvaluator,
-        UpgradeArtifact, UpgradePlanner,
+        DiagnoseCollector, DiagnoseSensorStatus, DiagnoseWalStatus, HotUpdateManifestVerifier,
+        RolloutGateEvaluator, UpgradeArtifact, UpgradePlanner, WatchdogLinkMonitor,
     };
     use crate::config::AgentConfig;
     use crate::health::HealthReporter;
     use crate::self_protection::ProtectionPosture;
     use aegis_model::{
-        CommunicationChannelKind, CommunicationRuntimeStatus, LineageCounters, PluginHealthStatus,
-        RuntimeHealthSignals, TelemetryIntegrity,
+        AgentSupervisorHeartbeat, CommunicationChannelKind, CommunicationRuntimeStatus,
+        HotUpdateManifest, LineageCounters, PluginHealthStatus, RuntimeHealthSignals,
+        TelemetryIntegrity, WatchdogAlertKind, WatchdogHeartbeat,
     };
+    use ed25519_dalek::{Signer, SigningKey};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
@@ -304,6 +454,89 @@ mod tests {
         assert_eq!(lockdown, CanaryGateDecision::Rollback);
     }
 
+    fn signed_manifest(
+        signing_key: &SigningKey,
+        artifact_bytes: &[u8],
+        rollback_bytes: Option<&[u8]>,
+    ) -> HotUpdateManifest {
+        let mut manifest = HotUpdateManifest {
+            artifact_id: "artifact-42".to_string(),
+            target_version: "1.2.3".to_string(),
+            rollout_channel: "canary".to_string(),
+            target_conf_version: 2,
+            target_schema_version: 3,
+            artifact_sha256: super::sha256_hex(artifact_bytes),
+            rollback_artifact_id: rollback_bytes.map(|_| "artifact-41".to_string()),
+            rollback_artifact_sha256: rollback_bytes.map(super::sha256_hex),
+            signature: Vec::new(),
+            signing_key_id: "server-k1".to_string(),
+        };
+        manifest.signature = signing_key
+            .sign(&HotUpdateManifestVerifier::canonical_payload(&manifest))
+            .to_bytes()
+            .to_vec();
+        manifest
+    }
+
+    #[test]
+    fn hot_update_manifest_verifier_rejects_invalid_signature() {
+        let server_signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let wrong_signing_key = SigningKey::from_bytes(&[10u8; 32]);
+        let artifact = b"agent-binary";
+        let rollback = b"agent-binary-prev";
+        let manifest = signed_manifest(&wrong_signing_key, artifact, Some(rollback));
+        let mut verifier = HotUpdateManifestVerifier::new();
+        verifier
+            .register_signing_key("server-k1", server_signing_key.verifying_key().to_bytes())
+            .expect("register signing key");
+
+        let result = verifier.verify_manifest(&manifest, artifact, Some(rollback));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn hot_update_manifest_verifier_rejects_rollback_digest_mismatch() {
+        let signing_key = SigningKey::from_bytes(&[11u8; 32]);
+        let artifact = b"agent-binary";
+        let rollback = b"agent-binary-prev";
+        let manifest = signed_manifest(&signing_key, artifact, Some(rollback));
+        let mut verifier = HotUpdateManifestVerifier::new();
+        verifier
+            .register_signing_key("server-k1", signing_key.verifying_key().to_bytes())
+            .expect("register signing key");
+
+        let result = verifier.verify_manifest(&manifest, artifact, Some(b"rollback-other"));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn watchdog_link_monitor_detects_missed_watchdog_heartbeat() {
+        let mut monitor = WatchdogLinkMonitor::new(1_000);
+        monitor.observe_agent(AgentSupervisorHeartbeat {
+            tenant_id: "tenant-a".to_string(),
+            agent_id: "agent-a".to_string(),
+            plugin_count: 2,
+            degraded_plugins: 0,
+            active_update_id: None,
+            sent_at_ms: 2_200,
+        });
+        monitor.observe_watchdog(WatchdogHeartbeat {
+            tenant_id: "tenant-a".to_string(),
+            agent_id: "agent-a".to_string(),
+            watchdog_id: "watchdog-a".to_string(),
+            observed_agent_restart_epoch: 3,
+            unhealthy_plugins: 0,
+            sent_at_ms: 1_000,
+        });
+
+        let alerts = monitor.evaluate(2_500);
+
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].kind, WatchdogAlertKind::WatchdogMissedHeartbeat);
+    }
+
     #[test]
     fn diagnose_collector_builds_redacted_bundle() {
         let bundle = DiagnoseCollector::collect(
@@ -366,4 +599,8 @@ mod tests {
             .redacted_fields
             .contains(&"server_signing_keys".to_string()));
     }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
 }

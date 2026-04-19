@@ -2,13 +2,17 @@ use aegis_core::comms::CommunicationRuntime;
 use aegis_core::config::AppConfig;
 use aegis_core::health::HealthReporter;
 use aegis_core::orchestrator::Orchestrator;
+use aegis_core::plugin_host::PluginHost;
 use aegis_core::self_protection::ProtectionPosture;
 use aegis_core::upgrade::{
     DiagnoseCertificateStatus, DiagnoseCollector, DiagnoseSensorStatus, DiagnoseWalStatus,
 };
-use aegis_model::{LineageCounters, RuntimeHealthSignals, TelemetryIntegrity};
+use aegis_model::{
+    AgentSupervisorHeartbeat, LineageCounters, RuntimeHealthSignals, TelemetryIntegrity,
+};
 use anyhow::Result;
 use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 
 #[tokio::main]
@@ -16,6 +20,7 @@ async fn main() -> Result<()> {
     if std::env::args().any(|arg| arg == "--diagnose") {
         let config = AppConfig::default();
         let communication = CommunicationRuntime::with_loopback_drivers(3).snapshot();
+        let plugin_status = PluginHost::default().statuses();
         let health = HealthReporter::build_snapshot(
             "0.1.0",
             &format!("bundle-{}", config.policy_version.policy_bundle),
@@ -73,7 +78,7 @@ async fn main() -> Result<()> {
                 quarantined_segments: 0,
             },
             health,
-            vec![],
+            plugin_status,
             ProtectionPosture::Normal,
         );
         println!("{}", DiagnoseCollector::to_json(&bundle)?);
@@ -87,14 +92,28 @@ async fn main() -> Result<()> {
     let orchestrator = Orchestrator::new(config);
     let artifacts = orchestrator.bootstrap()?;
     let summary = &artifacts.summary;
+    let plugin_status = PluginHost::default().statuses();
+    let supervisor_heartbeat = AgentSupervisorHeartbeat {
+        tenant_id: summary.tenant_id.clone(),
+        agent_id: summary.agent_id.clone(),
+        plugin_count: plugin_status.len(),
+        degraded_plugins: plugin_status
+            .iter()
+            .filter(|plugin| !plugin.healthy)
+            .count(),
+        active_update_id: None,
+        sent_at_ms: now_unix_ms(),
+    };
 
     info!(
         agent_id = %summary.agent_id,
         tenant_id = %summary.tenant_id,
         control_plane_url = %summary.control_plane_url,
         communication_channel = ?summary.communication_channel,
+        plugin_count = supervisor_heartbeat.plugin_count,
+        degraded_plugins = supervisor_heartbeat.degraded_plugins,
         tasks = ?summary.task_topology,
-        "aegis-agentd runtime skeleton bootstrapped"
+        "aegis-agentd runtime bootstrapped"
     );
 
     let runtime = orchestrator.start(artifacts);
@@ -104,4 +123,11 @@ async fn main() -> Result<()> {
     info!(tasks = ?stopped_tasks, "aegis-agentd runtime stopped");
 
     Ok(())
+}
+
+fn now_unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_millis() as i64
 }
