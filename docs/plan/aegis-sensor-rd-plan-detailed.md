@@ -384,6 +384,11 @@
   - 建立预签名 playbook 执行上下文
 - 验收：
   - 测试覆盖审批排队、playbook 约束、remote shell 审计
+- 完成记录（2026-04-19）：
+  - 已建立 `ApprovalQueue`，支持高危请求排队与审批状态流转
+  - 已建立 `RemoteShellRuntime`、`PreApprovedPlaybook` 与 `PlaybookRuntime`
+  - 已建立 `SessionLockRuntime` 与统一高危动作审计记录
+  - 已通过审批排队、remote shell 约束、playbook 执行与会话锁定审计测试
 
 ### P21：Self-Protection / Keys / Crash Exploit Analysis
 
