@@ -21,3 +21,4 @@ toml.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 aegis-model = { path = "../aegis-model" }
+aegis-platform = { path = "../aegis-platform" }
