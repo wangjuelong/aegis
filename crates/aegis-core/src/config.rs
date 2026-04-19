@@ -55,6 +55,109 @@ impl Default for RuntimeConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GrpcCommunicationConfig {
+    pub enabled: bool,
+    pub endpoint: String,
+}
+
+impl Default for GrpcCommunicationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            endpoint: "http://127.0.0.1:7443".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebSocketCommunicationConfig {
+    pub enabled: bool,
+    pub endpoint: String,
+}
+
+impl Default for WebSocketCommunicationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            endpoint: "ws://127.0.0.1:7444/ws".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HttpPollingCommunicationConfig {
+    pub enabled: bool,
+    pub uplink_url: String,
+    pub heartbeat_url: String,
+    pub downlink_url: String,
+    pub probe_url: String,
+    pub timeout_ms: u64,
+}
+
+impl Default for HttpPollingCommunicationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            uplink_url: "http://127.0.0.1:7445/uplink".to_string(),
+            heartbeat_url: "http://127.0.0.1:7445/heartbeat".to_string(),
+            downlink_url: "http://127.0.0.1:7445/downlink".to_string(),
+            probe_url: "http://127.0.0.1:7445/probe".to_string(),
+            timeout_ms: 2_000,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DomainFrontingCommunicationConfig {
+    pub enabled: bool,
+    pub uplink_url: String,
+    pub heartbeat_url: String,
+    pub downlink_url: String,
+    pub probe_url: String,
+    pub timeout_ms: u64,
+    pub front_domain: String,
+    pub host_header: String,
+}
+
+impl Default for DomainFrontingCommunicationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            uplink_url: "http://127.0.0.1:7446/uplink".to_string(),
+            heartbeat_url: "http://127.0.0.1:7446/heartbeat".to_string(),
+            downlink_url: "http://127.0.0.1:7446/downlink".to_string(),
+            probe_url: "http://127.0.0.1:7446/probe".to_string(),
+            timeout_ms: 5_000,
+            front_domain: "cdn.example.com".to_string(),
+            host_header: "control-plane.aegis.local".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommunicationConfig {
+    pub failure_threshold: u32,
+    pub development_allow_loopback: bool,
+    pub grpc: GrpcCommunicationConfig,
+    pub websocket: WebSocketCommunicationConfig,
+    pub long_polling: HttpPollingCommunicationConfig,
+    pub domain_fronting: DomainFrontingCommunicationConfig,
+}
+
+impl Default for CommunicationConfig {
+    fn default() -> Self {
+        Self {
+            failure_threshold: 3,
+            development_allow_loopback: false,
+            grpc: GrpcCommunicationConfig::default(),
+            websocket: WebSocketCommunicationConfig::default(),
+            long_polling: HttpPollingCommunicationConfig::default(),
+            domain_fronting: DomainFrontingCommunicationConfig::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StorageConfig {
     pub state_root: PathBuf,
     pub config_path: PathBuf,
@@ -85,6 +188,8 @@ pub struct AgentConfig {
     pub tenant_id: String,
     pub control_plane_url: String,
     pub policy_version: PolicyVersion,
+    #[serde(default)]
+    pub communication: CommunicationConfig,
     pub runtime: RuntimeConfig,
     pub storage: StorageConfig,
 }
@@ -100,6 +205,7 @@ impl Default for AgentConfig {
             tenant_id: "local-tenant".to_string(),
             control_plane_url: "https://127.0.0.1:7443".to_string(),
             policy_version: PolicyVersion::default(),
+            communication: CommunicationConfig::default(),
             runtime: RuntimeConfig::default(),
             storage: StorageConfig::default(),
         }
@@ -132,6 +238,16 @@ impl AgentConfig {
                 min_supported: supported.min_supported,
                 current: supported.current,
             });
+        }
+        let has_enabled_transport = self.communication.grpc.enabled
+            || self.communication.websocket.enabled
+            || self.communication.long_polling.enabled
+            || self.communication.domain_fronting.enabled;
+        if !self.communication.development_allow_loopback && !has_enabled_transport {
+            return Err(CoreError::ChannelBootstrap(
+                "communication config must enable at least one transport when loopback is disabled"
+                    .to_string(),
+            ));
         }
         Ok(())
     }
@@ -169,6 +285,7 @@ mod tests {
         assert_eq!(restored.conf_version, CURRENT_CONF_VERSION);
         assert_eq!(restored.policy_version.policy_bundle, 1);
         assert_eq!(restored.storage.agent_db_path, config.storage.agent_db_path);
+        assert!(!restored.communication.development_allow_loopback);
     }
 
     #[test]
@@ -187,6 +304,36 @@ min_supported = 1
 policy_bundle = 1
 ruleset_revision = 1
 model_revision = 1
+
+[communication]
+failure_threshold = 3
+development_allow_loopback = true
+
+[communication.grpc]
+enabled = true
+endpoint = "http://127.0.0.1:7443"
+
+[communication.websocket]
+enabled = true
+endpoint = "ws://127.0.0.1:7444/ws"
+
+[communication.long_polling]
+enabled = true
+uplink_url = "http://127.0.0.1:7445/uplink"
+heartbeat_url = "http://127.0.0.1:7445/heartbeat"
+downlink_url = "http://127.0.0.1:7445/downlink"
+probe_url = "http://127.0.0.1:7445/probe"
+timeout_ms = 2000
+
+[communication.domain_fronting]
+enabled = false
+uplink_url = "http://127.0.0.1:7446/uplink"
+heartbeat_url = "http://127.0.0.1:7446/heartbeat"
+downlink_url = "http://127.0.0.1:7446/downlink"
+probe_url = "http://127.0.0.1:7446/probe"
+timeout_ms = 5000
+front_domain = "cdn.example.com"
+host_header = "control-plane.aegis.local"
 
 [runtime]
 heartbeat_interval_secs = 60

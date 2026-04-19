@@ -10,7 +10,7 @@ service AgentService {
 }
 
 message UplinkMessage {
-  oneof payload {
+  oneof kind {
     EventBatch event_batch = 1;
     ClientAck client_ack = 2;
     FlowControlHint flow_control_hint = 3;
@@ -18,27 +18,150 @@ message UplinkMessage {
 }
 
 message DownlinkMessage {
-  oneof payload {
-    SignedServerCommand command = 1;
-    BatchAck batch_ack = 2;
-    FlowControlHint flow_control_hint = 3;
+  oneof kind {
+    BatchAck batch_ack = 1;
+    SignedServerCommand server_command = 2;
+    FlowControlHint flow_hint = 3;
   }
 }
 
+message ClientTransportEnvelope {
+  oneof kind {
+    UplinkMessage uplink_message = 1;
+    HeartbeatRequest heartbeat = 2;
+  }
+}
+
+message ServerTransportEnvelope {
+  oneof kind {
+    DownlinkMessage downlink_message = 1;
+    HeartbeatResponse heartbeat_response = 2;
+  }
+}
+
+message ClientTransportBundle {
+  repeated ClientTransportEnvelope messages = 1;
+}
+
+message ServerTransportBundle {
+  repeated ServerTransportEnvelope messages = 1;
+}
+
+enum Priority {
+  PRIORITY_UNSPECIFIED = 0;
+  PRIORITY_LOW = 1;
+  PRIORITY_NORMAL = 2;
+  PRIORITY_HIGH = 3;
+  PRIORITY_CRITICAL = 4;
+}
+
+enum Severity {
+  SEVERITY_UNSPECIFIED = 0;
+  SEVERITY_INFO = 1;
+  SEVERITY_LOW = 2;
+  SEVERITY_MEDIUM = 3;
+  SEVERITY_HIGH = 4;
+  SEVERITY_CRITICAL = 5;
+}
+
+enum EventType {
+  EVENT_TYPE_UNSPECIFIED = 0;
+  EVENT_TYPE_PROCESS_CREATE = 1;
+  EVENT_TYPE_PROCESS_EXIT = 2;
+  EVENT_TYPE_FILE_WRITE = 3;
+  EVENT_TYPE_NET_CONNECT = 4;
+  EVENT_TYPE_ALERT = 5;
+  EVENT_TYPE_REGISTRY_WRITE = 6;
+  EVENT_TYPE_AUTH = 7;
+  EVENT_TYPE_SCRIPT = 8;
+  EVENT_TYPE_MEMORY = 9;
+  EVENT_TYPE_CONTAINER = 10;
+  EVENT_TYPE_NAMED_PIPE = 11;
+  EVENT_TYPE_MODULE_LOAD = 12;
+  EVENT_TYPE_DEVICE_CONTROL = 13;
+  EVENT_TYPE_UNKNOWN = 14;
+}
+
+enum TelemetryIntegrity {
+  TELEMETRY_INTEGRITY_FULL = 0;
+  TELEMETRY_INTEGRITY_PARTIAL = 1;
+}
+
+message TelemetryBatch {
+  repeated TelemetryEvent events = 1;
+}
+
+message TelemetryEvent {
+  string event_id = 1;
+  string lineage_id = 2;
+  uint64 timestamp_ns = 3;
+  string tenant_id = 4;
+  string agent_id = 5;
+  TelemetryIntegrity integrity = 6;
+  EventType event_type = 7;
+  Priority priority = 8;
+  Severity severity = 9;
+  bytes host_json = 10;
+  bytes process_json = 11;
+  bytes payload_json = 12;
+  bytes container_json = 13;
+  bytes storyline_json = 14;
+  bytes enrichment_json = 15;
+  bytes syscall_origin_json = 16;
+  bytes lineage_json = 17;
+}
+
 message EventBatch {
-  repeated bytes events = 1;
+  string batch_id = 1;
+  uint64 sequence_id = 2;
+  uint32 event_count = 3;
+  bytes compressed_events = 4;
+  Priority priority = 5;
+  int64 batched_at = 6;
+  string tenant_id = 7;
+  string agent_id = 8;
 }
 
 message ClientAck {
-  uint64 sequence_id = 1;
+  enum Status {
+    RECEIVED = 0;
+    EXECUTED = 1;
+    REJECTED = 2;
+    FAILED = 3;
+  }
+
+  string command_id = 1;
+  Status status = 2;
+  string error_detail = 3;
+  int64 acked_at = 4;
 }
 
 message BatchAck {
-  uint64 sequence_id = 1;
+  enum Status {
+    ACCEPTED = 0;
+    REJECTED_RATE_LIMIT = 1;
+    REJECTED_BACKPRESSURE = 2;
+    REJECTED_MALFORMED = 3;
+    REJECTED_AUTH = 4;
+    REJECTED_QUOTA_EXCEEDED = 5;
+  }
+
+  string batch_id = 1;
+  uint64 sequence_id = 2;
+  Status status = 3;
+  uint32 retry_after_ms = 4;
+  string reason = 5;
+  int64 acked_at = 6;
+  uint32 accepted_events = 7;
+  uint32 rejected_events = 8;
 }
 
 message FlowControlHint {
-  uint32 queue_depth = 1;
+  bool pause_low_priority = 1;
+  uint32 max_batch_events = 2;
+  uint32 suggested_rate_eps = 3;
+  uint32 cooldown_ms = 4;
+  string reason = 5;
 }
 
 message SignedServerCommand {
@@ -48,28 +171,45 @@ message SignedServerCommand {
 }
 
 message HeartbeatRequest {
-  string agent_id = 1;
-  bytes health_json = 2;
+  string tenant_id = 1;
+  string agent_id = 2;
+  bytes health_json = 3;
+  bytes communication_json = 4;
+  float wal_utilization_ratio = 5;
+  uint64 restart_epoch = 6;
 }
 
 message HeartbeatResponse {
-  bool accepted = 1;
+  int64 server_time_ms = 1;
+  repeated string pending_update_ids = 2;
+  bool config_changed = 3;
 }
 
 message ArtifactChunk {
-  string artifact_id = 1;
-  bytes chunk = 2;
+  string upload_id = 1;
+  string artifact_kind = 2;
+  uint32 chunk_index = 3;
+  bytes bytes = 4;
+  bool eof = 5;
 }
 
 message UploadResult {
-  bool complete = 1;
+  string upload_id = 1;
+  uint32 accepted_chunks = 2;
+  uint64 accepted_bytes = 3;
+  string digest_hex = 4;
 }
 
 message UpdateRequest {
-  string agent_version = 1;
+  string tenant_id = 1;
+  string agent_id = 2;
+  string channel = 3;
+  string current_version = 4;
 }
 
 message UpdateChunk {
-  bytes chunk = 1;
+  string artifact_id = 1;
+  uint32 chunk_index = 2;
+  bytes bytes = 3;
+  bool eof = 4;
 }
-

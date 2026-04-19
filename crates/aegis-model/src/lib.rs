@@ -35,6 +35,7 @@ pub enum EventType {
     ProcessExit,
     FileWrite,
     NetConnect,
+    Alert,
     RegistryWrite,
     Auth,
     Script,
@@ -235,11 +236,20 @@ pub struct ContainerContext {
     pub node_name: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AlertContext {
+    pub alert_id: Uuid,
+    pub decision: DecisionKind,
+    pub summary: String,
+    pub storyline_id: Option<u64>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum EventPayload {
     None,
     File(FileContext),
     Network(NetworkContext),
+    Alert(AlertContext),
     Registry(RegistryContext),
     Auth(AuthContext),
     Script(ScriptContext),
@@ -437,6 +447,46 @@ impl TelemetryEvent {
             lineage: event.lineage.clone(),
         }
     }
+
+    pub fn from_alert(
+        alert: &Alert,
+        tenant_id: String,
+        agent_id: String,
+        timestamp_ns: u64,
+    ) -> Self {
+        let priority = match alert.severity {
+            Severity::Critical => Priority::Critical,
+            Severity::High => Priority::High,
+            Severity::Medium => Priority::Normal,
+            Severity::Low | Severity::Info => Priority::Low,
+        };
+        let lineage = LineageTrace::new(alert.lineage_id, timestamp_ns);
+
+        Self {
+            event_id: alert.alert_id,
+            lineage_id: alert.lineage_id,
+            timestamp_ns,
+            tenant_id,
+            agent_id,
+            integrity: TelemetryIntegrity::Full,
+            host: HostContext::default(),
+            event_type: EventType::Alert,
+            priority,
+            severity: alert.severity,
+            process: ProcessContext::default(),
+            payload: EventPayload::Alert(AlertContext {
+                alert_id: alert.alert_id,
+                decision: alert.decision,
+                summary: alert.summary.clone(),
+                storyline_id: alert.storyline_id,
+            }),
+            container: None,
+            storyline: None,
+            enrichment: EventEnrichment::default(),
+            syscall_origin: None,
+            lineage,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -629,16 +679,40 @@ pub struct EventBatch {
     pub events: Vec<TelemetryEvent>,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ClientAckStatus {
+    Received,
+    Executed,
+    Rejected,
+    Failed,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClientAck {
     pub command_id: Uuid,
-    pub status: String,
+    pub status: ClientAckStatus,
     pub detail: Option<String>,
+    pub acked_at: i64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum BatchAckStatus {
+    Accepted,
+    RejectedRateLimit,
+    RejectedBackpressure,
+    RejectedMalformed,
+    RejectedAuth,
+    RejectedQuotaExceeded,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BatchAck {
     pub batch_id: Uuid,
+    pub sequence_id: u64,
+    pub status: BatchAckStatus,
+    pub retry_after_ms: u32,
+    pub reason: Option<String>,
+    pub acked_at: i64,
     pub accepted_events: u32,
     pub rejected_events: u32,
 }
@@ -647,6 +721,9 @@ pub struct BatchAck {
 pub struct FlowControlHint {
     pub pause_low_priority: bool,
     pub max_batch_events: usize,
+    pub suggested_rate_eps: Option<u32>,
+    pub cooldown_ms: Option<u32>,
+    pub reason: Option<String>,
 }
 
 #[derive(

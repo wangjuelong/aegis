@@ -1,3 +1,5 @@
+use crate::config::CommunicationConfig;
+use crate::transport_drivers::{build_transport_drivers, TransportAgentContext};
 use aegis_model::{
     AgentHealth, ApproverEntry, CommunicationChannelHealth, CommunicationChannelKind,
     CommunicationRuntimeStatus, DownlinkMessage, EventBatch, HeartbeatRequest, ServerCommand,
@@ -211,6 +213,26 @@ impl CommunicationRuntime {
         Self::with_loopback_drivers_and_handles(failure_threshold).0
     }
 
+    pub fn from_config(
+        config: &CommunicationConfig,
+        agent: &TransportAgentContext,
+    ) -> Result<Self> {
+        if config.development_allow_loopback {
+            return Ok(Self::with_loopback_drivers(config.failure_threshold));
+        }
+
+        let mut runtime = Self::new(config.failure_threshold);
+        let drivers = build_transport_drivers(config, agent)?;
+        if drivers.is_empty() {
+            bail!("no communication drivers enabled and loopback is disabled");
+        }
+
+        for driver in drivers {
+            runtime.register_driver(driver);
+        }
+        Ok(runtime)
+    }
+
     pub fn with_loopback_drivers_and_handles(
         failure_threshold: u32,
     ) -> (
@@ -230,7 +252,7 @@ impl CommunicationRuntime {
     pub fn register_driver(&mut self, driver: Box<dyn TransportDriver>) {
         let channel = driver.channel();
         self.drivers.insert(channel, driver);
-        self.channel_state.entry(channel).or_default().healthy = true;
+        self.channel_state.entry(channel).or_default();
     }
 
     pub fn active_channel(&self) -> CommunicationChannelKind {
@@ -1105,8 +1127,9 @@ mod tests {
         )));
         let uplink = UplinkMessage::ClientAck(aegis_model::ClientAck {
             command_id: Uuid::now_v7(),
-            status: "queued".to_string(),
+            status: aegis_model::ClientAckStatus::Received,
             detail: None,
+            acked_at: 0,
         });
 
         for now_ms in [1_000, 2_000, 3_000] {
@@ -1207,8 +1230,9 @@ mod tests {
 
         let uplink = UplinkMessage::ClientAck(aegis_model::ClientAck {
             command_id,
-            status: "accepted".to_string(),
+            status: aegis_model::ClientAckStatus::Executed,
             detail: None,
+            acked_at: 0,
         });
         runtime
             .send_uplink(&uplink, 1_100)

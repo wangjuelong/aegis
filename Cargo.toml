@@ -18,19 +18,29 @@ authors = ["wangjuelong <juelongwang@163.com>"]
 
 [workspace.dependencies]
 anyhow = "1.0"
+axum = "0.7"
 base64 = "0.22"
 blake3 = "1.8"
 chacha20poly1305 = "0.10"
 crc32fast = "1.4"
 ed25519-dalek = "2.1"
+futures-util = "0.3"
 hex = "0.4"
 hkdf = "0.12"
+lz4_flex = "0.11"
+prost = "0.13"
+protoc-bin-vendored = "3"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 thiserror = "2.0"
-tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
+tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "sync", "time", "signal", "net", "io-util"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+tonic = { version = "0.12", features = ["transport"] }
+tonic-build = "0.12"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }

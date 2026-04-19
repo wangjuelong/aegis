@@ -4,6 +4,7 @@ use aegis_core::health::HealthReporter;
 use aegis_core::orchestrator::Orchestrator;
 use aegis_core::plugin_host::PluginHost;
 use aegis_core::self_protection::ProtectionPosture;
+use aegis_core::transport_drivers::TransportAgentContext;
 use aegis_core::upgrade::{
     AgentRuntimeSnapshot, DiagnoseCertificateStatus, DiagnoseCollector, DiagnoseConnectionStatus,
     DiagnoseSensorStatus, DiagnoseWalStatus, RuntimeStateStore,
@@ -23,18 +24,20 @@ use tracing::info;
 async fn main() -> Result<()> {
     if std::env::args().any(|arg| arg == "--diagnose") {
         let config = load_runtime_config()?;
-        let snapshot = match RuntimeStateStore::load_agent_snapshot(&config) {
-            Ok(snapshot) => snapshot,
-            Err(_) => {
-                let runtime_bridge = Orchestrator::new(config.clone())
+        let persisted_runtime_bridge = RuntimeStateStore::load_agent_snapshot(&config)
+            .ok()
+            .and_then(|snapshot| snapshot.runtime_bridge);
+        let runtime_bridge = match persisted_runtime_bridge {
+            Some(runtime_bridge) => runtime_bridge,
+            None => {
+                Orchestrator::new(config.clone())
                     .bootstrap()?
                     .summary
-                    .runtime_bridge;
-                let snapshot = build_agent_runtime_snapshot(&config, Some(runtime_bridge));
-                RuntimeStateStore::persist_agent_snapshot(&config, &snapshot)?;
-                snapshot
+                    .runtime_bridge
             }
         };
+        let snapshot = build_agent_runtime_snapshot(&config, Some(runtime_bridge));
+        RuntimeStateStore::persist_agent_snapshot(&config, &snapshot)?;
         let mut bundle = snapshot.to_diagnose_bundle();
         bundle.watchdog = RuntimeStateStore::load_watchdog_snapshot(&config).ok();
         println!("{}", DiagnoseCollector::to_json(&bundle)?);
@@ -74,14 +77,36 @@ async fn main() -> Result<()> {
 }
 
 fn load_runtime_config() -> Result<AppConfig> {
-    let config = AppConfig::default();
-    if let Ok(state_root) = std::env::var("AEGIS_STATE_ROOT") {
-        return Ok(config.with_state_root(PathBuf::from(state_root)));
+    let root_override = if let Ok(state_root) = std::env::var("AEGIS_STATE_ROOT") {
+        Some(PathBuf::from(state_root))
+    } else {
+        let default = AppConfig::default();
+        if state_root_writable(&default.storage.state_root) {
+            None
+        } else {
+            Some(std::env::current_dir()?.join("target/aegis-dev/state"))
+        }
+    };
+
+    let bootstrap = match &root_override {
+        Some(state_root) => AppConfig::default().with_state_root(state_root.clone()),
+        None => AppConfig::default(),
+    };
+
+    let explicit_config_path = std::env::var("AEGIS_CONFIG").ok().map(PathBuf::from);
+    let candidate_path =
+        explicit_config_path.unwrap_or_else(|| bootstrap.storage.config_path.clone());
+    let mut config = if candidate_path.exists() {
+        AppConfig::load_from_file(&candidate_path)?
+    } else {
+        bootstrap
+    };
+
+    if let Some(state_root) = root_override {
+        config = config.with_state_root(state_root);
     }
-    if state_root_writable(&config.storage.state_root) {
-        return Ok(config);
-    }
-    Ok(config.with_state_root(std::env::current_dir()?.join("target/aegis-dev/state")))
+
+    Ok(config)
 }
 
 fn state_root_writable(path: &Path) -> bool {
@@ -123,7 +148,15 @@ fn build_agent_runtime_snapshot(
     config: &AppConfig,
     runtime_bridge: Option<RuntimeBridgeStatus>,
 ) -> AgentRuntimeSnapshot {
-    let communication = CommunicationRuntime::with_loopback_drivers(3).snapshot();
+    let communication = CommunicationRuntime::from_config(
+        &config.communication,
+        &TransportAgentContext {
+            tenant_id: config.tenant_id.clone(),
+            agent_id: config.agent_id.clone(),
+        },
+    )
+    .map(|runtime| runtime.snapshot())
+    .unwrap_or_default();
     let plugin_status = collect_plugin_status(config);
     let active_update_id = RuntimeStateStore::load_update_snapshot(config)
         .ok()
@@ -161,7 +194,7 @@ fn build_agent_runtime_snapshot(
         },
         connection: DiagnoseConnectionStatus {
             control_plane_url: config.control_plane_url.clone(),
-            reachable: true,
+            reachable: communication.channels.iter().any(|channel| channel.healthy),
         },
         certificates: DiagnoseCertificateStatus {
             device_certificate_loaded: true,

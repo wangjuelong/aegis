@@ -23,13 +23,15 @@ use crate::specialized_detection::{
     DeceptionKind, DeceptionObject, DetectionFinding, SpecializedDetectionEngine,
 };
 use crate::temporal::{TemporalSnapshot, TemporalStateBuffer};
+use crate::transport_drivers::TransportAgentContext;
 use crate::yara::{EnqueueDisposition, YaraMatch, YaraResult, YaraScanTarget, YaraScheduler};
 use aegis_model::{
-    Alert, ClientAck, CloudApiConnectorContract, CloudLogSourceKind, CommandEnvelope,
-    CommunicationChannelKind, DownlinkMessage, EventPayload, IsolationRulesV2, LineageCheckpoint,
-    LineageCounters, NormalizedEvent, ResponseAction, RuntimeBridgeStatus, RuntimeHealthSignals,
-    RuntimeHeartbeat, RuntimeMetadata, RuntimePolicyContract, RuntimeProviderKind, Severity,
-    Storyline, StorylineContext, TelemetryEvent, ThreatIntelHit, UplinkMessage,
+    Alert, ClientAck, ClientAckStatus, CloudApiConnectorContract, CloudLogSourceKind,
+    CommandEnvelope, CommunicationChannelKind, DownlinkMessage, EventPayload, IsolationRulesV2,
+    LineageCheckpoint, LineageCounters, NormalizedEvent, ResponseAction, RuntimeBridgeStatus,
+    RuntimeHealthSignals, RuntimeHeartbeat, RuntimeMetadata, RuntimePolicyContract,
+    RuntimeProviderKind, Severity, Storyline, StorylineContext, TelemetryEvent, ThreatIntelHit,
+    UplinkMessage,
 };
 use aegis_platform::{MacosPlatform, PlatformRuntime};
 use anyhow::{anyhow, Result};
@@ -54,6 +56,10 @@ const ALERT_NORMAL_QUEUE_CAPACITY: usize = 4_096;
 const RESPONSE_QUEUE_CAPACITY: usize = 1_024;
 const TELEMETRY_QUEUE_CAPACITY: usize = 2_048;
 const COMMAND_POLL_INTERVAL_MS: u64 = 50;
+const NORMAL_BATCH_MAX_EVENTS_DEFAULT: usize = 100;
+const NORMAL_BATCH_MAX_EVENTS_LIMIT: usize = 500;
+const NORMAL_BATCH_FLUSH_INTERVAL_MS: u64 = 1_000;
+const FLOW_CONTROL_POLL_INTERVAL_MS: u64 = 100;
 const NETWORK_ISOLATION_TTL_SECS: u64 = 5 * 60;
 const LOOPBACK_SERVER_SIGNING_KEY_ID: &str = "server-k1";
 const LOOPBACK_ADMIN_SIGNING_KEY_ID: &str = "approver-admin-k1";
@@ -173,7 +179,7 @@ impl Orchestrator {
             agent_id: self.config.agent_id.clone(),
             tenant_id: self.config.tenant_id.clone(),
             control_plane_url: self.config.control_plane_url.clone(),
-            communication_channel: CommunicationChannelKind::Grpc,
+            communication_channel: configured_primary_channel(&self.config),
             lineage_counters: LineageCounters::default(),
             runtime_bridge: RuntimeBridgeStatus {
                 control_socket_path: Some(runtime_bridge_socket.display().to_string()),
@@ -216,10 +222,17 @@ impl Orchestrator {
 
     pub fn start(&self, artifacts: BootstrapArtifacts) -> Result<RuntimeHandle> {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (communication_runtime, _) = CommunicationRuntime::with_loopback_drivers_and_handles(3);
+        let communication_runtime = CommunicationRuntime::from_config(
+            &self.config.communication,
+            &TransportAgentContext {
+                tenant_id: self.config.tenant_id.clone(),
+                agent_id: self.config.agent_id.clone(),
+            },
+        )?;
         let comms_runtime = Arc::new(Mutex::new(communication_runtime));
         let detection_runtime = Arc::new(Mutex::new(DetectionRuntime::new()));
         let metrics = Arc::new(Mutex::new(RuntimeMetrics::default()));
+        let uplink_control = Arc::new(Mutex::new(UplinkControlState::default()));
         let platform = build_runtime_platform();
         let command_runtime = Arc::new(Mutex::new(CommandExecutionRuntime::new(
             &self.config,
@@ -236,6 +249,7 @@ impl Orchestrator {
             receivers,
             ..
         } = artifacts;
+        let telemetry_alert_tx = channels.telemetry_tx.clone();
         let RuntimeChannels {
             alert_tx_hi,
             alert_tx_norm,
@@ -288,6 +302,7 @@ impl Orchestrator {
             name: "comms-rx",
             handle: tokio::spawn(comms_rx_task(
                 Arc::clone(&comms_runtime),
+                Arc::clone(&uplink_control),
                 command_runtime,
                 metrics.clone(),
                 shutdown_rx.clone(),
@@ -295,17 +310,22 @@ impl Orchestrator {
         });
         tasks.push(RuntimeTask {
             name: "comms-tx-high",
-            handle: tokio::spawn(alert_forwarder_task(
-                "comms-tx-high",
+            handle: tokio::spawn(alert_uplink_high_task(
+                self.config.tenant_id.clone(),
+                self.config.agent_id.clone(),
                 alert_rx_hi,
+                Arc::clone(&comms_runtime),
+                Arc::clone(&uplink_control),
                 shutdown_rx.clone(),
             )),
         });
         tasks.push(RuntimeTask {
             name: "comms-tx-normal",
-            handle: tokio::spawn(alert_forwarder_task(
-                "comms-tx-normal",
+            handle: tokio::spawn(alert_normalizer_task(
+                self.config.tenant_id.clone(),
+                self.config.agent_id.clone(),
                 alert_rx_norm,
+                telemetry_alert_tx,
                 shutdown_rx.clone(),
             )),
         });
@@ -333,6 +353,7 @@ impl Orchestrator {
                 self.config.agent_id.clone(),
                 telemetry_rx,
                 Arc::clone(&comms_runtime),
+                Arc::clone(&uplink_control),
                 shutdown_rx.clone(),
             )),
         });
@@ -387,6 +408,102 @@ struct DetectionSignal {
 struct RuntimeMetrics {
     lineage_counters: LineageCounters,
     adaptive_whitelist_size: usize,
+}
+
+#[derive(Debug)]
+struct UplinkControlState {
+    next_sequence_id: u64,
+    normal_max_batch_events: usize,
+    pause_low_priority: bool,
+    suggested_rate_eps: Option<u32>,
+    cooldown_until_ms: Option<i64>,
+    last_normal_batch_sent_ms: Option<i64>,
+}
+
+impl Default for UplinkControlState {
+    fn default() -> Self {
+        Self {
+            next_sequence_id: 1,
+            normal_max_batch_events: NORMAL_BATCH_MAX_EVENTS_DEFAULT,
+            pause_low_priority: false,
+            suggested_rate_eps: None,
+            cooldown_until_ms: None,
+            last_normal_batch_sent_ms: None,
+        }
+    }
+}
+
+impl UplinkControlState {
+    fn reserve_sequence_id(&mut self) -> u64 {
+        let sequence_id = self.next_sequence_id;
+        self.next_sequence_id = self.next_sequence_id.saturating_add(1);
+        sequence_id
+    }
+
+    fn normal_batch_limit(&self) -> usize {
+        self.normal_max_batch_events
+            .clamp(1, NORMAL_BATCH_MAX_EVENTS_LIMIT)
+    }
+
+    fn normal_lane_ready(&self, now_ms: i64) -> bool {
+        if self.pause_low_priority {
+            return false;
+        }
+        if self
+            .cooldown_until_ms
+            .map(|until| now_ms < until)
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        if let Some(rate_eps) = self.suggested_rate_eps.filter(|rate| *rate > 0) {
+            let spacing_ms = ((1_000_u64 + u64::from(rate_eps) - 1) / u64::from(rate_eps)) as i64;
+            if self
+                .last_normal_batch_sent_ms
+                .map(|last_send_ms| now_ms - last_send_ms < spacing_ms)
+                .unwrap_or(false)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn normal_wait_duration(&self, now_ms: i64) -> Duration {
+        let mut wait_ms = FLOW_CONTROL_POLL_INTERVAL_MS;
+        if let Some(until_ms) = self.cooldown_until_ms {
+            if now_ms < until_ms {
+                wait_ms = wait_ms.min((until_ms - now_ms) as u64);
+            }
+        }
+        if let Some(rate_eps) = self.suggested_rate_eps.filter(|rate| *rate > 0) {
+            let spacing_ms = ((1_000_u64 + u64::from(rate_eps) - 1) / u64::from(rate_eps)) as i64;
+            if let Some(last_send_ms) = self.last_normal_batch_sent_ms {
+                let next_send_ms = last_send_ms.saturating_add(spacing_ms);
+                if now_ms < next_send_ms {
+                    wait_ms = wait_ms.min((next_send_ms - now_ms) as u64);
+                }
+            }
+        }
+        Duration::from_millis(wait_ms.max(1))
+    }
+
+    fn note_normal_batch_sent(&mut self, now_ms: i64) {
+        self.last_normal_batch_sent_ms = Some(now_ms);
+    }
+
+    fn apply_flow_control_hint(&mut self, hint: &aegis_model::FlowControlHint, now_ms: i64) {
+        if hint.max_batch_events > 0 {
+            self.normal_max_batch_events = hint.max_batch_events.min(NORMAL_BATCH_MAX_EVENTS_LIMIT);
+        } else {
+            self.normal_max_batch_events = NORMAL_BATCH_MAX_EVENTS_DEFAULT;
+        }
+        self.pause_low_priority = hint.pause_low_priority;
+        self.suggested_rate_eps = hint.suggested_rate_eps.filter(|rate| *rate > 0);
+        self.cooldown_until_ms = hint
+            .cooldown_ms
+            .map(|cooldown_ms| now_ms.saturating_add(i64::from(cooldown_ms)));
+    }
 }
 
 struct CommandExecutionRuntime {
@@ -1118,6 +1235,7 @@ async fn decision_router_task(
 
 async fn comms_rx_task(
     comms_runtime: Arc<Mutex<CommunicationRuntime>>,
+    uplink_control: Arc<Mutex<UplinkControlState>>,
     command_runtime: Arc<Mutex<CommandExecutionRuntime>>,
     metrics: Arc<Mutex<RuntimeMetrics>>,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -1160,24 +1278,37 @@ async fn comms_rx_task(
                             .lock()
                             .expect("communication runtime poisoned")
                             .send_uplink(&UplinkMessage::ClientAck(ack), now_unix_ms());
-                        if sent.is_ok() {
-                            let mut metrics = metrics.lock().expect("runtime metrics poisoned");
-                            metrics.lineage_counters.grpc_acked =
-                                metrics.lineage_counters.grpc_acked.saturating_add(1);
+                        if let Err(error) = sent {
+                            debug!(%error, "comms-rx failed to send client ack");
                         }
                     }
                     DownlinkMessage::BatchAck(batch_ack) => {
+                        if batch_ack.status == aegis_model::BatchAckStatus::Accepted {
+                            let mut snapshot = metrics.lock().expect("runtime metrics poisoned");
+                            snapshot.lineage_counters.grpc_acked = snapshot
+                                .lineage_counters
+                                .grpc_acked
+                                .saturating_add(u64::from(batch_ack.accepted_events.max(1)));
+                        }
                         debug!(
                             batch_id = %batch_ack.batch_id,
+                            status = ?batch_ack.status,
                             accepted = batch_ack.accepted_events,
                             rejected = batch_ack.rejected_events,
+                            reason = batch_ack.reason.as_deref().unwrap_or_default(),
                             "comms-rx received batch ack"
                         );
                     }
                     DownlinkMessage::FlowControlHint(flow_control) => {
+                        uplink_control
+                            .lock()
+                            .expect("uplink control poisoned")
+                            .apply_flow_control_hint(&flow_control, now_unix_ms());
                         debug!(
                             pause_low_priority = flow_control.pause_low_priority,
                             max_batch_events = flow_control.max_batch_events,
+                            suggested_rate_eps = flow_control.suggested_rate_eps,
+                            cooldown_ms = flow_control.cooldown_ms,
                             "comms-rx received flow-control hint"
                         );
                     }
@@ -1187,29 +1318,82 @@ async fn comms_rx_task(
     }
 }
 
-async fn alert_forwarder_task(
-    name: &'static str,
+async fn alert_uplink_high_task(
+    tenant_id: String,
+    agent_id: String,
     mut alert_rx: mpsc::Receiver<Alert>,
+    comms_runtime: Arc<Mutex<CommunicationRuntime>>,
+    uplink_control: Arc<Mutex<UplinkControlState>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     loop {
         tokio::select! {
             changed = shutdown_rx.changed() => {
                 if changed.is_ok() && *shutdown_rx.borrow() {
-                    debug!(task = name, "alert forwarder received shutdown");
+                    debug!("high-priority alert uplink received shutdown");
                     break;
                 }
             }
             maybe_alert = alert_rx.recv() => {
                 match maybe_alert {
                     Some(alert) => {
-                        debug!(
-                            task = name,
-                            alert_id = %alert.alert_id,
-                            storyline_id = alert.storyline_id.unwrap_or_default(),
-                            summary = %alert.summary,
-                            "forwarding alert"
+                        let alert_event = TelemetryEvent::from_alert(
+                            &alert,
+                            tenant_id.clone(),
+                            agent_id.clone(),
+                            now_unix_ns(),
                         );
+                        if let Err(error) = send_event_batch(
+                            &tenant_id,
+                            &agent_id,
+                            vec![alert_event],
+                            1,
+                            now_unix_ms(),
+                            &comms_runtime,
+                            &uplink_control,
+                        ) {
+                            debug!(
+                                %error,
+                                alert_id = %alert.alert_id,
+                                summary = %alert.summary,
+                                "high-priority alert uplink failed"
+                            );
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+}
+
+async fn alert_normalizer_task(
+    tenant_id: String,
+    agent_id: String,
+    mut alert_rx: mpsc::Receiver<Alert>,
+    telemetry_tx: mpsc::Sender<TelemetryEvent>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_ok() && *shutdown_rx.borrow() {
+                    debug!("normal alert forwarder received shutdown");
+                    break;
+                }
+            }
+            maybe_alert = alert_rx.recv() => {
+                match maybe_alert {
+                    Some(alert) => {
+                        let alert_event = TelemetryEvent::from_alert(
+                            &alert,
+                            tenant_id.clone(),
+                            agent_id.clone(),
+                            now_unix_ns(),
+                        );
+                        if telemetry_tx.send(alert_event).await.is_err() {
+                            break;
+                        }
                     }
                     None => break,
                 }
@@ -1258,41 +1442,169 @@ async fn telemetry_drain_task(
     agent_id: String,
     mut telemetry_rx: mpsc::Receiver<TelemetryEvent>,
     comms_runtime: Arc<Mutex<CommunicationRuntime>>,
+    uplink_control: Arc<Mutex<UplinkControlState>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    let builder = TelemetryBatchBuilder::new(1);
+    let mut buffer = Vec::new();
+    let mut flush_ticker = interval(Duration::from_millis(NORMAL_BATCH_FLUSH_INTERVAL_MS));
+    flush_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
     loop {
+        let now_ms = now_unix_ms();
+        let (normal_lane_ready, max_batch_events, wait_duration) = {
+            let control = uplink_control.lock().expect("uplink control poisoned");
+            (
+                control.normal_lane_ready(now_ms),
+                control.normal_batch_limit(),
+                control.normal_wait_duration(now_ms),
+            )
+        };
         tokio::select! {
             changed = shutdown_rx.changed() => {
                 if changed.is_ok() && *shutdown_rx.borrow() {
+                    if !buffer.is_empty() {
+                        let _ = flush_normal_telemetry_buffer(
+                            &tenant_id,
+                            &agent_id,
+                            &mut buffer,
+                            max_batch_events,
+                            &comms_runtime,
+                            &uplink_control,
+                        );
+                    }
                     debug!("telemetry-drain received shutdown");
                     break;
                 }
             }
-            maybe_event = telemetry_rx.recv() => {
-                match maybe_event {
-                    Some(event) => {
-                        match builder.build(
-                            tenant_id.clone(),
-                            agent_id.clone(),
-                            event.lineage.checkpoints.len() as u64,
-                            vec![event.clone()],
-                        ) {
-                            Ok(batch) => {
-                                let send_result = comms_runtime
-                                    .lock()
-                                    .expect("comms runtime poisoned")
-                                    .send_uplink(&batch, event.timestamp_ns as i64);
-                                if let Err(error) = send_result {
-                                    debug!(%error, "telemetry-drain failed to send batch");
-                                }
-                            }
-                            Err(error) => debug!(%error, "telemetry-drain failed to build batch"),
-                        }
-                    }
-                    None => break,
+            _ = flush_ticker.tick(), if !buffer.is_empty() => {
+                if normal_lane_ready {
+                    let _ = flush_normal_telemetry_buffer(
+                        &tenant_id,
+                        &agent_id,
+                        &mut buffer,
+                        max_batch_events,
+                        &comms_runtime,
+                        &uplink_control,
+                    );
                 }
             }
+            maybe_event = telemetry_rx.recv(), if normal_lane_ready && buffer.len() < max_batch_events => {
+                match maybe_event {
+                    Some(event) => {
+                        buffer.push(event);
+                        if buffer.len() >= max_batch_events {
+                            let _ = flush_normal_telemetry_buffer(
+                                &tenant_id,
+                                &agent_id,
+                                &mut buffer,
+                                max_batch_events,
+                                &comms_runtime,
+                                &uplink_control,
+                            );
+                        }
+                    }
+                    None => {
+                        if !buffer.is_empty() {
+                            let _ = flush_normal_telemetry_buffer(
+                                &tenant_id,
+                                &agent_id,
+                                &mut buffer,
+                                max_batch_events,
+                                &comms_runtime,
+                                &uplink_control,
+                            );
+                        }
+                        break;
+                    }
+                }
+            }
+            _ = tokio::time::sleep(wait_duration), if !normal_lane_ready => {
+                if !buffer.is_empty() {
+                    let now_ms = now_unix_ms();
+                    let ready_after_wait = uplink_control
+                        .lock()
+                        .expect("uplink control poisoned")
+                        .normal_lane_ready(now_ms);
+                    if ready_after_wait {
+                        let max_batch_events = uplink_control
+                            .lock()
+                            .expect("uplink control poisoned")
+                            .normal_batch_limit();
+                        let _ = flush_normal_telemetry_buffer(
+                            &tenant_id,
+                            &agent_id,
+                            &mut buffer,
+                            max_batch_events,
+                            &comms_runtime,
+                            &uplink_control,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn send_event_batch(
+    tenant_id: &str,
+    agent_id: &str,
+    events: Vec<TelemetryEvent>,
+    max_batch_events: usize,
+    sent_at_ms: i64,
+    comms_runtime: &Arc<Mutex<CommunicationRuntime>>,
+    uplink_control: &Arc<Mutex<UplinkControlState>>,
+) -> Result<()> {
+    let sequence_hint = uplink_control
+        .lock()
+        .expect("uplink control poisoned")
+        .reserve_sequence_id();
+    let batch = TelemetryBatchBuilder::new(max_batch_events).build(
+        tenant_id.to_string(),
+        agent_id.to_string(),
+        sequence_hint,
+        events,
+    )?;
+    comms_runtime
+        .lock()
+        .expect("comms runtime poisoned")
+        .send_uplink(&batch, sent_at_ms)?;
+    Ok(())
+}
+
+fn flush_normal_telemetry_buffer(
+    tenant_id: &str,
+    agent_id: &str,
+    buffer: &mut Vec<TelemetryEvent>,
+    max_batch_events: usize,
+    comms_runtime: &Arc<Mutex<CommunicationRuntime>>,
+    uplink_control: &Arc<Mutex<UplinkControlState>>,
+) -> Result<()> {
+    if buffer.is_empty() {
+        return Ok(());
+    }
+
+    let events = std::mem::take(buffer);
+    let sent_at_ms = now_unix_ms();
+    match send_event_batch(
+        tenant_id,
+        agent_id,
+        events.clone(),
+        max_batch_events,
+        sent_at_ms,
+        comms_runtime,
+        uplink_control,
+    ) {
+        Ok(()) => {
+            uplink_control
+                .lock()
+                .expect("uplink control poisoned")
+                .note_normal_batch_sent(sent_at_ms);
+            Ok(())
+        }
+        Err(error) => {
+            *buffer = events;
+            debug!(%error, "telemetry-drain failed to send batch");
+            Err(error)
         }
     }
 }
@@ -1760,16 +2072,18 @@ fn command_envelope(command: &aegis_model::ServerCommand) -> Result<CommandEnvel
 fn accepted_ack(command_id: Uuid, detail: String) -> ClientAck {
     ClientAck {
         command_id,
-        status: "accepted".to_string(),
+        status: ClientAckStatus::Executed,
         detail: Some(detail),
+        acked_at: now_unix_ms(),
     }
 }
 
 fn rejected_ack(command_id: Uuid, detail: String) -> ClientAck {
     ClientAck {
         command_id,
-        status: "rejected".to_string(),
+        status: ClientAckStatus::Rejected,
         detail: Some(detail),
+        acked_at: now_unix_ms(),
     }
 }
 
@@ -1829,6 +2143,22 @@ fn response_audit_path(config: &AppConfig) -> PathBuf {
     config.storage.state_root.join("response-audit.jsonl")
 }
 
+fn configured_primary_channel(config: &AppConfig) -> CommunicationChannelKind {
+    if config.communication.grpc.enabled {
+        CommunicationChannelKind::Grpc
+    } else if config.communication.websocket.enabled {
+        CommunicationChannelKind::WebSocket
+    } else if config.communication.long_polling.enabled {
+        CommunicationChannelKind::LongPolling
+    } else if config.communication.domain_fronting.enabled {
+        CommunicationChannelKind::DomainFronting
+    } else if config.communication.development_allow_loopback {
+        CommunicationChannelKind::Grpc
+    } else {
+        CommunicationChannelKind::Grpc
+    }
+}
+
 fn runtime_bridge_socket_path(config: &AppConfig) -> PathBuf {
     config
         .storage
@@ -1843,6 +2173,13 @@ fn now_unix_ms() -> i64 {
         .as_millis() as i64
 }
 
+fn now_unix_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_nanos() as u64
+}
+
 fn now_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1855,14 +2192,22 @@ mod tests {
     use super::*;
     use crate::comms::canonical_command_hash;
     use aegis_model::{
-        ApprovalPolicy, ApprovalProof, ApproverEntry, ClientAck, DownlinkMessage, EventType,
-        Priority, ProcessContext, ScriptContext, ServerCommand, SignedServerCommand, TargetScope,
-        TargetScopeKind, UplinkMessage,
+        Alert, ApprovalPolicy, ApprovalProof, ApproverEntry, BatchAck, BatchAckStatus, ClientAck,
+        DecisionKind, DownlinkMessage, EventPayload, EventType, FlowControlHint, Priority,
+        ProcessContext, ScriptContext, ServerCommand, SignedServerCommand, TargetScope,
+        TargetScopeKind, TelemetryEvent, UplinkMessage,
     };
     use ed25519_dalek::{Signer, SigningKey};
 
     fn temp_state_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("aegis-{name}-{}", Uuid::now_v7()))
+    }
+
+    fn loopback_test_config(name: &str) -> AppConfig {
+        let mut config = AppConfig::default();
+        config.storage.state_root = temp_state_root(name);
+        config.communication.development_allow_loopback = true;
+        config
     }
 
     fn target_scope() -> TargetScope {
@@ -1949,6 +2294,45 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn event_batches(
+        handle: &crate::comms::LoopbackTransportHandle,
+    ) -> Vec<aegis_model::EventBatch> {
+        handle
+            .take_uplinks()
+            .into_iter()
+            .filter_map(|message| match message {
+                UplinkMessage::EventBatch(batch) => Some(batch),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn sample_alert(severity: Severity, summary: &str) -> Alert {
+        Alert {
+            alert_id: Uuid::now_v7(),
+            lineage_id: Uuid::now_v7(),
+            storyline_id: None,
+            severity,
+            decision: DecisionKind::Alert,
+            summary: summary.to_string(),
+        }
+    }
+
+    fn benign_telemetry_event(timestamp_ns: u64) -> TelemetryEvent {
+        TelemetryEvent::from_normalized(
+            &NormalizedEvent::new(
+                timestamp_ns,
+                EventType::ProcessCreate,
+                Priority::Normal,
+                Severity::Info,
+                ProcessContext::default(),
+                EventPayload::None,
+            ),
+            "local-tenant".to_string(),
+            "local-agent".to_string(),
+        )
     }
 
     fn malicious_script_event() -> NormalizedEvent {
@@ -2049,10 +2433,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_routes_high_alerts_and_batches_normal_uplinks() {
+        let config = loopback_test_config("uplink-routing");
+        let state_root = config.storage.state_root.clone();
+        let orchestrator = Orchestrator::new(config);
+        let artifacts = orchestrator.bootstrap().expect("bootstrap should work");
+        let alert_tx_hi = artifacts.channels.alert_tx_hi.clone();
+        let alert_tx_norm = artifacts.channels.alert_tx_norm.clone();
+        let telemetry_tx = artifacts.channels.telemetry_tx.clone();
+        let runtime = orchestrator.start(artifacts).expect("runtime should start");
+        let handle = runtime
+            .loopback_handle(CommunicationChannelKind::Grpc)
+            .expect("grpc loopback handle");
+
+        alert_tx_hi
+            .send(sample_alert(Severity::High, "high severity alert"))
+            .await
+            .expect("send high alert");
+        telemetry_tx
+            .send(benign_telemetry_event(1))
+            .await
+            .expect("send telemetry event 1");
+        telemetry_tx
+            .send(benign_telemetry_event(2))
+            .await
+            .expect("send telemetry event 2");
+        alert_tx_norm
+            .send(sample_alert(Severity::Low, "low severity alert"))
+            .await
+            .expect("send normal alert");
+
+        tokio::time::sleep(Duration::from_millis(1_250)).await;
+
+        let batches = event_batches(&handle);
+        assert!(batches.iter().any(|batch| {
+            batch.events.len() == 1
+                && matches!(batch.events[0].payload, EventPayload::Alert(_))
+                && batch.events[0].severity == Severity::High
+        }));
+        assert!(batches.iter().any(|batch| {
+            batch.events.len() >= 3
+                && batch.events.iter().any(|event| {
+                    matches!(event.payload, EventPayload::Alert(_))
+                        && event.severity == Severity::Low
+                })
+                && batch
+                    .events
+                    .iter()
+                    .any(|event| event.event_type == EventType::ProcessCreate)
+        }));
+
+        runtime
+            .graceful_shutdown(Duration::from_secs(1))
+            .await
+            .expect("runtime shutdown should work");
+        fs::remove_dir_all(state_root).ok();
+    }
+
+    #[tokio::test]
+    async fn runtime_applies_flow_control_to_normal_lane_and_counts_batch_acks() {
+        let mut config = loopback_test_config("flow-control");
+        config.runtime.heartbeat_interval_secs = 1;
+        let state_root = config.storage.state_root.clone();
+        let orchestrator = Orchestrator::new(config);
+        let artifacts = orchestrator.bootstrap().expect("bootstrap should work");
+        let telemetry_tx = artifacts.channels.telemetry_tx.clone();
+        let runtime = orchestrator.start(artifacts).expect("runtime should start");
+        let handle = runtime
+            .loopback_handle(CommunicationChannelKind::Grpc)
+            .expect("grpc loopback handle");
+
+        handle.inject_downlink(DownlinkMessage::FlowControlHint(FlowControlHint {
+            pause_low_priority: true,
+            max_batch_events: 2,
+            suggested_rate_eps: Some(10),
+            cooldown_ms: Some(250),
+            reason: Some("throttle normal lane".to_string()),
+        }));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        telemetry_tx
+            .send(benign_telemetry_event(10))
+            .await
+            .expect("send telemetry event 10");
+        telemetry_tx
+            .send(benign_telemetry_event(11))
+            .await
+            .expect("send telemetry event 11");
+        telemetry_tx
+            .send(benign_telemetry_event(12))
+            .await
+            .expect("send telemetry event 12");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(event_batches(&handle).is_empty());
+
+        handle.inject_downlink(DownlinkMessage::FlowControlHint(FlowControlHint {
+            pause_low_priority: false,
+            max_batch_events: 2,
+            suggested_rate_eps: None,
+            cooldown_ms: None,
+            reason: Some("resume normal lane".to_string()),
+        }));
+
+        tokio::time::sleep(Duration::from_millis(1_250)).await;
+        let batches = event_batches(&handle);
+        assert!(batches.iter().any(|batch| batch.events.len() == 2));
+        assert!(batches.iter().any(|batch| batch.events.len() == 1));
+
+        handle.inject_downlink(DownlinkMessage::BatchAck(BatchAck {
+            batch_id: Uuid::now_v7(),
+            sequence_id: 1,
+            status: BatchAckStatus::Accepted,
+            retry_after_ms: 0,
+            reason: None,
+            acked_at: now_unix_ms(),
+            accepted_events: 2,
+            rejected_events: 0,
+        }));
+
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        let heartbeats = handle.take_heartbeats();
+        assert!(heartbeats
+            .iter()
+            .any(|heartbeat| heartbeat.health.lineage_counters.grpc_acked >= 2));
+
+        runtime
+            .graceful_shutdown(Duration::from_secs(1))
+            .await
+            .expect("runtime shutdown should work");
+        fs::remove_dir_all(state_root).ok();
+    }
+
+    #[tokio::test]
     async fn runtime_accepts_kill_command_and_rejects_replay() {
-        let mut config = AppConfig::default();
-        let state_root = temp_state_root("command-replay");
-        config.storage.state_root = state_root.clone();
+        let config = loopback_test_config("command-replay");
+        let state_root = config.storage.state_root.clone();
         let orchestrator = Orchestrator::new(config.clone());
         let artifacts = orchestrator.bootstrap().expect("bootstrap should work");
         let runtime = orchestrator.start(artifacts).expect("runtime should start");
@@ -2076,12 +2592,12 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(150)).await;
 
         let acks = client_acks(&handle);
-        assert!(acks
-            .iter()
-            .any(|ack| ack.command_id == command.command_id && ack.status == "accepted"));
+        assert!(acks.iter().any(|ack| {
+            ack.command_id == command.command_id && ack.status == ClientAckStatus::Executed
+        }));
         assert!(acks.iter().any(|ack| {
             ack.command_id == command.command_id
-                && ack.status == "rejected"
+                && ack.status == ClientAckStatus::Rejected
                 && ack.detail.as_deref().unwrap_or_default().contains("replay")
         }));
 
@@ -2098,9 +2614,8 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_rejects_remote_shell_without_required_approvers() {
-        let mut config = AppConfig::default();
-        let state_root = temp_state_root("remote-shell-reject");
-        config.storage.state_root = state_root.clone();
+        let config = loopback_test_config("remote-shell-reject");
+        let state_root = config.storage.state_root.clone();
         let orchestrator = Orchestrator::new(config);
         let artifacts = orchestrator.bootstrap().expect("bootstrap should work");
         let runtime = orchestrator.start(artifacts).expect("runtime should start");
@@ -2138,7 +2653,7 @@ mod tests {
         let acks = client_acks(&handle);
         assert!(acks.iter().any(|ack| {
             ack.command_id == command.command_id
-                && ack.status == "rejected"
+                && ack.status == ClientAckStatus::Rejected
                 && ack
                     .detail
                     .as_deref()
@@ -2155,9 +2670,8 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_executes_session_lock_command() {
-        let mut config = AppConfig::default();
-        let state_root = temp_state_root("session-lock");
-        config.storage.state_root = state_root.clone();
+        let config = loopback_test_config("session-lock");
+        let state_root = config.storage.state_root.clone();
         let orchestrator = Orchestrator::new(config);
         let artifacts = orchestrator.bootstrap().expect("bootstrap should work");
         let runtime = orchestrator.start(artifacts).expect("runtime should start");
@@ -2188,7 +2702,7 @@ mod tests {
         let acks = client_acks(&handle);
         assert!(acks.iter().any(|ack| {
             ack.command_id == command.command_id
-                && ack.status == "accepted"
+                && ack.status == ClientAckStatus::Executed
                 && ack
                     .detail
                     .as_deref()
