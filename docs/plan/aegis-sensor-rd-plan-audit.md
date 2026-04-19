@@ -37,7 +37,7 @@
 - 至此，第三轮在当前仓库内可闭合的 agent 差距已全部收口
 - Linux 平台用户态运行时已在 2026-04-19 的补录中完成真实 host capability probing、`/proc` 进程差分、auth log 采集、信号级响应、隔离/取证物料落盘与 Linux 容器验证
 - Linux 平台同日已继续补齐 eBPF 资产发现、pin root 规划、受控 `bpftool prog loadall` 装载状态机与 BPF 完整性状态表达
-- 剩余平台差距已收缩为：Linux 内核侧 `eBPF/LSM` 实际 attach 与强制执行、Windows/macOS 系统级集成，以及 TPM/Secure Enclave 正式硬件绑定
+- 剩余平台差距已收缩为：Windows/macOS 系统级集成，以及 Windows/macOS 正式硬件根信任与 Linux attestation / quote 级别 TPM 绑定
 
 ## 2. 审计方法
 
@@ -131,7 +131,7 @@
 
 当前主要妥协已从第一轮的“骨架化闭环”收缩到系统级交付边界。当前事实妥协只剩：
 
-- Linux 侧虽已具备真实用户态探测、响应、eBPF 资产、loader/pin/link 状态机与特权安装/验证脚本，但测试机因启用 `bpf` LSM 后离线，内核侧强制执行真机验收尚未收口
+- Linux 侧已具备真实用户态探测、响应、eBPF 资产、loader/pin/link 状态机、特权安装/验证脚本与 sealed-object 主密钥路径，且新测试机 `192.168.1.6` 上的 eBPF 强制执行 smoke test 与 TPM sealed-object `create/unseal` 真机验收均已收口
 - Windows / macOS 仍未进入驱动、System Extension、签名和授权链路的真实系统级交付
 - Windows/macOS 正式硬件根信任仍未进入当前仓库，Linux TPM 虽已具备 sealed-object 主密钥路径与 NV fallback，但 attestation / quote 级别绑定仍未进入当前仓库
 
@@ -139,7 +139,7 @@
 
 设计上保留了终态目标，但实现层仍存在以下事实上的降级：
 
-- Linux 已不再是纯 in-memory provider 注入，且 TPM-backed key/rollback provider 与 sealed-object 主路径已落地，但内核态强制执行仍缺最终真机验收闭环
+- Linux 已不再是纯 in-memory provider 注入，且 TPM-backed key/rollback provider、sealed-object 主路径与内核态强制执行真机验收均已落地；剩余差距仅在 attestation / quote 级别硬件根信任
 - Windows / macOS 真实平台集成仍主要停留在基线/注入与状态表达层，尚未进入系统级强制执行面
 
 ## 6. 收口计划

@@ -34,17 +34,16 @@
 
 尚未完成：
 
-- Linux 测试机恢复后的 eBPF 强制执行真机验收
-- Linux 测试机恢复后的 TPM sealed-object `create + unseal` 真机验收
-- 最终状态文档与收口 commit
+- Linux TPM attestation / quote / policy session 级别硬件根信任
+- 更高阶生产部署或发行工程项
 
 ## 3. 当前进度快照（2026-04-19 续）
 
 - B00：done，已由 `5fcd19c` 固化 Linux runtime / TPM NV / 文档基线。
 - B01：代码已完成。`packaging/linux-ebpf/` 已入仓真实 `process/file/network` BPF 资产、`build.sh`、`README.md` 和 manifest。
-- B02：代码与本地校验已完成。`scripts/linux-ebpf-{sync,install,verify,uninstall}.sh` 已入仓，测试机上已验证真实编译、装载、pin/link/map 落盘；为使 LSM 强制执行生效，已把 `bpf` 加入 GRUB LSM 顺序，但测试机重启后离线，最终 smoke test 暂挂。
-- B03：代码与本地单测已完成。`aegis-core` 已新增 sealed-object 主路径、sealed 优先 / NV fallback 和 `scripts/linux-tpm-sealed-verify.sh`；测试机 `tpm2-tools` 真机 roundtrip 待机器恢复后补齐。
-- B04：待 B02/B03 真机验收完成后一并收口。
+- B02：done。已在新测试机 `192.168.1.6` 安装 `clang` / `llvm` / `libbpf-dev`，写入 `lsm=lockdown,capability,bpf,landlock,yama,apparmor` 并重启生效；`scripts/linux-ebpf-{sync,install,verify,uninstall}.sh` 已完成真实编译、装载、pin/link/map 校验与最终 verify smoke test。
+- B03：done。已修正 sealed-object 路径对真实 `tpm2-tools` 的参数兼容性问题（sealing input 不再显式传 `-G keyedhash`），并在新测试机 `192.168.1.6` 安装 `tpm2-tools` 后通过 `scripts/linux-tpm-sealed-verify.sh` 的 `create + unseal` 真机 roundtrip。
+- B04：done。环境文档、状态文档、审计文档与 Linux 收口记录已同步更新，本轮 Linux 剩余研发只剩 attestation / quote 与更高阶发行工程项。
 
 ## 4. 执行规则
 
@@ -154,7 +153,7 @@
 
 Linux 测试机来源：`docs/env/开发环境.md`
 
-- IP：`192.168.1.15`
+- IP：`192.168.1.6`
 - 用户：`ubuntu`
 - 密码：`ubuntu`
 

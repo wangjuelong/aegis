@@ -262,8 +262,6 @@ fn create_sealed_object(
         create
             .arg("-C")
             .arg(&primary_ctx)
-            .arg("-G")
-            .arg("keyedhash")
             .arg("-u")
             .arg(public_path)
             .arg("-r")

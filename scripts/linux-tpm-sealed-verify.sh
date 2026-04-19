@@ -24,7 +24,9 @@ for tool in tpm2_createprimary tpm2_create tpm2_load tpm2_unseal; do
   fi
 done
 
-export TPM2TOOLS_TCTI="device:$REMOTE_DEVICE_PATH"
+sudo_tpm() {
+  printf '%s\n' "$PASSWORD" | sudo -S -p '' env TPM2TOOLS_TCTI="device:$REMOTE_DEVICE_PATH" "\$@"
+}
 
 WORKDIR="$REMOTE_ROOT/sealed-verify"
 rm -rf "\$WORKDIR"
@@ -32,8 +34,8 @@ mkdir -p "\$WORKDIR"
 
 cleanup() {
   if command -v tpm2_flushcontext >/dev/null 2>&1; then
-    tpm2_flushcontext "\$WORKDIR/object.ctx" >/dev/null 2>&1 || true
-    tpm2_flushcontext "\$WORKDIR/primary.ctx" >/dev/null 2>&1 || true
+    sudo_tpm tpm2_flushcontext "\$WORKDIR/object.ctx" >/dev/null 2>&1 || true
+    sudo_tpm tpm2_flushcontext "\$WORKDIR/primary.ctx" >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
@@ -44,19 +46,18 @@ import sys
 sys.stdout.buffer.write(os.urandom(32))
 PY
 
-tpm2_createprimary -C o -c "\$WORKDIR/primary.ctx"
-tpm2_create \
+sudo_tpm tpm2_createprimary -C o -c "\$WORKDIR/primary.ctx"
+sudo_tpm tpm2_create \
   -C "\$WORKDIR/primary.ctx" \
-  -G keyedhash \
   -u "\$WORKDIR/master-key.pub" \
   -r "\$WORKDIR/master-key.priv" \
   -i "\$WORKDIR/secret.bin"
-tpm2_load \
+sudo_tpm tpm2_load \
   -C "\$WORKDIR/primary.ctx" \
   -u "\$WORKDIR/master-key.pub" \
   -r "\$WORKDIR/master-key.priv" \
   -c "\$WORKDIR/object.ctx"
-tpm2_unseal -c "\$WORKDIR/object.ctx" > "\$WORKDIR/unsealed.bin"
+sudo_tpm tpm2_unseal -c "\$WORKDIR/object.ctx" > "\$WORKDIR/unsealed.bin"
 
 cmp "\$WORKDIR/secret.bin" "\$WORKDIR/unsealed.bin"
 echo "linux tpm sealed-object verification passed"
