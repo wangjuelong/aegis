@@ -181,6 +181,11 @@
   - 建立 macOS 事件到 `RawSensorEvent` 的转换入口
 - 验收：
   - 单元测试覆盖授权状态流转、能力矩阵、事件转换
+- 完成记录（2026-04-19）：
+  - 已建立 `MacosPlatform`、ESF / NE / System Extension / TCC / ExecPolicy provider 基线
+  - 已建立 `NotDetermined / AwaitingUserApproval / Approved / Denied` 授权状态机
+  - 已建立事件订阅集、授权态感知事件注入与 `EventBuffer` 轮询能力
+  - 已通过授权状态流转、能力矩阵和授权事件轮询测试
 
 ### P11：IOC / Rule VM / Temporal
 

@@ -20,8 +20,8 @@
 | P07 | 平台 Trait 细化与 Mock Harness | done | 已建立平台描述、能力矩阵和可注入/可断言的 mock harness，并通过平台层测试 |
 | P08 | Windows 平台采集基线 | done | 已建立 Windows provider 基线、能力矩阵、事件注入与平台测试 |
 | P09 | Linux 平台采集基线 | done | 已建立 Linux provider 基线、4 级降级模型、容器感知事件注入与平台测试 |
-| P10 | macOS 平台采集基线 | doing | 当前进入 ESF / Network Extension / System Extension 基线实现 |
-| P11 | IOC / Rule VM / Temporal | todo | 依赖 P03-P05 |
+| P10 | macOS 平台采集基线 | done | 已建立 macOS provider 基线、授权状态机、订阅集与平台测试 |
+| P11 | IOC / Rule VM / Temporal | doing | 当前进入 IOC 索引、Rule VM 与 temporal buffer 基线实现 |
 | P12 | YARA / Script Decode / AMSI Interlock | todo | 依赖 P11 |
 | P13 | ML / OOD / Behavioral Models | todo | 依赖 P11 |
 | P14 | Correlation / Storyline / Threat Feedback | todo | 依赖 P03/P11/P13 |
