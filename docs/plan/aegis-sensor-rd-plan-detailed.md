@@ -491,6 +491,11 @@
   - 建立 DaemonSet/sidecar 所需配置对象
 - 验收：
   - 测试覆盖容器元数据映射、sidecar 契约和容器检测规则
+- 完成记录（2026-04-19）：
+  - 已建立 `ContainerMetadataMapper`，支持 `NormalizedEvent` 与 K8s 元数据的容器资产映射
+  - 已建立 `DaemonSetHostAgentConfig` 与 `SidecarLiteContract`，覆盖宿主机 Agent / sidecar lite 关键约束校验
+  - 已建立 `ContainerDetectionEngine`，覆盖容器横移与主机逃逸基础规则
+  - 已通过容器元数据映射、sidecar 契约和容器检测规则测试
 
 ### P26：Runtime SDK / Cloud API Connector
 
