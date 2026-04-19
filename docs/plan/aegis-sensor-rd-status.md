@@ -23,8 +23,8 @@
 | P10 | macOS 平台采集基线 | done | 已建立 macOS provider 基线、授权状态机、订阅集与平台测试 |
 | P11 | IOC / Rule VM / Temporal | done | 已建立分层 IOC 索引、栈式 Rule VM、时间窗口缓冲与核心测试 |
 | P12 | YARA / Script Decode / AMSI Interlock | done | 已建立 YARA 调度缓存、脚本解码流水线、AMSI 快速分流与测试 |
-| P13 | ML / OOD / Behavioral Models | doing | 当前进入 ML 特征、OOD 评分与行为基线实现 |
-| P14 | Correlation / Storyline / Threat Feedback | todo | 依赖 P03/P11/P13 |
+| P13 | ML / OOD / Behavioral Models | done | 已建立模型注册、特征抽取、OOD 评分与失败回退测试 |
+| P14 | Correlation / Storyline / Threat Feedback | doing | 当前进入关联缓存、storyline 合并与 feedback 回灌实现 |
 | P15 | 专项检测能力 | todo | 依赖 P11-P14 |
 | P16 | Vuln Scan / Passive Discovery / AI Monitor | todo | 依赖 P03-P04 |
 | P17 | Response Executor / Quarantine / Kill | todo | 依赖 P04/P07 |

@@ -241,6 +241,11 @@
   - 建立 OOD 评分器与阈值决策
 - 验收：
   - 测试覆盖特征提取、模型路由、OOD 判定与失败回退
+- 完成记录（2026-04-19）：
+  - 已建立 `OnnxRuntimeSession` 抽象、`ModelRegistry` 与模型路由接口
+  - 已建立静态、行为、脚本三类特征向量转换与行为窗口路由策略
+  - 已建立在线质心 `OodScorer` 与缺模/推理失败回退策略
+  - 已通过特征提取、模型路由、OOD 判定与失败回退测试
 
 ### P14：Correlation / Storyline / Threat Feedback
 
