@@ -171,6 +171,13 @@
 
 - 测试覆盖密钥轮换、加密 segment 回放、损坏 segment 隔离、证据链连续性
 
+**完成记录（2026-04-19）**
+
+- 已为 Telemetry WAL 与 Forensic Journal 引入分级密钥派生接口和 `XChaCha20-Poly1305` 加密/CRC 校验
+- 已将损坏 WAL segment 自动隔离到 quarantine 目录，并在诊断输出中暴露 `encrypted`、`key_version`、`quarantined_segments`
+- 已增强文件回滚清单校验，新增 snapshot 篡改拒绝恢复与证据链篡改检测测试
+- 已通过 `cargo fmt --all`、`cargo test --workspace` 与 `cargo run -p aegis-agentd -- --diagnose`
+
 ### G04：插件宿主、Watchdog 与 Updater 热更新链路
 
 **目标**

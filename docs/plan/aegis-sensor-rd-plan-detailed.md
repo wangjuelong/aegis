@@ -601,3 +601,24 @@
   - 已将通信状态扩展到 `HeartbeatRequest`、`AgentHealth` 与 `DiagnoseBundle`，补齐 `communication_channel`、篡改信号与 `plugin_status`
   - 已将 telemetry/heartbeat 接入 orchestrator 的通信运行时，并增加 `comms-link-manager` 后台任务
   - 已新增通信降级/恢复测试，并通过 `cargo fmt --all`、`cargo test --workspace` 与 `cargo run -p aegis-agentd -- --diagnose`
+
+### G03：WAL 加密、恢复与证据链加固
+
+- 目标：让 WAL、Forensic Journal、Rollback/Evidence 不再停留在明文 JSONL 与简单复制。
+- 交付：
+  - `Cargo.toml`
+  - `crates/aegis-core/Cargo.toml`
+  - `crates/aegis-core/src/error.rs`
+  - `crates/aegis-core/src/self_protection.rs`
+  - `crates/aegis-core/src/wal.rs`
+  - `crates/aegis-core/src/recovery.rs`
+  - `crates/aegis-core/src/upgrade.rs`
+  - `crates/aegis-agentd/src/main.rs`
+  - `docs/qe/aegis-sensor-qe-matrix.md`
+  - `docs/plan/aegis-sensor-rd-status.md`
+- 依赖：G02
+- 完成记录（2026-04-19）：
+  - 已建立 `DerivedKeyTier` / `DerivedKeyMaterial` 分级派生接口，为 WAL、Journal 与恢复证据链提供独立密钥版本域
+  - 已将 Telemetry WAL 与 Forensic Journal 升级为加密落盘格式，补齐 `XChaCha20-Poly1305` 加密、AAD、CRC 校验与损坏 segment 隔离
+  - 已增强 `FilesystemRollbackPlanner` 与 `EvidenceChain`，补齐 snapshot 大小/哈希/manifest 校验与 artifact 反篡改校验
+  - 已扩展 `DiagnoseWalStatus` 并通过 `cargo fmt --all`、`cargo test --workspace`、`cargo run -p aegis-agentd -- --diagnose`
