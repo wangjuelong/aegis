@@ -1,8 +1,9 @@
 use aegis_model::{
-    AgentHealth, ApproverEntry, EventBatch, HeartbeatRequest, ServerCommand, SignedServerCommand,
+    AgentHealth, ApproverEntry, CommunicationChannelHealth, CommunicationChannelKind,
+    CommunicationRuntimeStatus, EventBatch, HeartbeatRequest, ServerCommand, SignedServerCommand,
     TargetScopeKind, TelemetryEvent, UplinkMessage,
 };
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -56,6 +57,7 @@ impl HeartbeatBuilder {
         tenant_id: impl Into<String>,
         agent_id: impl Into<String>,
         health: AgentHealth,
+        communication: CommunicationRuntimeStatus,
         wal_utilization_ratio: f32,
         restart_epoch: u64,
     ) -> HeartbeatRequest {
@@ -63,8 +65,226 @@ impl HeartbeatBuilder {
             tenant_id: tenant_id.into(),
             agent_id: agent_id.into(),
             health,
+            communication,
             wal_utilization_ratio,
             restart_epoch,
+        }
+    }
+}
+
+pub trait TransportDriver: Send + Sync {
+    fn channel(&self) -> CommunicationChannelKind;
+    fn send_uplink(&self, message: &UplinkMessage) -> Result<()>;
+    fn send_heartbeat(&self, heartbeat: &HeartbeatRequest) -> Result<()>;
+    fn probe(&self) -> bool;
+}
+
+pub struct LoopbackTransportDriver {
+    channel: CommunicationChannelKind,
+}
+
+impl LoopbackTransportDriver {
+    pub fn new(channel: CommunicationChannelKind) -> Self {
+        Self { channel }
+    }
+}
+
+impl TransportDriver for LoopbackTransportDriver {
+    fn channel(&self) -> CommunicationChannelKind {
+        self.channel
+    }
+
+    fn send_uplink(&self, _message: &UplinkMessage) -> Result<()> {
+        Ok(())
+    }
+
+    fn send_heartbeat(&self, _heartbeat: &HeartbeatRequest) -> Result<()> {
+        Ok(())
+    }
+
+    fn probe(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ChannelRuntimeState {
+    healthy: bool,
+    consecutive_failures: u32,
+    last_attempt_ms: Option<i64>,
+    last_success_ms: Option<i64>,
+    last_error: Option<String>,
+}
+
+pub struct CommunicationRuntime {
+    fallback_order: Vec<CommunicationChannelKind>,
+    drivers: HashMap<CommunicationChannelKind, Box<dyn TransportDriver>>,
+    failure_threshold: u32,
+    active_index: usize,
+    channel_state: HashMap<CommunicationChannelKind, ChannelRuntimeState>,
+}
+
+impl CommunicationRuntime {
+    pub fn new(failure_threshold: u32) -> Self {
+        let fallback_order = Self::default_fallback_order();
+        let channel_state = fallback_order
+            .iter()
+            .copied()
+            .map(|channel| (channel, ChannelRuntimeState::default()))
+            .collect();
+        Self {
+            fallback_order,
+            drivers: HashMap::new(),
+            failure_threshold: failure_threshold.max(1),
+            active_index: 0,
+            channel_state,
+        }
+    }
+
+    pub fn with_loopback_drivers(failure_threshold: u32) -> Self {
+        let mut runtime = Self::new(failure_threshold);
+        for channel in Self::default_fallback_order() {
+            runtime.register_driver(Box::new(LoopbackTransportDriver::new(channel)));
+        }
+        runtime
+    }
+
+    pub fn register_driver(&mut self, driver: Box<dyn TransportDriver>) {
+        let channel = driver.channel();
+        self.drivers.insert(channel, driver);
+        self.channel_state.entry(channel).or_default().healthy = true;
+    }
+
+    pub fn active_channel(&self) -> CommunicationChannelKind {
+        self.fallback_order[self.active_index]
+    }
+
+    pub fn send_uplink(
+        &mut self,
+        message: &UplinkMessage,
+        now_ms: i64,
+    ) -> Result<CommunicationChannelKind> {
+        self.send_with_active_channel(now_ms, |driver| driver.send_uplink(message))
+    }
+
+    pub fn send_heartbeat(
+        &mut self,
+        heartbeat: &HeartbeatRequest,
+        now_ms: i64,
+    ) -> Result<CommunicationChannelKind> {
+        self.send_with_active_channel(now_ms, |driver| driver.send_heartbeat(heartbeat))
+    }
+
+    pub fn probe_upgrade(&mut self, now_ms: i64) -> Option<CommunicationChannelKind> {
+        if self.active_index == 0 {
+            return None;
+        }
+
+        for index in 0..self.active_index {
+            let channel = self.fallback_order[index];
+            let healthy = self
+                .drivers
+                .get(&channel)
+                .map(|driver| driver.probe())
+                .unwrap_or(false);
+            let state = self.channel_state.entry(channel).or_default();
+            state.last_attempt_ms = Some(now_ms);
+            state.healthy = healthy;
+            if healthy {
+                state.last_error = None;
+                self.active_index = index;
+                return Some(channel);
+            }
+            state.last_error = Some("probe failed".to_string());
+        }
+
+        None
+    }
+
+    pub fn snapshot(&self) -> CommunicationRuntimeStatus {
+        let channels = self
+            .fallback_order
+            .iter()
+            .copied()
+            .map(|channel| {
+                let state = self
+                    .channel_state
+                    .get(&channel)
+                    .cloned()
+                    .unwrap_or_default();
+                CommunicationChannelHealth {
+                    channel,
+                    healthy: state.healthy,
+                    consecutive_failures: state.consecutive_failures,
+                    last_attempt_ms: state.last_attempt_ms,
+                    last_success_ms: state.last_success_ms,
+                    last_error: state.last_error,
+                }
+            })
+            .collect::<Vec<_>>();
+        let last_success_ms = channels
+            .iter()
+            .filter_map(|channel| channel.last_success_ms)
+            .max();
+
+        CommunicationRuntimeStatus {
+            active_channel: self.active_channel(),
+            degraded: self.active_index > 0,
+            fallback_chain: self.fallback_order.clone(),
+            last_success_ms,
+            channels,
+        }
+    }
+
+    fn default_fallback_order() -> Vec<CommunicationChannelKind> {
+        vec![
+            CommunicationChannelKind::Grpc,
+            CommunicationChannelKind::WebSocket,
+            CommunicationChannelKind::LongPolling,
+            CommunicationChannelKind::DomainFronting,
+        ]
+    }
+
+    fn send_with_active_channel<F>(
+        &mut self,
+        now_ms: i64,
+        send: F,
+    ) -> Result<CommunicationChannelKind>
+    where
+        F: FnOnce(&dyn TransportDriver) -> Result<()>,
+    {
+        let channel = self.active_channel();
+        self.channel_state
+            .entry(channel)
+            .or_default()
+            .last_attempt_ms = Some(now_ms);
+
+        let result: Result<()> = match self.drivers.get(&channel) {
+            Some(driver) => send(driver.as_ref()),
+            None => Err(anyhow!("no transport driver registered for {:?}", channel)),
+        };
+
+        match result {
+            Ok(()) => {
+                let state = self.channel_state.entry(channel).or_default();
+                state.healthy = true;
+                state.consecutive_failures = 0;
+                state.last_success_ms = Some(now_ms);
+                state.last_error = None;
+                Ok(channel)
+            }
+            Err(error) => {
+                let state = self.channel_state.entry(channel).or_default();
+                state.healthy = false;
+                state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+                state.last_error = Some(error.to_string());
+                if state.consecutive_failures >= self.failure_threshold
+                    && self.active_index + 1 < self.fallback_order.len()
+                {
+                    self.active_index += 1;
+                }
+                Err(error)
+            }
         }
     }
 }
@@ -440,15 +660,18 @@ fn policy_version_rank(version: &str) -> u64 {
 mod tests {
     use super::{
         canonical_command_hash, AgentIdentity, CommandReplayLedger, CommandValidationError,
-        CommandValidator, HeartbeatBuilder, TelemetryBatchBuilder,
+        CommandValidator, CommunicationRuntime, HeartbeatBuilder, TelemetryBatchBuilder,
+        TransportDriver,
     };
     use aegis_model::{
-        AgentHealth, ApprovalPolicy, ApprovalProof, ApproverEntry, EventPayload, EventType,
-        FileContext, NormalizedEvent, Priority, ProcessContext, ServerCommand, Severity,
-        SignedServerCommand, TargetScope, TargetScopeKind, TelemetryEvent, UplinkMessage,
+        AgentHealth, ApprovalPolicy, ApprovalProof, ApproverEntry, CommunicationChannelKind,
+        EventPayload, EventType, FileContext, NormalizedEvent, Priority, ProcessContext,
+        RuntimeHealthSignals, ServerCommand, Severity, SignedServerCommand, TargetScope,
+        TargetScopeKind, TelemetryEvent, UplinkMessage,
     };
     use ed25519_dalek::{Signer, SigningKey};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
+    use std::sync::Mutex;
     use uuid::Uuid;
 
     fn identity() -> AgentIdentity {
@@ -533,6 +756,63 @@ mod tests {
             queue_depths: BTreeMap::from([("telemetry".to_string(), 4)]),
             dropped_events_total: 0,
             lineage_counters: Default::default(),
+            runtime_signals: RuntimeHealthSignals {
+                communication_channel: CommunicationChannelKind::Grpc,
+                adaptive_whitelist_size: 2,
+                etw_tamper_detected: false,
+                amsi_tamper_detected: false,
+                bpf_integrity_pass: true,
+            },
+        }
+    }
+
+    struct MockTransportDriver {
+        channel: CommunicationChannelKind,
+        send_results: Mutex<VecDeque<anyhow::Result<()>>>,
+        probe_results: Mutex<VecDeque<bool>>,
+    }
+
+    impl MockTransportDriver {
+        fn new(
+            channel: CommunicationChannelKind,
+            send_results: Vec<anyhow::Result<()>>,
+            probe_results: Vec<bool>,
+        ) -> Self {
+            Self {
+                channel,
+                send_results: Mutex::new(send_results.into()),
+                probe_results: Mutex::new(probe_results.into()),
+            }
+        }
+
+        fn next_send_result(&self) -> anyhow::Result<()> {
+            self.send_results
+                .lock()
+                .expect("send queue poisoned")
+                .pop_front()
+                .unwrap_or(Ok(()))
+        }
+    }
+
+    impl TransportDriver for MockTransportDriver {
+        fn channel(&self) -> CommunicationChannelKind {
+            self.channel
+        }
+
+        fn send_uplink(&self, _message: &UplinkMessage) -> anyhow::Result<()> {
+            self.next_send_result()
+        }
+
+        fn send_heartbeat(&self, _heartbeat: &aegis_model::HeartbeatRequest) -> anyhow::Result<()> {
+            self.next_send_result()
+        }
+
+        fn probe(&self) -> bool {
+            self.probe_results
+                .lock()
+                .expect("probe queue poisoned")
+                .pop_front()
+                .unwrap_or(true)
         }
     }
 
@@ -555,7 +835,9 @@ mod tests {
         let uplink = builder
             .build("tenant-a", "agent-1", 9, vec![event])
             .expect("build uplink");
-        let heartbeat = HeartbeatBuilder::build("tenant-a", "agent-1", health(), 0.2, 3);
+        let communication = CommunicationRuntime::with_loopback_drivers(3).snapshot();
+        let heartbeat =
+            HeartbeatBuilder::build("tenant-a", "agent-1", health(), communication, 0.2, 3);
 
         match uplink {
             UplinkMessage::EventBatch(batch) => {
@@ -567,6 +849,114 @@ mod tests {
         }
         assert_eq!(heartbeat.agent_id, "agent-1");
         assert_eq!(heartbeat.restart_epoch, 3);
+        assert_eq!(
+            heartbeat.communication.active_channel,
+            CommunicationChannelKind::Grpc
+        );
+    }
+
+    #[test]
+    fn communication_runtime_falls_back_after_three_failures() {
+        let mut runtime = CommunicationRuntime::new(3);
+        runtime.register_driver(Box::new(MockTransportDriver::new(
+            CommunicationChannelKind::Grpc,
+            vec![
+                Err(anyhow::anyhow!("grpc-1")),
+                Err(anyhow::anyhow!("grpc-2")),
+                Err(anyhow::anyhow!("grpc-3")),
+            ],
+            vec![false],
+        )));
+        runtime.register_driver(Box::new(MockTransportDriver::new(
+            CommunicationChannelKind::WebSocket,
+            vec![Ok(())],
+            vec![true],
+        )));
+        runtime.register_driver(Box::new(MockTransportDriver::new(
+            CommunicationChannelKind::LongPolling,
+            vec![Ok(())],
+            vec![true],
+        )));
+        runtime.register_driver(Box::new(MockTransportDriver::new(
+            CommunicationChannelKind::DomainFronting,
+            vec![Ok(())],
+            vec![true],
+        )));
+        let uplink = UplinkMessage::ClientAck(aegis_model::ClientAck {
+            command_id: Uuid::now_v7(),
+            status: "queued".to_string(),
+            detail: None,
+        });
+
+        for now_ms in [1_000, 2_000, 3_000] {
+            assert!(runtime.send_uplink(&uplink, now_ms).is_err());
+        }
+
+        let active = runtime
+            .send_uplink(&uplink, 4_000)
+            .expect("websocket should take over");
+        let snapshot = runtime.snapshot();
+
+        assert_eq!(active, CommunicationChannelKind::WebSocket);
+        assert_eq!(snapshot.active_channel, CommunicationChannelKind::WebSocket);
+        assert!(snapshot.degraded);
+        let grpc = snapshot
+            .channels
+            .iter()
+            .find(|status| status.channel == CommunicationChannelKind::Grpc)
+            .expect("grpc state");
+        assert_eq!(grpc.consecutive_failures, 3);
+        assert_eq!(grpc.last_error.as_deref(), Some("grpc-3"));
+    }
+
+    #[test]
+    fn communication_runtime_promotes_recovered_higher_priority_channel() {
+        let mut runtime = CommunicationRuntime::new(2);
+        runtime.register_driver(Box::new(MockTransportDriver::new(
+            CommunicationChannelKind::Grpc,
+            vec![
+                Err(anyhow::anyhow!("grpc-down-1")),
+                Err(anyhow::anyhow!("grpc-down-2")),
+            ],
+            vec![true],
+        )));
+        runtime.register_driver(Box::new(MockTransportDriver::new(
+            CommunicationChannelKind::WebSocket,
+            vec![Ok(())],
+            vec![true],
+        )));
+        runtime.register_driver(Box::new(MockTransportDriver::new(
+            CommunicationChannelKind::LongPolling,
+            vec![Ok(())],
+            vec![true],
+        )));
+        runtime.register_driver(Box::new(MockTransportDriver::new(
+            CommunicationChannelKind::DomainFronting,
+            vec![Ok(())],
+            vec![true],
+        )));
+        let heartbeat = HeartbeatBuilder::build(
+            "tenant-a",
+            "agent-1",
+            health(),
+            CommunicationRuntime::with_loopback_drivers(2).snapshot(),
+            0.2,
+            1,
+        );
+
+        assert!(runtime.send_heartbeat(&heartbeat, 1_000).is_err());
+        assert!(runtime.send_heartbeat(&heartbeat, 2_000).is_err());
+        assert_eq!(
+            runtime.active_channel(),
+            CommunicationChannelKind::WebSocket
+        );
+
+        let promoted = runtime.probe_upgrade(3_000).expect("grpc recovered");
+        let snapshot = runtime.snapshot();
+
+        assert_eq!(promoted, CommunicationChannelKind::Grpc);
+        assert_eq!(snapshot.active_channel, CommunicationChannelKind::Grpc);
+        assert!(!snapshot.degraded);
     }
 
     #[test]

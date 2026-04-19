@@ -1,3 +1,4 @@
+use aegis_core::comms::CommunicationRuntime;
 use aegis_core::config::AppConfig;
 use aegis_core::health::HealthReporter;
 use aegis_core::orchestrator::Orchestrator;
@@ -5,7 +6,7 @@ use aegis_core::self_protection::ProtectionPosture;
 use aegis_core::upgrade::{
     DiagnoseCertificateStatus, DiagnoseCollector, DiagnoseSensorStatus, DiagnoseWalStatus,
 };
-use aegis_model::{LineageCounters, TelemetryIntegrity};
+use aegis_model::{LineageCounters, RuntimeHealthSignals, TelemetryIntegrity};
 use anyhow::Result;
 use std::collections::BTreeMap;
 use tracing::info;
@@ -14,6 +15,7 @@ use tracing::info;
 async fn main() -> Result<()> {
     if std::env::args().any(|arg| arg == "--diagnose") {
         let config = AppConfig::default();
+        let communication = CommunicationRuntime::with_loopback_drivers(3).snapshot();
         let health = HealthReporter::build_snapshot(
             "0.1.0",
             &format!("bundle-{}", config.policy_version.policy_bundle),
@@ -23,6 +25,13 @@ async fn main() -> Result<()> {
             128,
             BTreeMap::from([("event".to_string(), 0usize)]),
             LineageCounters::default(),
+            RuntimeHealthSignals {
+                communication_channel: communication.active_channel,
+                adaptive_whitelist_size: 0,
+                etw_tamper_detected: false,
+                amsi_tamper_detected: false,
+                bpf_integrity_pass: true,
+            },
         );
         let bundle = DiagnoseCollector::collect(
             config.control_plane_url.clone(),
@@ -39,6 +48,7 @@ async fn main() -> Result<()> {
                 ],
                 unhealthy_sensors: vec![],
             },
+            communication,
             BTreeMap::from([
                 (
                     "policy_bundle".to_string(),
@@ -60,6 +70,7 @@ async fn main() -> Result<()> {
                 completeness: TelemetryIntegrity::Full,
             },
             health,
+            vec![],
             ProtectionPosture::Normal,
         );
         println!("{}", DiagnoseCollector::to_json(&bundle)?);
@@ -78,6 +89,7 @@ async fn main() -> Result<()> {
         agent_id = %summary.agent_id,
         tenant_id = %summary.tenant_id,
         control_plane_url = %summary.control_plane_url,
+        communication_channel = ?summary.communication_channel,
         tasks = ?summary.task_topology,
         "aegis-agentd runtime skeleton bootstrapped"
     );

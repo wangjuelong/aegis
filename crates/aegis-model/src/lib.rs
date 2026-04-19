@@ -649,6 +649,66 @@ pub struct FlowControlHint {
     pub max_batch_events: usize,
 }
 
+#[derive(
+    Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+pub enum CommunicationChannelKind {
+    #[default]
+    Grpc,
+    WebSocket,
+    LongPolling,
+    DomainFronting,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommunicationChannelHealth {
+    pub channel: CommunicationChannelKind,
+    pub healthy: bool,
+    pub consecutive_failures: u32,
+    pub last_attempt_ms: Option<i64>,
+    pub last_success_ms: Option<i64>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommunicationRuntimeStatus {
+    pub active_channel: CommunicationChannelKind,
+    pub degraded: bool,
+    pub fallback_chain: Vec<CommunicationChannelKind>,
+    pub last_success_ms: Option<i64>,
+    pub channels: Vec<CommunicationChannelHealth>,
+}
+
+impl Default for CommunicationRuntimeStatus {
+    fn default() -> Self {
+        let fallback_chain = vec![
+            CommunicationChannelKind::Grpc,
+            CommunicationChannelKind::WebSocket,
+            CommunicationChannelKind::LongPolling,
+            CommunicationChannelKind::DomainFronting,
+        ];
+        let channels = fallback_chain
+            .iter()
+            .copied()
+            .map(|channel| CommunicationChannelHealth {
+                channel,
+                healthy: false,
+                consecutive_failures: 0,
+                last_attempt_ms: None,
+                last_success_ms: None,
+                last_error: None,
+            })
+            .collect();
+        Self {
+            active_channel: CommunicationChannelKind::Grpc,
+            degraded: false,
+            fallback_chain,
+            last_success_ms: None,
+            channels,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum UplinkMessage {
     EventBatch(EventBatch),
@@ -687,6 +747,7 @@ pub struct AgentHealth {
     pub queue_depths: BTreeMap<String, usize>,
     pub dropped_events_total: u64,
     pub lineage_counters: LineageCounters,
+    pub runtime_signals: RuntimeHealthSignals,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -694,6 +755,7 @@ pub struct HeartbeatRequest {
     pub tenant_id: String,
     pub agent_id: String,
     pub health: AgentHealth,
+    pub communication: CommunicationRuntimeStatus,
     pub wal_utilization_ratio: f32,
     pub restart_epoch: u64,
 }
@@ -736,6 +798,23 @@ pub struct UpdateChunk {
     pub chunk_index: u32,
     pub bytes: Vec<u8>,
     pub eof: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeHealthSignals {
+    pub communication_channel: CommunicationChannelKind,
+    pub adaptive_whitelist_size: usize,
+    pub etw_tamper_detected: bool,
+    pub amsi_tamper_detected: bool,
+    pub bpf_integrity_pass: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginHealthStatus {
+    pub plugin_id: String,
+    pub healthy: bool,
+    pub state: String,
+    pub crash_count: u32,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -853,8 +932,9 @@ pub struct CloudApiConnectorContract {
 mod tests {
     use super::{
         CloudApiConnectorContract, CloudApiRecord, CloudConnectorCursor, CloudLogSourceKind,
-        EventBatch, EventPayload, EventType, FileContext, NormalizedEvent, Priority,
-        ProcessContext, RuntimeHeartbeat, RuntimeMetadata, RuntimePolicyContract,
+        CommunicationChannelKind, CommunicationRuntimeStatus, EventBatch, EventPayload, EventType,
+        FileContext, NormalizedEvent, PluginHealthStatus, Priority, ProcessContext,
+        RuntimeHealthSignals, RuntimeHeartbeat, RuntimeMetadata, RuntimePolicyContract,
         RuntimeProviderKind, RuntimeSdkEvent, RuntimeSignalKind, Severity, TelemetryEvent,
         TelemetryIntegrity, UplinkMessage,
     };
@@ -976,6 +1056,13 @@ mod tests {
             buffered_events: 8,
             dropped_events_total: 0,
         };
+        let health_signals = RuntimeHealthSignals {
+            communication_channel: CommunicationChannelKind::Grpc,
+            adaptive_whitelist_size: 3,
+            etw_tamper_detected: false,
+            amsi_tamper_detected: false,
+            bpf_integrity_pass: true,
+        };
         let policy = RuntimePolicyContract {
             contract_version: "serverless.v1".to_string(),
             policy_version: "policy-7".to_string(),
@@ -984,6 +1071,7 @@ mod tests {
             max_request_body_bytes: 8192,
             require_response_sampling: true,
         };
+        let communication = CommunicationRuntimeStatus::default();
         let connector = CloudApiConnectorContract {
             contract_version: "serverless.v1".to_string(),
             connector_id: "aws-cloudtrail".to_string(),
@@ -1011,10 +1099,22 @@ mod tests {
             observed_at_ms: 1_713_000_100_000,
             attributes: BTreeMap::from([("sourceIp".to_string(), "10.0.0.8".to_string())]),
         };
+        let plugin = PluginHealthStatus {
+            plugin_id: "runtime-audit".to_string(),
+            healthy: true,
+            state: "running".to_string(),
+            crash_count: 0,
+        };
 
         assert_eq!(event.contract_version, heartbeat.contract_version);
         assert_eq!(heartbeat.policy_version, policy.policy_version);
         assert_eq!(connector.contract_version, record.contract_version);
         assert_eq!(record.source, CloudLogSourceKind::AwsCloudTrail);
+        assert_eq!(
+            health_signals.communication_channel,
+            CommunicationChannelKind::Grpc
+        );
+        assert_eq!(communication.active_channel, CommunicationChannelKind::Grpc);
+        assert!(plugin.healthy);
     }
 }

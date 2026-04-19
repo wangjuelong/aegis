@@ -1,7 +1,10 @@
 use crate::config::{AgentConfig, CURRENT_CONF_VERSION};
 use crate::migrations::{CURRENT_SCHEMA_VERSION, MIN_READER_SCHEMA_VERSION};
 use crate::self_protection::ProtectionPosture;
-use aegis_model::{AgentHealth, TelemetryIntegrity};
+use aegis_model::{
+    AgentHealth, CommunicationRuntimeStatus, PluginHealthStatus, RuntimeHealthSignals,
+    TelemetryIntegrity,
+};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -155,10 +158,13 @@ pub struct DiagnoseBundle {
     pub connection: DiagnoseConnectionStatus,
     pub certificates: DiagnoseCertificateStatus,
     pub sensors: DiagnoseSensorStatus,
+    pub communication: CommunicationRuntimeStatus,
     pub engine_versions: BTreeMap<String, String>,
     pub ring_buffer_utilization_ratio: f32,
     pub wal: DiagnoseWalStatus,
     pub resources: AgentHealth,
+    pub runtime_signals: RuntimeHealthSignals,
+    pub plugin_status: Vec<PluginHealthStatus>,
     pub self_protection_posture: ProtectionPosture,
     pub redacted_fields: Vec<String>,
 }
@@ -172,10 +178,12 @@ impl DiagnoseCollector {
         reachable: bool,
         certificates: DiagnoseCertificateStatus,
         sensors: DiagnoseSensorStatus,
+        communication: CommunicationRuntimeStatus,
         engine_versions: BTreeMap<String, String>,
         ring_buffer_utilization_ratio: f32,
         wal: DiagnoseWalStatus,
         resources: AgentHealth,
+        plugin_status: Vec<PluginHealthStatus>,
         self_protection_posture: ProtectionPosture,
     ) -> DiagnoseBundle {
         DiagnoseBundle {
@@ -185,10 +193,13 @@ impl DiagnoseCollector {
             },
             certificates,
             sensors,
+            communication,
             engine_versions,
             ring_buffer_utilization_ratio,
             wal,
+            runtime_signals: resources.runtime_signals.clone(),
             resources,
+            plugin_status,
             self_protection_posture,
             redacted_fields: vec![
                 "server_signing_keys".to_string(),
@@ -213,7 +224,10 @@ mod tests {
     use crate::config::AgentConfig;
     use crate::health::HealthReporter;
     use crate::self_protection::ProtectionPosture;
-    use aegis_model::{LineageCounters, TelemetryIntegrity};
+    use aegis_model::{
+        CommunicationChannelKind, CommunicationRuntimeStatus, LineageCounters, PluginHealthStatus,
+        RuntimeHealthSignals, TelemetryIntegrity,
+    };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
@@ -227,6 +241,13 @@ mod tests {
             256,
             BTreeMap::from([("event".to_string(), 8usize)]),
             LineageCounters::default(),
+            RuntimeHealthSignals {
+                communication_channel: CommunicationChannelKind::Grpc,
+                adaptive_whitelist_size: 5,
+                etw_tamper_detected: false,
+                amsi_tamper_detected: false,
+                bpf_integrity_pass: true,
+            },
         )
     }
 
@@ -293,6 +314,18 @@ mod tests {
                 enabled_sensors: vec!["process".to_string(), "network".to_string()],
                 unhealthy_sensors: vec![],
             },
+            CommunicationRuntimeStatus {
+                active_channel: CommunicationChannelKind::WebSocket,
+                degraded: true,
+                fallback_chain: vec![
+                    CommunicationChannelKind::Grpc,
+                    CommunicationChannelKind::WebSocket,
+                    CommunicationChannelKind::LongPolling,
+                    CommunicationChannelKind::DomainFronting,
+                ],
+                last_success_ms: Some(1_713_000_100_000),
+                channels: vec![],
+            },
             BTreeMap::from([
                 ("detector".to_string(), "ruleset-1".to_string()),
                 ("model".to_string(), "model-1".to_string()),
@@ -304,12 +337,24 @@ mod tests {
                 completeness: TelemetryIntegrity::Partial,
             },
             health(),
+            vec![PluginHealthStatus {
+                plugin_id: "runtime-audit".to_string(),
+                healthy: true,
+                state: "running".to_string(),
+                crash_count: 0,
+            }],
             ProtectionPosture::Normal,
         );
         let json = DiagnoseCollector::to_json(&bundle).expect("serialize bundle");
 
         assert!(json.contains("\"telemetry_segments\": 3"));
+        assert!(json.contains("\"active_channel\": \"WebSocket\""));
         assert!(json.contains("\"redacted_fields\""));
+        assert_eq!(
+            bundle.runtime_signals.communication_channel,
+            CommunicationChannelKind::Grpc
+        );
+        assert_eq!(bundle.plugin_status.len(), 1);
         assert!(bundle
             .redacted_fields
             .contains(&"server_signing_keys".to_string()));

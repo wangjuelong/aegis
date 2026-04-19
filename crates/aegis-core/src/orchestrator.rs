@@ -1,7 +1,14 @@
+use crate::comms::{CommunicationRuntime, HeartbeatBuilder, TelemetryBatchBuilder};
 use crate::config::AppConfig;
-use aegis_model::{Alert, LineageCounters, NormalizedEvent, ResponseAction, TelemetryEvent};
+use crate::health::HealthReporter;
+use aegis_model::{
+    Alert, CommunicationChannelKind, LineageCounters, NormalizedEvent, ResponseAction,
+    RuntimeHealthSignals, TelemetryEvent,
+};
 use anyhow::{anyhow, Result};
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, timeout, Duration, MissedTickBehavior};
@@ -41,6 +48,7 @@ pub struct BootstrapSummary {
     pub agent_id: String,
     pub tenant_id: String,
     pub control_plane_url: String,
+    pub communication_channel: CommunicationChannelKind,
     pub lineage_counters: LineageCounters,
     pub queue_capacities: BTreeMap<String, usize>,
     pub task_topology: Vec<String>,
@@ -108,6 +116,7 @@ impl Orchestrator {
             agent_id: self.config.agent_id.clone(),
             tenant_id: self.config.tenant_id.clone(),
             control_plane_url: self.config.control_plane_url.clone(),
+            communication_channel: CommunicationChannelKind::Grpc,
             lineage_counters: LineageCounters::default(),
             queue_capacities: BTreeMap::from([
                 ("event".to_string(), EVENT_QUEUE_CAPACITY),
@@ -120,6 +129,7 @@ impl Orchestrator {
                 "sensor-dispatch".to_string(),
                 "comms-tx-high".to_string(),
                 "comms-tx-normal".to_string(),
+                "comms-link-manager".to_string(),
                 "response-executor".to_string(),
                 "telemetry-drain".to_string(),
                 "health-reporter".to_string(),
@@ -136,6 +146,7 @@ impl Orchestrator {
 
     pub fn start(&self, artifacts: BootstrapArtifacts) -> RuntimeHandle {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let comms_runtime = Arc::new(Mutex::new(CommunicationRuntime::with_loopback_drivers(3)));
 
         let mut tasks = Vec::new();
         tasks.push(RuntimeTask {
@@ -169,16 +180,30 @@ impl Orchestrator {
             )),
         });
         tasks.push(RuntimeTask {
+            name: "comms-link-manager",
+            handle: tokio::spawn(comms_link_manager_task(
+                self.config.heartbeat_interval(),
+                Arc::clone(&comms_runtime),
+                shutdown_rx.clone(),
+            )),
+        });
+        tasks.push(RuntimeTask {
             name: "telemetry-drain",
             handle: tokio::spawn(telemetry_drain_task(
+                self.config.tenant_id.clone(),
+                self.config.agent_id.clone(),
                 artifacts.receivers.telemetry_rx,
+                Arc::clone(&comms_runtime),
                 shutdown_rx.clone(),
             )),
         });
         tasks.push(RuntimeTask {
             name: "health-reporter",
             handle: tokio::spawn(health_reporter_task(
+                self.config.tenant_id.clone(),
+                self.config.agent_id.clone(),
                 self.config.heartbeat_interval(),
+                Arc::clone(&comms_runtime),
                 shutdown_rx.clone(),
             )),
         });
@@ -265,9 +290,13 @@ async fn response_executor_task(
 }
 
 async fn telemetry_drain_task(
+    tenant_id: String,
+    agent_id: String,
     mut telemetry_rx: mpsc::Receiver<TelemetryEvent>,
+    comms_runtime: Arc<Mutex<CommunicationRuntime>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
+    let builder = TelemetryBatchBuilder::new(1);
     loop {
         tokio::select! {
             changed = shutdown_rx.changed() => {
@@ -279,7 +308,23 @@ async fn telemetry_drain_task(
             maybe_event = telemetry_rx.recv() => {
                 match maybe_event {
                     Some(event) => {
-                        debug!(event_id = %event.event_id, lineage_id = %event.lineage_id, "telemetry-drain received event");
+                        match builder.build(
+                            tenant_id.clone(),
+                            agent_id.clone(),
+                            event.lineage.checkpoints.len() as u64,
+                            vec![event.clone()],
+                        ) {
+                            Ok(batch) => {
+                                let send_result = comms_runtime
+                                    .lock()
+                                    .expect("comms runtime poisoned")
+                                    .send_uplink(&batch, event.timestamp_ns as i64);
+                                if let Err(error) = send_result {
+                                    debug!(%error, "telemetry-drain failed to send batch");
+                                }
+                            }
+                            Err(error) => debug!(%error, "telemetry-drain failed to build batch"),
+                        }
                     }
                     None => break,
                 }
@@ -289,7 +334,10 @@ async fn telemetry_drain_task(
 }
 
 async fn health_reporter_task(
+    tenant_id: String,
+    agent_id: String,
     heartbeat_interval: Duration,
+    comms_runtime: Arc<Mutex<CommunicationRuntime>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let mut ticker = interval(heartbeat_interval);
@@ -304,7 +352,72 @@ async fn health_reporter_task(
                 }
             }
             _ = ticker.tick() => {
-                info!("health-reporter tick");
+                let communication = comms_runtime
+                    .lock()
+                    .expect("comms runtime poisoned")
+                    .snapshot();
+                let health = HealthReporter::build_snapshot(
+                    "0.1.0",
+                    "policy-1",
+                    "ruleset-1",
+                    "model-1",
+                    0.0,
+                    0,
+                    BTreeMap::from([("telemetry".to_string(), 0usize)]),
+                    LineageCounters::default(),
+                    RuntimeHealthSignals {
+                        communication_channel: communication.active_channel,
+                        adaptive_whitelist_size: 0,
+                        etw_tamper_detected: false,
+                        amsi_tamper_detected: false,
+                        bpf_integrity_pass: true,
+                    },
+                );
+                let heartbeat = HeartbeatBuilder::build(
+                    tenant_id.clone(),
+                    agent_id.clone(),
+                    health,
+                    communication,
+                    0.0,
+                    0,
+                );
+                let send_result = comms_runtime
+                    .lock()
+                    .expect("comms runtime poisoned")
+                    .send_heartbeat(&heartbeat, now_unix_ms());
+                match send_result {
+                    Ok(channel) => info!(?channel, "health-reporter tick"),
+                    Err(error) => debug!(%error, "health-reporter failed to send heartbeat"),
+                }
+            }
+        }
+    }
+}
+
+async fn comms_link_manager_task(
+    heartbeat_interval: Duration,
+    comms_runtime: Arc<Mutex<CommunicationRuntime>>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let mut ticker = interval(heartbeat_interval / 2);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_ok() && *shutdown_rx.borrow() {
+                    debug!("comms-link-manager received shutdown");
+                    break;
+                }
+            }
+            _ = ticker.tick() => {
+                let promoted = comms_runtime
+                    .lock()
+                    .expect("comms runtime poisoned")
+                    .probe_upgrade(now_unix_ms());
+                if let Some(channel) = promoted {
+                    info!(?channel, "comms-link-manager promoted transport");
+                }
             }
         }
     }
@@ -326,6 +439,13 @@ async fn config_watcher_task(mut shutdown_rx: watch::Receiver<bool>) {
     }
 }
 
+fn now_unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_millis() as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,11 +457,19 @@ mod tests {
 
         assert_eq!(artifacts.summary.agent_id, "local-agent");
         assert_eq!(artifacts.summary.tenant_id, "local-tenant");
+        assert_eq!(
+            artifacts.summary.communication_channel,
+            CommunicationChannelKind::Grpc
+        );
         assert_eq!(artifacts.summary.queue_capacities["event"], 65_536);
         assert!(artifacts
             .summary
             .task_topology
             .contains(&"health-reporter".to_string()));
+        assert!(artifacts
+            .summary
+            .task_topology
+            .contains(&"comms-link-manager".to_string()));
     }
 
     #[tokio::test]
@@ -357,6 +485,7 @@ mod tests {
 
         assert!(stopped.contains(&"sensor-dispatch".to_string()));
         assert!(stopped.contains(&"health-reporter".to_string()));
+        assert!(stopped.contains(&"comms-link-manager".to_string()));
         assert!(stopped.contains(&"config-watcher".to_string()));
     }
 }
