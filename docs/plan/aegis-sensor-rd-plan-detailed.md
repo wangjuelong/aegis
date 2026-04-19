@@ -645,3 +645,25 @@
   - 已建立 `HotUpdateManifest` 与 `HotUpdateManifestVerifier`，实现升级清单验签、artifact 与 rollback artifact 完整性验证
   - 已建立 `AgentSupervisorHeartbeat`、`WatchdogHeartbeat` 与 `WatchdogLinkMonitor`，支持 watchdog 失联检测与异常告警
   - 已将 `agentd`、`watchdog`、`updater` 接入共享运行时对象，并通过 `cargo fmt --all`、`cargo test --workspace`、`cargo run -p aegis-agentd -- --diagnose`、`cargo run -p aegis-watchdog`、`cargo run -p aegis-updater`
+
+### G05：容器、Sidecar 与 Serverless 运行时接入
+
+- 目标：将容器、sidecar 与 serverless 契约对象收口为可运行、可诊断的桥接能力。
+- 交付：
+  - `crates/aegis-core/src/container_mode.rs`
+  - `crates/aegis-core/src/runtime_sdk.rs`
+  - `crates/aegis-core/src/orchestrator.rs`
+  - `crates/aegis-core/src/upgrade.rs`
+  - `crates/aegis-core/examples/runtime_sdk_connector.rs`
+  - `crates/aegis-model/src/lib.rs`
+  - `crates/aegis-agentd/src/main.rs`
+  - `docs/pilot/aegis-sensor-pilot-record.md`
+  - `docs/qe/aegis-sensor-qe-matrix.md`
+  - `docs/plan/aegis-sensor-rd-status.md`
+- 依赖：G04
+- 完成记录（2026-04-19）：
+  - 已建立 `SidecarControlMessage` 与 `SidecarLocalControlPlane`，覆盖 unix socket 本地控制面绑定、发送与接收
+  - 已建立 `RuntimeEventEmitter` 与 `CloudConnectorRunner`，补齐 runtime heartbeat 绑定、事件缓存、connector flush/cursor 与运行态桥接状态快照
+  - 已将 `runtime-bridge` 纳入 `Orchestrator` 拓扑，并将 `RuntimeBridgeStatus` 接入 `DiagnoseBundle` 与 `aegis-agentd -- --diagnose`
+  - 已更新 `runtime_sdk_connector` 示例，实跑展示 connector 二次写入 flush 与 batch 计数
+  - 已通过 `cargo fmt --all`、`cargo test --workspace`、`cargo run -p aegis-core --example runtime_sdk_connector`、`cargo run -p aegis-agentd -- --diagnose`

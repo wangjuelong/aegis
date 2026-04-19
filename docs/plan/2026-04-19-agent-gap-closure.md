@@ -244,6 +244,13 @@
 
 - 测试覆盖 unix socket/本地消息转发、connector flush/cursor、runtime heartbeat
 
+**完成记录（2026-04-19）**
+
+- 已新增 `SidecarControlMessage` 与 `SidecarLocalControlPlane`，补齐 sidecar 到宿主 agent 的 unix socket 本地控制面与消息转发
+- 已新增 `RuntimeEventEmitter`、`CloudConnectorRunner` 与 `RuntimeBridgeStatus`，补齐 runtime heartbeat、connector flush/cursor 与 bridge 诊断快照
+- 已将 `runtime-bridge` 纳入 `Orchestrator` 拓扑，并将 `runtime_bridge` 映射接入 `aegis-agentd -- --diagnose`
+- 已通过 `cargo fmt --all`、`cargo test --workspace`、`cargo run -p aegis-core --example runtime_sdk_connector`、`cargo run -p aegis-agentd -- --diagnose`
+
 ### G06：平台执行基线收口
 
 **目标**
