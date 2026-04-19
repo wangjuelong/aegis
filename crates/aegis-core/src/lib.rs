@@ -13,6 +13,7 @@ pub mod migrations;
 pub mod ml;
 pub mod orchestrator;
 pub mod process_tree;
+pub mod recovery;
 pub mod response_executor;
 pub mod ring_buffer;
 pub mod rule_vm;
