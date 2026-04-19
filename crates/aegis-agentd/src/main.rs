@@ -5,111 +5,53 @@ use aegis_core::orchestrator::Orchestrator;
 use aegis_core::plugin_host::PluginHost;
 use aegis_core::self_protection::ProtectionPosture;
 use aegis_core::upgrade::{
-    DiagnoseCertificateStatus, DiagnoseCollector, DiagnoseSensorStatus, DiagnoseWalStatus,
+    AgentRuntimeSnapshot, DiagnoseCertificateStatus, DiagnoseCollector, DiagnoseConnectionStatus,
+    DiagnoseSensorStatus, DiagnoseWalStatus, RuntimeStateStore,
 };
 use aegis_model::{
-    AgentSupervisorHeartbeat, LineageCounters, PluginHealthStatus, RuntimeHealthSignals,
-    TelemetryIntegrity,
+    AgentSupervisorHeartbeat, LineageCounters, PluginHealthStatus, RuntimeBridgeStatus,
+    RuntimeHealthSignals, TelemetryIntegrity,
 };
 use anyhow::Result;
 use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     if std::env::args().any(|arg| arg == "--diagnose") {
-        let config = AppConfig::default();
-        let runtime_bridge = Orchestrator::new(config.clone())
-            .bootstrap()?
-            .summary
-            .runtime_bridge;
-        let communication = CommunicationRuntime::with_loopback_drivers(3).snapshot();
-        let plugin_status = collect_plugin_status(&config);
-        let health = HealthReporter::build_snapshot(
-            "0.1.0",
-            &format!("bundle-{}", config.policy_version.policy_bundle),
-            &format!("ruleset-{}", config.policy_version.ruleset_revision),
-            &format!("model-{}", config.policy_version.model_revision),
-            2.5,
-            128,
-            BTreeMap::from([("event".to_string(), 0usize)]),
-            LineageCounters::default(),
-            RuntimeHealthSignals {
-                communication_channel: communication.active_channel,
-                adaptive_whitelist_size: 0,
-                etw_tamper_detected: false,
-                amsi_tamper_detected: false,
-                bpf_integrity_pass: true,
-            },
-        );
-        let bundle = DiagnoseCollector::collect(
-            config.control_plane_url.clone(),
-            true,
-            DiagnoseCertificateStatus {
-                device_certificate_loaded: true,
-                last_rotation_succeeded: true,
-            },
-            DiagnoseSensorStatus {
-                enabled_sensors: vec![
-                    "process".to_string(),
-                    "file".to_string(),
-                    "network".to_string(),
-                ],
-                unhealthy_sensors: vec![],
-            },
-            communication,
-            BTreeMap::from([
-                (
-                    "policy_bundle".to_string(),
-                    config.policy_version.policy_bundle.to_string(),
-                ),
-                (
-                    "ruleset_revision".to_string(),
-                    config.policy_version.ruleset_revision.to_string(),
-                ),
-                (
-                    "model_revision".to_string(),
-                    config.policy_version.model_revision.to_string(),
-                ),
-            ]),
-            0.0,
-            DiagnoseWalStatus {
-                telemetry_segments: 0,
-                forensic_root: config.storage.forensic_path.clone(),
-                completeness: TelemetryIntegrity::Full,
-                encrypted: true,
-                key_version: 1,
-                quarantined_segments: 0,
-            },
-            health,
-            Some(runtime_bridge),
-            plugin_status,
-            ProtectionPosture::Normal,
-        );
+        let config = load_runtime_config()?;
+        let snapshot = match RuntimeStateStore::load_agent_snapshot(&config) {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                let runtime_bridge = Orchestrator::new(config.clone())
+                    .bootstrap()?
+                    .summary
+                    .runtime_bridge;
+                let snapshot = build_agent_runtime_snapshot(&config, Some(runtime_bridge));
+                RuntimeStateStore::persist_agent_snapshot(&config, &snapshot)?;
+                snapshot
+            }
+        };
+        let mut bundle = snapshot.to_diagnose_bundle();
+        bundle.watchdog = RuntimeStateStore::load_watchdog_snapshot(&config).ok();
         println!("{}", DiagnoseCollector::to_json(&bundle)?);
         return Ok(());
     }
 
     tracing_subscriber::fmt().with_env_filter("info").init();
 
-    let config = AppConfig::default();
+    let config = load_runtime_config()?;
     let shutdown_grace_period = config.shutdown_grace_period();
     let orchestrator = Orchestrator::new(config.clone());
     let artifacts = orchestrator.bootstrap()?;
     let summary = &artifacts.summary;
-    let plugin_status = collect_plugin_status(&config);
-    let supervisor_heartbeat = AgentSupervisorHeartbeat {
-        tenant_id: summary.tenant_id.clone(),
-        agent_id: summary.agent_id.clone(),
-        plugin_count: plugin_status.len(),
-        degraded_plugins: plugin_status
-            .iter()
-            .filter(|plugin| !plugin.healthy)
-            .count(),
-        active_update_id: None,
-        sent_at_ms: now_unix_ms(),
-    };
+    let runtime_snapshot =
+        build_agent_runtime_snapshot(&config, Some(summary.runtime_bridge.clone()));
+    RuntimeStateStore::persist_agent_snapshot(&config, &runtime_snapshot)?;
+    let supervisor_heartbeat = runtime_snapshot.supervisor_heartbeat.clone();
 
     info!(
         agent_id = %summary.agent_id,
@@ -131,6 +73,31 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn load_runtime_config() -> Result<AppConfig> {
+    let config = AppConfig::default();
+    if let Ok(state_root) = std::env::var("AEGIS_STATE_ROOT") {
+        return Ok(config.with_state_root(PathBuf::from(state_root)));
+    }
+    if state_root_writable(&config.storage.state_root) {
+        return Ok(config);
+    }
+    Ok(config.with_state_root(std::env::current_dir()?.join("target/aegis-dev/state")))
+}
+
+fn state_root_writable(path: &Path) -> bool {
+    if fs::create_dir_all(path).is_err() {
+        return false;
+    }
+    let probe = path.join(".aegis-write-probe");
+    match fs::write(&probe, b"ok") {
+        Ok(()) => {
+            let _ = fs::remove_file(probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 fn now_unix_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -150,4 +117,91 @@ fn collect_plugin_status(config: &AppConfig) -> Vec<PluginHealthStatus> {
         }];
     }
     plugin_host.run_all_once()
+}
+
+fn build_agent_runtime_snapshot(
+    config: &AppConfig,
+    runtime_bridge: Option<RuntimeBridgeStatus>,
+) -> AgentRuntimeSnapshot {
+    let communication = CommunicationRuntime::with_loopback_drivers(3).snapshot();
+    let plugin_status = collect_plugin_status(config);
+    let active_update_id = RuntimeStateStore::load_update_snapshot(config)
+        .ok()
+        .map(|snapshot| snapshot.manifest.artifact_id);
+    let health = HealthReporter::build_snapshot(
+        "0.1.0",
+        &format!("bundle-{}", config.policy_version.policy_bundle),
+        &format!("ruleset-{}", config.policy_version.ruleset_revision),
+        &format!("model-{}", config.policy_version.model_revision),
+        2.5,
+        128,
+        BTreeMap::from([("event".to_string(), 0usize)]),
+        LineageCounters::default(),
+        RuntimeHealthSignals {
+            communication_channel: communication.active_channel,
+            adaptive_whitelist_size: 0,
+            etw_tamper_detected: false,
+            amsi_tamper_detected: false,
+            bpf_integrity_pass: true,
+        },
+    );
+
+    AgentRuntimeSnapshot {
+        captured_at_ms: now_unix_ms(),
+        supervisor_heartbeat: AgentSupervisorHeartbeat {
+            tenant_id: config.tenant_id.clone(),
+            agent_id: config.agent_id.clone(),
+            plugin_count: plugin_status.len(),
+            degraded_plugins: plugin_status
+                .iter()
+                .filter(|plugin| !plugin.healthy)
+                .count(),
+            active_update_id,
+            sent_at_ms: now_unix_ms(),
+        },
+        connection: DiagnoseConnectionStatus {
+            control_plane_url: config.control_plane_url.clone(),
+            reachable: true,
+        },
+        certificates: DiagnoseCertificateStatus {
+            device_certificate_loaded: true,
+            last_rotation_succeeded: true,
+        },
+        sensors: DiagnoseSensorStatus {
+            enabled_sensors: vec![
+                "process".to_string(),
+                "file".to_string(),
+                "network".to_string(),
+            ],
+            unhealthy_sensors: vec![],
+        },
+        communication,
+        engine_versions: BTreeMap::from([
+            (
+                "policy_bundle".to_string(),
+                config.policy_version.policy_bundle.to_string(),
+            ),
+            (
+                "ruleset_revision".to_string(),
+                config.policy_version.ruleset_revision.to_string(),
+            ),
+            (
+                "model_revision".to_string(),
+                config.policy_version.model_revision.to_string(),
+            ),
+        ]),
+        ring_buffer_utilization_ratio: 0.0,
+        wal: DiagnoseWalStatus {
+            telemetry_segments: 0,
+            forensic_root: config.storage.forensic_path.clone(),
+            completeness: TelemetryIntegrity::Full,
+            encrypted: true,
+            key_version: 1,
+            quarantined_segments: 0,
+        },
+        resources: health,
+        runtime_bridge,
+        plugin_status,
+        self_protection_posture: ProtectionPosture::Normal,
+    }
 }

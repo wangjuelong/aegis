@@ -87,6 +87,7 @@ dependencies = [
  "anyhow",
  "ed25519-dalek",
  "hex",
+ "serde_json",
  "sha2",
  "tracing",
  "tracing-subscriber",

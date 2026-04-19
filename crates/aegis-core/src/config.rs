@@ -143,11 +143,22 @@ impl AgentConfig {
     pub fn shutdown_grace_period(&self) -> Duration {
         Duration::from_secs(self.runtime.shutdown_grace_period_secs)
     }
+
+    pub fn with_state_root(mut self, state_root: PathBuf) -> Self {
+        self.storage.state_root = state_root.clone();
+        self.storage.config_path = state_root.join("agent.toml");
+        self.storage.agent_db_path = state_root.join("agent.db");
+        self.storage.ring_buffer_path = state_root.join("ring-buffer");
+        self.storage.spill_path = state_root.join("spill");
+        self.storage.forensic_path = state_root.join("forensics");
+        self
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{AgentConfig, CURRENT_CONF_VERSION};
+    use std::path::PathBuf;
 
     #[test]
     fn config_toml_roundtrip_preserves_versions() {
@@ -192,5 +203,20 @@ forensic_path = "/var/lib/aegis/forensics"
 
         let error = AgentConfig::from_toml_str(raw).expect_err("config version must fail");
         assert!(error.to_string().contains("unsupported config version"));
+    }
+
+    #[test]
+    fn with_state_root_rebinds_storage_paths() {
+        let config = AgentConfig::default().with_state_root(PathBuf::from("/tmp/aegis-dev"));
+
+        assert_eq!(config.storage.state_root, PathBuf::from("/tmp/aegis-dev"));
+        assert_eq!(
+            config.storage.agent_db_path,
+            PathBuf::from("/tmp/aegis-dev/agent.db")
+        );
+        assert_eq!(
+            config.storage.forensic_path,
+            PathBuf::from("/tmp/aegis-dev/forensics")
+        );
     }
 }
