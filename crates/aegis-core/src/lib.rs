@@ -8,6 +8,7 @@ pub mod error;
 pub mod feedback;
 pub mod hashing;
 pub mod health;
+pub mod high_risk_ops;
 pub mod ioc;
 pub mod migrations;
 pub mod ml;
