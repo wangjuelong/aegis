@@ -1,12 +1,16 @@
 use aegis_model::{
     AgentHealth, ApproverEntry, CommunicationChannelHealth, CommunicationChannelKind,
-    CommunicationRuntimeStatus, EventBatch, HeartbeatRequest, ServerCommand, SignedServerCommand,
-    TargetScopeKind, TelemetryEvent, UplinkMessage,
+    CommunicationRuntimeStatus, DownlinkMessage, EventBatch, HeartbeatRequest, ServerCommand,
+    SignedServerCommand, TargetScopeKind, TelemetryEvent, UplinkMessage,
 };
 use anyhow::{anyhow, bail, Result};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::any::Any;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,16 +80,55 @@ pub trait TransportDriver: Send + Sync {
     fn channel(&self) -> CommunicationChannelKind;
     fn send_uplink(&self, message: &UplinkMessage) -> Result<()>;
     fn send_heartbeat(&self, heartbeat: &HeartbeatRequest) -> Result<()>;
+    fn recv_downlink(&self) -> Result<Option<DownlinkMessage>>;
     fn probe(&self) -> bool;
+    fn as_any(&self) -> &dyn Any;
+}
+
+#[derive(Clone, Default)]
+pub struct LoopbackTransportHandle {
+    uplinks: Arc<Mutex<Vec<UplinkMessage>>>,
+    heartbeats: Arc<Mutex<Vec<HeartbeatRequest>>>,
+    downlinks: Arc<Mutex<VecDeque<DownlinkMessage>>>,
+}
+
+impl LoopbackTransportHandle {
+    pub fn inject_downlink(&self, message: DownlinkMessage) {
+        self.downlinks
+            .lock()
+            .expect("loopback downlink queue poisoned")
+            .push_back(message);
+    }
+
+    pub fn take_uplinks(&self) -> Vec<UplinkMessage> {
+        let mut uplinks = self.uplinks.lock().expect("loopback uplink queue poisoned");
+        std::mem::take(&mut *uplinks)
+    }
+
+    pub fn take_heartbeats(&self) -> Vec<HeartbeatRequest> {
+        let mut heartbeats = self
+            .heartbeats
+            .lock()
+            .expect("loopback heartbeat queue poisoned");
+        std::mem::take(&mut *heartbeats)
+    }
 }
 
 pub struct LoopbackTransportDriver {
     channel: CommunicationChannelKind,
+    handle: LoopbackTransportHandle,
 }
 
 impl LoopbackTransportDriver {
     pub fn new(channel: CommunicationChannelKind) -> Self {
-        Self { channel }
+        Self {
+            channel,
+            handle: LoopbackTransportHandle::default(),
+        }
+    }
+
+    pub fn handle(&self) -> LoopbackTransportHandle {
+        self.handle.clone()
     }
 }
 
@@ -94,16 +137,39 @@ impl TransportDriver for LoopbackTransportDriver {
         self.channel
     }
 
-    fn send_uplink(&self, _message: &UplinkMessage) -> Result<()> {
+    fn send_uplink(&self, message: &UplinkMessage) -> Result<()> {
+        self.handle
+            .uplinks
+            .lock()
+            .expect("loopback uplink queue poisoned")
+            .push(message.clone());
         Ok(())
     }
 
-    fn send_heartbeat(&self, _heartbeat: &HeartbeatRequest) -> Result<()> {
+    fn send_heartbeat(&self, heartbeat: &HeartbeatRequest) -> Result<()> {
+        self.handle
+            .heartbeats
+            .lock()
+            .expect("loopback heartbeat queue poisoned")
+            .push(heartbeat.clone());
         Ok(())
+    }
+
+    fn recv_downlink(&self) -> Result<Option<DownlinkMessage>> {
+        Ok(self
+            .handle
+            .downlinks
+            .lock()
+            .expect("loopback downlink queue poisoned")
+            .pop_front())
     }
 
     fn probe(&self) -> bool {
         true
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -142,11 +208,23 @@ impl CommunicationRuntime {
     }
 
     pub fn with_loopback_drivers(failure_threshold: u32) -> Self {
+        Self::with_loopback_drivers_and_handles(failure_threshold).0
+    }
+
+    pub fn with_loopback_drivers_and_handles(
+        failure_threshold: u32,
+    ) -> (
+        Self,
+        HashMap<CommunicationChannelKind, LoopbackTransportHandle>,
+    ) {
         let mut runtime = Self::new(failure_threshold);
+        let mut handles = HashMap::new();
         for channel in Self::default_fallback_order() {
-            runtime.register_driver(Box::new(LoopbackTransportDriver::new(channel)));
+            let driver = LoopbackTransportDriver::new(channel);
+            handles.insert(channel, driver.handle());
+            runtime.register_driver(Box::new(driver));
         }
-        runtime
+        (runtime, handles)
     }
 
     pub fn register_driver(&mut self, driver: Box<dyn TransportDriver>) {
@@ -173,6 +251,45 @@ impl CommunicationRuntime {
         now_ms: i64,
     ) -> Result<CommunicationChannelKind> {
         self.send_with_active_channel(now_ms, |driver| driver.send_heartbeat(heartbeat))
+    }
+
+    pub fn poll_downlink(
+        &mut self,
+        now_ms: i64,
+    ) -> Result<Option<(CommunicationChannelKind, DownlinkMessage)>> {
+        let channel = self.active_channel();
+        self.channel_state
+            .entry(channel)
+            .or_default()
+            .last_attempt_ms = Some(now_ms);
+
+        let result = match self.drivers.get(&channel) {
+            Some(driver) => driver.recv_downlink(),
+            None => Err(anyhow!("no transport driver registered for {:?}", channel)),
+        };
+
+        match result {
+            Ok(message) => {
+                let state = self.channel_state.entry(channel).or_default();
+                state.healthy = true;
+                state.consecutive_failures = 0;
+                state.last_success_ms = Some(now_ms);
+                state.last_error = None;
+                Ok(message.map(|message| (channel, message)))
+            }
+            Err(error) => {
+                let state = self.channel_state.entry(channel).or_default();
+                state.healthy = false;
+                state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+                state.last_error = Some(error.to_string());
+                if state.consecutive_failures >= self.failure_threshold
+                    && self.active_index + 1 < self.fallback_order.len()
+                {
+                    self.active_index += 1;
+                }
+                Err(error)
+            }
+        }
     }
 
     pub fn probe_upgrade(&mut self, now_ms: i64) -> Option<CommunicationChannelKind> {
@@ -236,6 +353,16 @@ impl CommunicationRuntime {
         }
     }
 
+    pub fn loopback_handle(
+        &self,
+        channel: CommunicationChannelKind,
+    ) -> Option<LoopbackTransportHandle> {
+        self.drivers
+            .get(&channel)
+            .and_then(|driver| driver.as_any().downcast_ref::<LoopbackTransportDriver>())
+            .map(LoopbackTransportDriver::handle)
+    }
+
     fn default_fallback_order() -> Vec<CommunicationChannelKind> {
         vec![
             CommunicationChannelKind::Grpc,
@@ -289,29 +416,107 @@ impl CommunicationRuntime {
     }
 }
 
-#[derive(Default)]
+enum CommandReplayLedgerBackend {
+    Memory(HashMap<Uuid, i64>),
+    Sqlite(PathBuf),
+}
+
 pub struct CommandReplayLedger {
-    seen: HashMap<Uuid, i64>,
+    backend: CommandReplayLedgerBackend,
+}
+
+impl Default for CommandReplayLedger {
+    fn default() -> Self {
+        Self {
+            backend: CommandReplayLedgerBackend::Memory(HashMap::new()),
+        }
+    }
 }
 
 impl CommandReplayLedger {
+    pub fn new_persistent(path: PathBuf) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        initialize_replay_ledger_backend(&path)?;
+        Ok(Self {
+            backend: CommandReplayLedgerBackend::Sqlite(path),
+        })
+    }
+
     pub fn register(
         &mut self,
         command_id: Uuid,
         expires_at_ms: i64,
         now_ms: i64,
     ) -> Result<(), CommandValidationError> {
-        self.prune(now_ms);
-        if self.seen.contains_key(&command_id) {
-            return Err(CommandValidationError::ReplayDetected);
+        self.prune(now_ms)?;
+        match &mut self.backend {
+            CommandReplayLedgerBackend::Memory(seen) => {
+                if seen.contains_key(&command_id) {
+                    return Err(CommandValidationError::ReplayDetected);
+                }
+                seen.insert(command_id, expires_at_ms);
+                Ok(())
+            }
+            CommandReplayLedgerBackend::Sqlite(path) => {
+                let connection = Connection::open(path)
+                    .map_err(|_| CommandValidationError::PersistenceFailure)?;
+                let existing = connection
+                    .query_row(
+                        "SELECT expires_at_ms FROM command_replay_ledger WHERE command_id = ?1",
+                        params![command_id.to_string()],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()
+                    .map_err(|_| CommandValidationError::PersistenceFailure)?;
+                if existing.is_some() {
+                    return Err(CommandValidationError::ReplayDetected);
+                }
+                connection
+                    .execute(
+                        "INSERT INTO command_replay_ledger(command_id, expires_at_ms)
+                         VALUES (?1, ?2)",
+                        params![command_id.to_string(), expires_at_ms],
+                    )
+                    .map_err(|_| CommandValidationError::PersistenceFailure)?;
+                Ok(())
+            }
         }
-        self.seen.insert(command_id, expires_at_ms);
-        Ok(())
     }
 
-    pub fn prune(&mut self, now_ms: i64) {
-        self.seen.retain(|_, expires_at_ms| *expires_at_ms > now_ms);
+    fn prune(&mut self, now_ms: i64) -> Result<(), CommandValidationError> {
+        match &mut self.backend {
+            CommandReplayLedgerBackend::Memory(seen) => {
+                seen.retain(|_, expires_at_ms| *expires_at_ms > now_ms);
+                Ok(())
+            }
+            CommandReplayLedgerBackend::Sqlite(path) => {
+                let connection = Connection::open(path)
+                    .map_err(|_| CommandValidationError::PersistenceFailure)?;
+                connection
+                    .execute(
+                        "DELETE FROM command_replay_ledger WHERE expires_at_ms <= ?1",
+                        params![now_ms],
+                    )
+                    .map_err(|_| CommandValidationError::PersistenceFailure)?;
+                Ok(())
+            }
+        }
     }
+}
+
+fn initialize_replay_ledger_backend(path: &Path) -> Result<()> {
+    let connection = Connection::open(path)?;
+    connection.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS command_replay_ledger (
+            command_id TEXT PRIMARY KEY,
+            expires_at_ms INTEGER NOT NULL
+        );
+        ",
+    )?;
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -480,6 +685,8 @@ pub enum CommandValidationError {
     ClockSkewExceeded,
     #[error("replay detected")]
     ReplayDetected,
+    #[error("command replay ledger persistence failure")]
+    PersistenceFailure,
     #[error("approval proof failed")]
     ApprovalProofFailed,
     #[error("approval policy version too low")]
@@ -629,7 +836,7 @@ fn validate_approval_signature(
         .map_err(|_| CommandValidationError::ApprovalProofFailed)
 }
 
-fn canonical_command_hash(command: &ServerCommand) -> [u8; 32] {
+pub(crate) fn canonical_command_hash(command: &ServerCommand) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(command.command_id.as_bytes());
     update_len_prefixed(&mut hasher, command.tenant_id.as_bytes());
@@ -665,12 +872,14 @@ mod tests {
     };
     use aegis_model::{
         AgentHealth, ApprovalPolicy, ApprovalProof, ApproverEntry, CommunicationChannelKind,
-        EventPayload, EventType, FileContext, NormalizedEvent, Priority, ProcessContext,
-        RuntimeHealthSignals, ServerCommand, Severity, SignedServerCommand, TargetScope,
-        TargetScopeKind, TelemetryEvent, UplinkMessage,
+        DownlinkMessage, EventPayload, EventType, FileContext, NormalizedEvent, Priority,
+        ProcessContext, RuntimeHealthSignals, ServerCommand, Severity, SignedServerCommand,
+        TargetScope, TargetScopeKind, TelemetryEvent, UplinkMessage,
     };
     use ed25519_dalek::{Signer, SigningKey};
+    use std::any::Any;
     use std::collections::{BTreeMap, VecDeque};
+    use std::path::PathBuf;
     use std::sync::Mutex;
     use uuid::Uuid;
 
@@ -690,6 +899,10 @@ mod tests {
             agent_ids: Vec::new(),
             max_fanout: 1,
         }
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("aegis-{name}-{}", Uuid::now_v7()))
     }
 
     fn low_risk_command() -> ServerCommand {
@@ -807,12 +1020,20 @@ mod tests {
             self.next_send_result()
         }
 
+        fn recv_downlink(&self) -> anyhow::Result<Option<DownlinkMessage>> {
+            Ok(None)
+        }
+
         fn probe(&self) -> bool {
             self.probe_results
                 .lock()
                 .expect("probe queue poisoned")
                 .pop_front()
                 .unwrap_or(true)
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
         }
     }
 
@@ -957,6 +1178,59 @@ mod tests {
         assert_eq!(promoted, CommunicationChannelKind::Grpc);
         assert_eq!(snapshot.active_channel, CommunicationChannelKind::Grpc);
         assert!(!snapshot.degraded);
+    }
+
+    #[test]
+    fn communication_runtime_polls_loopback_downlink_and_records_uplink() {
+        let (mut runtime, handles) = CommunicationRuntime::with_loopback_drivers_and_handles(2);
+        let grpc = handles
+            .get(&CommunicationChannelKind::Grpc)
+            .expect("grpc handle");
+        let command_id = Uuid::now_v7();
+        grpc.inject_downlink(DownlinkMessage::ServerCommand(SignedServerCommand {
+            payload: vec![1, 2, 3],
+            signature: vec![4, 5, 6],
+            signing_key_id: "server-k1".to_string(),
+        }));
+
+        let polled = runtime
+            .poll_downlink(1_000)
+            .expect("poll downlink")
+            .expect("downlink message");
+        assert_eq!(polled.0, CommunicationChannelKind::Grpc);
+        match polled.1 {
+            DownlinkMessage::ServerCommand(command) => {
+                assert_eq!(command.signing_key_id, "server-k1");
+            }
+            _ => panic!("expected server command"),
+        }
+
+        let uplink = UplinkMessage::ClientAck(aegis_model::ClientAck {
+            command_id,
+            status: "accepted".to_string(),
+            detail: None,
+        });
+        runtime
+            .send_uplink(&uplink, 1_100)
+            .expect("send loopback uplink");
+        assert_eq!(grpc.take_uplinks(), vec![uplink]);
+    }
+
+    #[test]
+    fn command_replay_ledger_persists_across_reopen() {
+        let path = temp_path("command-replay.db");
+        let command_id = Uuid::now_v7();
+        let mut first = CommandReplayLedger::new_persistent(path.clone()).expect("create ledger");
+        first
+            .register(command_id, 10_000, 1_000)
+            .expect("first register");
+
+        let mut reopened =
+            CommandReplayLedger::new_persistent(path).expect("reopen persistent ledger");
+        let error = reopened
+            .register(command_id, 10_000, 1_100)
+            .expect_err("replay should be persisted");
+        assert_eq!(error, CommandValidationError::ReplayDetected);
     }
 
     #[test]

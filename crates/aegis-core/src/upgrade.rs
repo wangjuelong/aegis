@@ -8,10 +8,12 @@ use aegis_model::{
 };
 use anyhow::{bail, Result};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpgradeArtifact {
@@ -316,9 +318,104 @@ pub struct DiagnoseBundle {
     pub resources: AgentHealth,
     pub runtime_signals: RuntimeHealthSignals,
     pub runtime_bridge: Option<RuntimeBridgeStatus>,
+    pub watchdog: Option<WatchdogRuntimeSnapshot>,
     pub plugin_status: Vec<PluginHealthStatus>,
     pub self_protection_posture: ProtectionPosture,
     pub redacted_fields: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentRuntimeSnapshot {
+    pub captured_at_ms: i64,
+    pub supervisor_heartbeat: AgentSupervisorHeartbeat,
+    pub connection: DiagnoseConnectionStatus,
+    pub certificates: DiagnoseCertificateStatus,
+    pub sensors: DiagnoseSensorStatus,
+    pub communication: CommunicationRuntimeStatus,
+    pub engine_versions: BTreeMap<String, String>,
+    pub ring_buffer_utilization_ratio: f32,
+    pub wal: DiagnoseWalStatus,
+    pub resources: AgentHealth,
+    pub runtime_bridge: Option<RuntimeBridgeStatus>,
+    pub plugin_status: Vec<PluginHealthStatus>,
+    pub self_protection_posture: ProtectionPosture,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WatchdogRuntimeSnapshot {
+    pub observed_at_ms: i64,
+    pub agent_heartbeat: AgentSupervisorHeartbeat,
+    pub watchdog_heartbeat: WatchdogHeartbeat,
+    pub alerts: Vec<WatchdogAlert>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateVerificationSnapshot {
+    pub verified_at_ms: i64,
+    pub manifest: HotUpdateManifest,
+    pub artifact_path: PathBuf,
+    pub rollback_path: Option<PathBuf>,
+}
+
+pub struct RuntimeStateStore;
+
+impl RuntimeStateStore {
+    pub fn agent_snapshot_path(config: &AgentConfig) -> PathBuf {
+        config.storage.state_root.join("runtime-state.json")
+    }
+
+    pub fn watchdog_snapshot_path(config: &AgentConfig) -> PathBuf {
+        config.storage.state_root.join("watchdog-state.json")
+    }
+
+    pub fn update_snapshot_path(config: &AgentConfig) -> PathBuf {
+        config.storage.state_root.join("update-state.json")
+    }
+
+    pub fn staged_update_manifest_path(config: &AgentConfig) -> PathBuf {
+        config.storage.state_root.join("updates/manifest.json")
+    }
+
+    pub fn staged_update_artifact_path(config: &AgentConfig) -> PathBuf {
+        config.storage.state_root.join("updates/artifact.bin")
+    }
+
+    pub fn staged_update_rollback_path(config: &AgentConfig) -> PathBuf {
+        config.storage.state_root.join("updates/rollback.bin")
+    }
+
+    pub fn persist_agent_snapshot(
+        config: &AgentConfig,
+        snapshot: &AgentRuntimeSnapshot,
+    ) -> Result<()> {
+        write_json(Self::agent_snapshot_path(config), snapshot)
+    }
+
+    pub fn load_agent_snapshot(config: &AgentConfig) -> Result<AgentRuntimeSnapshot> {
+        read_json(&Self::agent_snapshot_path(config))
+    }
+
+    pub fn persist_watchdog_snapshot(
+        config: &AgentConfig,
+        snapshot: &WatchdogRuntimeSnapshot,
+    ) -> Result<()> {
+        write_json(Self::watchdog_snapshot_path(config), snapshot)
+    }
+
+    pub fn load_watchdog_snapshot(config: &AgentConfig) -> Result<WatchdogRuntimeSnapshot> {
+        read_json(&Self::watchdog_snapshot_path(config))
+    }
+
+    pub fn persist_update_snapshot(
+        config: &AgentConfig,
+        snapshot: &UpdateVerificationSnapshot,
+    ) -> Result<()> {
+        write_json(Self::update_snapshot_path(config), snapshot)
+    }
+
+    pub fn load_update_snapshot(config: &AgentConfig) -> Result<UpdateVerificationSnapshot> {
+        read_json(&Self::update_snapshot_path(config))
+    }
 }
 
 pub struct DiagnoseCollector;
@@ -353,6 +450,7 @@ impl DiagnoseCollector {
             runtime_signals: resources.runtime_signals.clone(),
             resources,
             runtime_bridge,
+            watchdog: None,
             plugin_status,
             self_protection_posture,
             redacted_fields: vec![
@@ -368,12 +466,33 @@ impl DiagnoseCollector {
     }
 }
 
+impl AgentRuntimeSnapshot {
+    pub fn to_diagnose_bundle(&self) -> DiagnoseBundle {
+        DiagnoseCollector::collect(
+            self.connection.control_plane_url.clone(),
+            self.connection.reachable,
+            self.certificates.clone(),
+            self.sensors.clone(),
+            self.communication.clone(),
+            self.engine_versions.clone(),
+            self.ring_buffer_utilization_ratio,
+            self.wal.clone(),
+            self.resources.clone(),
+            self.runtime_bridge.clone(),
+            self.plugin_status.clone(),
+            self.self_protection_posture,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CanaryGateDecision, CanaryGateThresholds, CanaryObservation, DiagnoseCertificateStatus,
-        DiagnoseCollector, DiagnoseSensorStatus, DiagnoseWalStatus, HotUpdateManifestVerifier,
-        RolloutGateEvaluator, UpgradeArtifact, UpgradePlanner, WatchdogLinkMonitor,
+        AgentRuntimeSnapshot, CanaryGateDecision, CanaryGateThresholds, CanaryObservation,
+        DiagnoseCertificateStatus, DiagnoseCollector, DiagnoseConnectionStatus,
+        DiagnoseSensorStatus, DiagnoseWalStatus, HotUpdateManifestVerifier, RolloutGateEvaluator,
+        RuntimeStateStore, UpdateVerificationSnapshot, UpgradeArtifact, UpgradePlanner,
+        WatchdogLinkMonitor, WatchdogRuntimeSnapshot,
     };
     use crate::config::AgentConfig;
     use crate::health::HealthReporter;
@@ -387,6 +506,7 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use uuid::Uuid;
 
     fn health() -> aegis_model::AgentHealth {
         HealthReporter::build_snapshot(
@@ -624,8 +744,128 @@ mod tests {
             .redacted_fields
             .contains(&"server_signing_keys".to_string()));
     }
+
+    fn temp_state_root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("aegis-upgrade-{name}-{}", Uuid::now_v7()))
+    }
+
+    #[test]
+    fn runtime_state_store_roundtrips_agent_watchdog_and_update_snapshots() {
+        let mut config = AgentConfig::default();
+        let state_root = temp_state_root("state-store");
+        config.storage.state_root = state_root.clone();
+
+        let agent_snapshot = AgentRuntimeSnapshot {
+            captured_at_ms: 1_713_000_300_000,
+            supervisor_heartbeat: AgentSupervisorHeartbeat {
+                tenant_id: "tenant-a".to_string(),
+                agent_id: "agent-a".to_string(),
+                plugin_count: 1,
+                degraded_plugins: 0,
+                active_update_id: Some("artifact-42".to_string()),
+                sent_at_ms: 1_713_000_300_000,
+            },
+            connection: DiagnoseConnectionStatus {
+                control_plane_url: "https://control-plane.example".to_string(),
+                reachable: true,
+            },
+            certificates: DiagnoseCertificateStatus {
+                device_certificate_loaded: true,
+                last_rotation_succeeded: true,
+            },
+            sensors: DiagnoseSensorStatus {
+                enabled_sensors: vec!["process".to_string()],
+                unhealthy_sensors: vec![],
+            },
+            communication: CommunicationRuntimeStatus {
+                active_channel: CommunicationChannelKind::Grpc,
+                degraded: false,
+                fallback_chain: vec![CommunicationChannelKind::Grpc],
+                last_success_ms: Some(1_713_000_299_000),
+                channels: vec![],
+            },
+            engine_versions: BTreeMap::from([("policy_bundle".to_string(), "1".to_string())]),
+            ring_buffer_utilization_ratio: 0.1,
+            wal: DiagnoseWalStatus {
+                telemetry_segments: 1,
+                forensic_root: state_root.join("forensics"),
+                completeness: TelemetryIntegrity::Full,
+                encrypted: true,
+                key_version: 1,
+                quarantined_segments: 0,
+            },
+            resources: health(),
+            runtime_bridge: None,
+            plugin_status: vec![PluginHealthStatus {
+                plugin_id: "runtime-audit".to_string(),
+                healthy: true,
+                state: "loaded".to_string(),
+                crash_count: 0,
+            }],
+            self_protection_posture: ProtectionPosture::Normal,
+        };
+        RuntimeStateStore::persist_agent_snapshot(&config, &agent_snapshot)
+            .expect("persist agent snapshot");
+        let restored_agent =
+            RuntimeStateStore::load_agent_snapshot(&config).expect("load agent snapshot");
+        assert_eq!(restored_agent, agent_snapshot);
+
+        let watchdog_snapshot = WatchdogRuntimeSnapshot {
+            observed_at_ms: 1_713_000_301_000,
+            agent_heartbeat: restored_agent.supervisor_heartbeat.clone(),
+            watchdog_heartbeat: WatchdogHeartbeat {
+                tenant_id: "tenant-a".to_string(),
+                agent_id: "agent-a".to_string(),
+                watchdog_id: "watchdog-a".to_string(),
+                observed_agent_restart_epoch: 0,
+                unhealthy_plugins: 0,
+                sent_at_ms: 1_713_000_301_000,
+            },
+            alerts: vec![],
+        };
+        RuntimeStateStore::persist_watchdog_snapshot(&config, &watchdog_snapshot)
+            .expect("persist watchdog snapshot");
+        let restored_watchdog =
+            RuntimeStateStore::load_watchdog_snapshot(&config).expect("load watchdog snapshot");
+        assert_eq!(restored_watchdog, watchdog_snapshot);
+
+        let update_snapshot = UpdateVerificationSnapshot {
+            verified_at_ms: 1_713_000_302_000,
+            manifest: signed_manifest(&SigningKey::from_bytes(&[13u8; 32]), b"artifact", None),
+            artifact_path: state_root.join("updates/artifact.bin"),
+            rollback_path: None,
+        };
+        RuntimeStateStore::persist_update_snapshot(&config, &update_snapshot)
+            .expect("persist update snapshot");
+        let restored_update =
+            RuntimeStateStore::load_update_snapshot(&config).expect("load update snapshot");
+        assert_eq!(restored_update, update_snapshot);
+
+        let bundle = restored_agent.to_diagnose_bundle();
+        assert_eq!(bundle.plugin_status.len(), 1);
+        assert_eq!(
+            bundle.connection.control_plane_url,
+            "https://control-plane.example"
+        );
+        assert!(bundle.watchdog.is_none());
+
+        std::fs::remove_dir_all(state_root).ok();
+    }
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+fn write_json<T: Serialize>(path: PathBuf, value: &T) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_vec_pretty(value)?)?;
+    Ok(())
+}
+
+fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
+    let raw = fs::read(path)?;
+    Ok(serde_json::from_slice(&raw)?)
 }

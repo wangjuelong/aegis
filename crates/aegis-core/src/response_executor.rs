@@ -1,4 +1,4 @@
-use aegis_model::QuarantineReceipt;
+use aegis_model::{IsolationRulesV2, QuarantineReceipt};
 use aegis_platform::PlatformRuntime;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,7 @@ pub enum ResponseActionKind {
     Kill,
     KillProtected,
     Quarantine,
+    NetworkIsolate,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -65,12 +66,12 @@ impl ResponseAuditLog {
     }
 }
 
-pub struct ResponseExecutor<'a, P: PlatformRuntime> {
+pub struct ResponseExecutor<'a, P: PlatformRuntime + ?Sized> {
     platform: &'a P,
     audit: ResponseAuditLog,
 }
 
-impl<'a, P: PlatformRuntime> ResponseExecutor<'a, P> {
+impl<'a, P: PlatformRuntime + ?Sized> ResponseExecutor<'a, P> {
     pub fn new(platform: &'a P, audit: ResponseAuditLog) -> Self {
         Self { platform, audit }
     }
@@ -133,6 +134,21 @@ impl<'a, P: PlatformRuntime> ResponseExecutor<'a, P> {
     pub fn quarantine_file(&self, path: &Path) -> Result<ResponseExecutionReport> {
         let receipt = self.platform.quarantine_file(path)?;
         let record = self.record_quarantine(path, &receipt);
+        self.audit.append(&record)?;
+        Ok(ResponseExecutionReport {
+            records: vec![record],
+        })
+    }
+
+    pub fn network_isolate(&self, rules: &IsolationRulesV2) -> Result<ResponseExecutionReport> {
+        self.platform.network_isolate(rules)?;
+        let record = self.record(
+            ResponseActionKind::NetworkIsolate,
+            "network".to_string(),
+            true,
+            format!("network isolation applied for {}s", rules.ttl.as_secs()),
+            None,
+        );
         self.audit.append(&record)?;
         Ok(ResponseExecutionReport {
             records: vec![record],

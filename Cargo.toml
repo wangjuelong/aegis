@@ -35,3 +35,5 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 uuid = { version = "1.11", features = ["serde", "v7"] }
+wasmtime = "43.0.1"
+wat = "1.247.0"
