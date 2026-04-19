@@ -38,3 +38,15 @@
 | P25 | Container Host Agent / Sidecar Lite | done | 已建立容器元数据映射、宿主机 DaemonSet / sidecar lite 契约与容器横移/逃逸检测测试 |
 | P26 | Runtime SDK / Cloud API Connector | done | 已建立 Runtime SDK 契约、云端 connector 映射/缓冲接口与最小接入示例 |
 | P27 | QE / Pilot / Merge / Release | done | 已补齐 QE/试点/发布文档并完成 `main` 合并，待推送 `origin/main` |
+
+## Agent 缺口收口状态
+
+| 工作包 | 名称 | 状态 | 备注 |
+|--------|------|------|------|
+| G00 | 缺口审计与执行基线重建 | doing | 已建立新的 gap 收口计划，正在修正审计与状态基线 |
+| G01 | 高危操作执行链路加固 | todo | 待实现审批持久化、Remote Shell 会话管理与审计增强 |
+| G02 | 通信回退运行时与诊断扩展 | todo | 待实现回退状态机、链路健康与诊断字段扩展 |
+| G03 | WAL 加密、恢复与证据链加固 | todo | 待实现加密 segment、恢复链路与证据链增强 |
+| G04 | 插件宿主、Watchdog 与 Updater 热更新链路 | todo | 待实现 WASM 插件宿主、热更新验签与双向心跳 |
+| G05 | 容器、Sidecar 与 Serverless 运行时接入 | todo | 待实现 sidecar、本地控制面与 connector runner |
+| G06 | 平台执行基线收口 | todo | 待将平台 no-op 动作收口为有状态执行基线 |
