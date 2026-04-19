@@ -282,10 +282,18 @@ fn load_master_key(config: &AgentConfig) -> Result<(Vec<u8>, KeyProtectionStatus
                 Some(format!("linux tpm master key unavailable: {error}")),
             ),
         }
-    } else if tpm_runtime.available() && config.security.linux_tpm_master_key_nv_index.is_none() {
+    } else if tpm_runtime.master_key_configured() {
         merge_status_error(
             &mut last_error,
-            Some("linux tpm available but master key nv index is not configured".to_string()),
+            Some(
+                "linux tpm master key provider is configured but the required tools or device are unavailable"
+                    .to_string(),
+            ),
+        );
+    } else if tpm_runtime.nv_available() || tpm_runtime.sealed_object_available() {
+        merge_status_error(
+            &mut last_error,
+            Some("linux tpm available but no master key provider is configured".to_string()),
         );
     }
 

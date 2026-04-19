@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "bundles": [
+    {
+      "name": "process",
+      "object": "process.bpf.o",
+      "pin_subdir": "process",
+      "auto_attach": true,
+      "modes": ["full", "tracepoint_only"],
+      "attachments": [
+        {
+          "name": "aegis_sched_exec",
+          "kind": "tracepoint",
+          "target": "sched/sched_process_exec",
+          "link_pin": "aegis_sched_exec"
+        },
+        {
+          "name": "aegis_sched_exit",
+          "kind": "tracepoint",
+          "target": "sched/sched_process_exit",
+          "link_pin": "aegis_sched_exit"
+        },
+        {
+          "name": "aegis_sched_fork",
+          "kind": "tracepoint",
+          "target": "sched/sched_process_fork",
+          "link_pin": "aegis_sched_fork"
+        },
+        {
+          "name": "aegis_commit_creds",
+          "kind": "kprobe",
+          "target": "commit_creds",
+          "link_pin": "aegis_commit_creds"
+        }
+      ]
+    },
+    {
+      "name": "file",
+      "object": "file.bpf.o",
+      "pin_subdir": "file",
+      "map_pin_subdir": "maps/file",
+      "auto_attach": true,
+      "modes": ["full"],
+      "attachments": [
+        {
+          "name": "aegis_bprm_check_security",
+          "kind": "lsm",
+          "target": "bprm_check_security",
+          "link_pin": "aegis_bprm_check_security"
+        },
+        {
+          "name": "aegis_file_open",
+          "kind": "lsm",
+          "target": "file_open",
+          "link_pin": "aegis_file_open"
+        }
+      ]
+    },
+    {
+      "name": "network",
+      "object": "network.bpf.o",
+      "pin_subdir": "network",
+      "map_pin_subdir": "maps/network",
+      "auto_attach": true,
+      "modes": ["full"],
+      "attachments": [
+        {
+          "name": "aegis_inet_sock_state",
+          "kind": "tracepoint",
+          "target": "sock/inet_sock_set_state",
+          "link_pin": "aegis_inet_sock_state"
+        },
+        {
+          "name": "aegis_tcp_v4_connect",
+          "kind": "kprobe",
+          "target": "tcp_v4_connect",
+          "link_pin": "aegis_tcp_v4_connect"
+        },
+        {
+          "name": "aegis_socket_connect",
+          "kind": "lsm",
+          "target": "socket_connect",
+          "link_pin": "aegis_socket_connect"
+        }
+      ]
+    }
+  ]
+}

@@ -2,11 +2,12 @@ use crate::config::SecurityConfig;
 use anyhow::{anyhow, bail, Context, Result};
 use getrandom::fill as getrandom_fill;
 use std::env;
-#[cfg(all(test, unix))]
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use uuid::Uuid;
 
 const MASTER_KEY_SIZE: usize = 32;
 const ROLLBACK_FLOOR_SIZE: usize = 8;
@@ -17,7 +18,9 @@ const TPM_INDEX_AUTH_ENV: &str = "AEGIS_LINUX_TPM_INDEX_AUTH";
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct LinuxTpmRuntime {
     pub(crate) hardware_present: bool,
-    pub(crate) tools_ready: bool,
+    pub(crate) nv_tools_ready: bool,
+    pub(crate) sealed_object_tools_ready: bool,
+    pub(crate) master_key_sealed_object_path: Option<PathBuf>,
     pub(crate) master_key_index: Option<String>,
     pub(crate) rollback_index: Option<String>,
     pub(crate) auto_provision: bool,
@@ -25,15 +28,39 @@ pub(crate) struct LinuxTpmRuntime {
 
 impl LinuxTpmRuntime {
     pub(crate) fn available(&self) -> bool {
-        self.hardware_present && self.tools_ready
+        self.nv_available() || self.sealed_object_available()
+    }
+
+    pub(crate) fn nv_available(&self) -> bool {
+        self.hardware_present && self.nv_tools_ready
+    }
+
+    pub(crate) fn sealed_object_available(&self) -> bool {
+        self.hardware_present && self.sealed_object_tools_ready
+    }
+
+    pub(crate) fn master_key_configured(&self) -> bool {
+        self.master_key_sealed_object_path.is_some() || self.master_key_index.is_some()
+    }
+
+    pub(crate) fn rollback_configured(&self) -> bool {
+        self.rollback_index.is_some()
+    }
+
+    pub(crate) fn master_key_sealed_enabled(&self) -> bool {
+        self.sealed_object_available() && self.master_key_sealed_object_path.is_some()
+    }
+
+    pub(crate) fn master_key_nv_enabled(&self) -> bool {
+        self.nv_available() && self.master_key_index.is_some()
     }
 
     pub(crate) fn master_key_enabled(&self) -> bool {
-        self.available() && self.master_key_index.is_some()
+        self.master_key_sealed_enabled() || self.master_key_nv_enabled()
     }
 
     pub(crate) fn rollback_enabled(&self) -> bool {
-        self.available() && self.rollback_index.is_some()
+        self.nv_available() && self.rollback_index.is_some()
     }
 }
 
@@ -47,15 +74,25 @@ pub(crate) fn detect_linux_tpm_runtime(security: &SecurityConfig) -> LinuxTpmRun
                 .iter()
                 .any(|path| Path::new(path).exists())
         });
-    let tools_ready = ["tpm2_nvreadpublic", "tpm2_nvread", "tpm2_nvwrite"]
+    let nv_tools_ready = ["tpm2_nvreadpublic", "tpm2_nvread", "tpm2_nvwrite"]
         .into_iter()
         .all(|tool| resolve_tool(security, tool).is_some())
         && (!security.linux_tpm_auto_provision_nv
             || resolve_tool(security, "tpm2_nvdefine").is_some());
+    let sealed_object_tools_ready = [
+        "tpm2_createprimary",
+        "tpm2_create",
+        "tpm2_load",
+        "tpm2_unseal",
+    ]
+    .into_iter()
+    .all(|tool| resolve_tool(security, tool).is_some());
 
     LinuxTpmRuntime {
         hardware_present,
-        tools_ready,
+        nv_tools_ready,
+        sealed_object_tools_ready,
+        master_key_sealed_object_path: security.linux_tpm_master_key_sealed_object_path.clone(),
         master_key_index: sanitize_index(security.linux_tpm_master_key_nv_index.as_deref()),
         rollback_index: sanitize_index(security.linux_tpm_rollback_nv_index.as_deref()),
         auto_provision: security.linux_tpm_auto_provision_nv,
@@ -67,25 +104,47 @@ pub(crate) fn load_or_initialize_master_key_from_tpm(security: &SecurityConfig) 
     if !runtime.available() {
         bail!("linux tpm runtime unavailable");
     }
-    let index = runtime
-        .master_key_index
-        .ok_or_else(|| anyhow!("linux tpm master key nv index not configured"))?;
-    let created = ensure_nv_index(security, &index, MASTER_KEY_SIZE)?;
-    if created {
-        let mut secret = vec![0u8; MASTER_KEY_SIZE];
-        getrandom_fill(&mut secret)
-            .map_err(|error| anyhow!("generate tpm-backed master key: {error}"))?;
-        write_nv_bytes(security, &index, &secret)?;
-        return Ok(secret);
+    let mut failures = Vec::new();
+
+    if let Some(sealed_object_path) = runtime.master_key_sealed_object_path.as_deref() {
+        if runtime.sealed_object_available() {
+            match load_or_initialize_master_key_from_tpm_sealed_object(security, sealed_object_path)
+            {
+                Ok(secret) => return Ok(secret),
+                Err(error) => failures.push(format!("sealed object provider failed: {error}")),
+            }
+        } else {
+            failures.push(
+                "sealed object provider configured but required tools are unavailable".to_string(),
+            );
+        }
     }
-    read_nv_bytes(security, &index, MASTER_KEY_SIZE)
+
+    if let Some(index) = runtime.master_key_index.as_deref() {
+        if runtime.nv_available() {
+            match load_or_initialize_master_key_from_tpm_nv_index(security, index) {
+                Ok(secret) => return Ok(secret),
+                Err(error) => failures.push(format!("nv index provider failed: {error}")),
+            }
+        } else {
+            failures.push(
+                "nv index provider configured but required tools are unavailable".to_string(),
+            );
+        }
+    }
+
+    if failures.is_empty() {
+        bail!("linux tpm master key provider not configured")
+    } else {
+        bail!(failures.join("; "))
+    }
 }
 
 pub(crate) fn load_or_initialize_rollback_floor_from_tpm(
     security: &SecurityConfig,
 ) -> Result<Option<i64>> {
     let runtime = detect_linux_tpm_runtime(security);
-    if !runtime.available() {
+    if !runtime.nv_available() {
         bail!("linux tpm runtime unavailable");
     }
     let index = runtime
@@ -108,7 +167,7 @@ pub(crate) fn persist_rollback_floor_to_tpm(
     floor_issued_at_ms: Option<i64>,
 ) -> Result<()> {
     let runtime = detect_linux_tpm_runtime(security);
-    if !runtime.available() {
+    if !runtime.nv_available() {
         bail!("linux tpm runtime unavailable");
     }
     let index = runtime
@@ -127,6 +186,178 @@ fn sanitize_index(index: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn load_or_initialize_master_key_from_tpm_nv_index(
+    security: &SecurityConfig,
+    index: &str,
+) -> Result<Vec<u8>> {
+    let created = ensure_nv_index(security, index, MASTER_KEY_SIZE)?;
+    if created {
+        let secret = generate_master_key_secret()?;
+        write_nv_bytes(security, index, &secret)?;
+        return Ok(secret);
+    }
+    read_nv_bytes(security, index, MASTER_KEY_SIZE)
+}
+
+fn load_or_initialize_master_key_from_tpm_sealed_object(
+    security: &SecurityConfig,
+    sealed_object_path: &Path,
+) -> Result<Vec<u8>> {
+    let (public_path, private_path) = sealed_object_artifact_paths(sealed_object_path);
+    if public_path.exists() && private_path.exists() {
+        return unseal_master_key_from_sealed_object(security, &public_path, &private_path);
+    }
+
+    if public_path.exists() != private_path.exists() {
+        let _ = fs::remove_file(&public_path);
+        let _ = fs::remove_file(&private_path);
+    }
+
+    let secret = generate_master_key_secret()?;
+    create_sealed_object(security, &public_path, &private_path, &secret)?;
+    Ok(secret)
+}
+
+fn generate_master_key_secret() -> Result<Vec<u8>> {
+    let mut secret = vec![0u8; MASTER_KEY_SIZE];
+    getrandom_fill(&mut secret)
+        .map_err(|error| anyhow!("generate tpm-backed master key: {error}"))?;
+    Ok(secret)
+}
+
+fn create_sealed_object(
+    security: &SecurityConfig,
+    public_path: &Path,
+    private_path: &Path,
+    secret: &[u8],
+) -> Result<()> {
+    let parent = public_path
+        .parent()
+        .or_else(|| private_path.parent())
+        .ok_or_else(|| anyhow!("sealed object path has no parent directory"))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create sealed object dir {}", parent.display()))?;
+
+    let temp_dir = temp_runtime_dir("create")?;
+    let secret_path = temp_dir.join("secret.bin");
+    let primary_ctx = temp_dir.join("primary.ctx");
+    fs::write(&secret_path, secret)
+        .with_context(|| format!("write sealed object input {}", secret_path.display()))?;
+
+    let result = (|| -> Result<()> {
+        let mut create_primary = build_tool_command(security, "tpm2_createprimary")?;
+        create_primary
+            .arg("-C")
+            .arg("o")
+            .arg("-c")
+            .arg(&primary_ctx);
+        if let Some(auth) = hierarchy_auth() {
+            create_primary.arg("-P").arg(auth);
+        }
+        run_command(create_primary, "create tpm primary for sealed object")?;
+
+        let mut create = build_tool_command(security, "tpm2_create")?;
+        create
+            .arg("-C")
+            .arg(&primary_ctx)
+            .arg("-G")
+            .arg("keyedhash")
+            .arg("-u")
+            .arg(public_path)
+            .arg("-r")
+            .arg(private_path)
+            .arg("-i")
+            .arg(&secret_path);
+        run_command(create, "create sealed tpm object")?;
+        Ok(())
+    })();
+
+    best_effort_flush_context(security, &primary_ctx);
+    let _ = fs::remove_dir_all(&temp_dir);
+    result
+}
+
+fn unseal_master_key_from_sealed_object(
+    security: &SecurityConfig,
+    public_path: &Path,
+    private_path: &Path,
+) -> Result<Vec<u8>> {
+    let temp_dir = temp_runtime_dir("unseal")?;
+    let primary_ctx = temp_dir.join("primary.ctx");
+    let object_ctx = temp_dir.join("object.ctx");
+
+    let result = (|| -> Result<Vec<u8>> {
+        let mut create_primary = build_tool_command(security, "tpm2_createprimary")?;
+        create_primary
+            .arg("-C")
+            .arg("o")
+            .arg("-c")
+            .arg(&primary_ctx);
+        if let Some(auth) = hierarchy_auth() {
+            create_primary.arg("-P").arg(auth);
+        }
+        run_command(create_primary, "create tpm primary for unseal")?;
+
+        let mut load = build_tool_command(security, "tpm2_load")?;
+        load.arg("-C")
+            .arg(&primary_ctx)
+            .arg("-u")
+            .arg(public_path)
+            .arg("-r")
+            .arg(private_path)
+            .arg("-c")
+            .arg(&object_ctx);
+        run_command(load, "load sealed tpm object")?;
+
+        let mut unseal = build_tool_command(security, "tpm2_unseal")?;
+        unseal.arg("-c").arg(&object_ctx);
+        let output = run_command(unseal, "unseal tpm master key")?;
+        let secret = output.stdout;
+        if secret.len() != MASTER_KEY_SIZE {
+            bail!(
+                "unexpected master key length {} from sealed object, expected {}",
+                secret.len(),
+                MASTER_KEY_SIZE
+            );
+        }
+        Ok(secret)
+    })();
+
+    best_effort_flush_context(security, &object_ctx);
+    best_effort_flush_context(security, &primary_ctx);
+    let _ = fs::remove_dir_all(&temp_dir);
+    result
+}
+
+fn sealed_object_artifact_paths(base_path: &Path) -> (PathBuf, PathBuf) {
+    (
+        path_with_suffix(base_path, ".pub"),
+        path_with_suffix(base_path, ".priv"),
+    )
+}
+
+fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = OsString::from(path.as_os_str());
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn temp_runtime_dir(scope: &str) -> Result<PathBuf> {
+    let dir = env::temp_dir().join(format!("aegis-linux-tpm-{scope}-{}", Uuid::now_v7()));
+    fs::create_dir_all(&dir).with_context(|| format!("create temp tpm dir {}", dir.display()))?;
+    Ok(dir)
+}
+
+fn best_effort_flush_context(security: &SecurityConfig, context_path: &Path) {
+    let Some(flush_path) = resolve_tool(security, "tpm2_flushcontext") else {
+        return;
+    };
+
+    let mut command = Command::new(flush_path);
+    apply_tcti_override(security, &mut command);
+    let _ = command.arg(context_path).output();
 }
 
 fn ensure_nv_index(security: &SecurityConfig, index: &str, size: usize) -> Result<bool> {
@@ -233,7 +464,22 @@ fn write_nv_bytes(security: &SecurityConfig, index: &str, bytes: &[u8]) -> Resul
 
 fn build_tool_command(security: &SecurityConfig, tool: &str) -> Result<Command> {
     let path = resolve_tool(security, tool).ok_or_else(|| anyhow!("missing tool {tool}"))?;
-    Ok(Command::new(path))
+    let mut command = Command::new(path);
+    apply_tcti_override(security, &mut command);
+    Ok(command)
+}
+
+fn apply_tcti_override(security: &SecurityConfig, command: &mut Command) {
+    let Some(device_path) = security.linux_tpm_device_path.as_deref() else {
+        return;
+    };
+    if !device_path.starts_with("/dev/") {
+        return;
+    }
+    command.env(
+        "TPM2TOOLS_TCTI",
+        format!("device:{}", device_path.display()),
+    );
 }
 
 fn run_command(mut command: Command, context: &str) -> Result<Output> {
@@ -309,6 +555,11 @@ impl TestTpmHarness {
             "tpm2_nvdefine",
             "tpm2_nvread",
             "tpm2_nvwrite",
+            "tpm2_createprimary",
+            "tpm2_create",
+            "tpm2_load",
+            "tpm2_unseal",
+            "tpm2_flushcontext",
         ] {
             let path = tools_dir.join(tool);
             fs::write(&path, test_tool_script(tool, &store_dir)).expect("write test tool");
@@ -413,6 +664,85 @@ case "$tool" in
       cat > "$STORE/$index.bin"
     fi
     ;;
+  tpm2_createprimary)
+    context=
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -c)
+          context="$2"
+          shift 2
+          ;;
+        *)
+          shift
+          ;;
+      esac
+    done
+    printf 'primary' > "$context"
+    ;;
+  tpm2_create)
+    public=
+    private=
+    input=
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -u)
+          public="$2"
+          shift 2
+          ;;
+        -r)
+          private="$2"
+          shift 2
+          ;;
+        -i)
+          input="$2"
+          shift 2
+          ;;
+        *)
+          shift
+          ;;
+      esac
+    done
+    printf 'public' > "$public"
+    cat "$input" > "$private"
+    ;;
+  tpm2_load)
+    private=
+    context=
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -r)
+          private="$2"
+          shift 2
+          ;;
+        -c)
+          context="$2"
+          shift 2
+          ;;
+        *)
+          shift
+          ;;
+      esac
+    done
+    cat "$private" > "$context"
+    ;;
+  tpm2_unseal)
+    context=
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -c)
+          context="$2"
+          shift 2
+          ;;
+        *)
+          shift
+          ;;
+      esac
+    done
+    cat "$context"
+    ;;
+  tpm2_flushcontext)
+    exit 0
+    ;;
 esac
 "#,
         store = store_dir.display(),
@@ -427,6 +757,7 @@ mod tests {
         load_or_initialize_rollback_floor_from_tpm, persist_rollback_floor_to_tpm, TestTpmHarness,
     };
     use crate::config::SecurityConfig;
+    use std::{env, fs};
 
     #[test]
     fn detect_runtime_respects_explicit_tool_dir_and_device_override() {
@@ -459,6 +790,57 @@ mod tests {
         let first =
             load_or_initialize_master_key_from_tpm(&security).expect("provision master key");
         let second = load_or_initialize_master_key_from_tpm(&security).expect("reload master key");
+
+        assert_eq!(first.len(), 32);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn master_key_round_trips_through_tpm_sealed_object() {
+        let harness = TestTpmHarness::install("master-key-sealed");
+        let sealed_root = env::temp_dir().join("aegis-master-key-sealed");
+        let security = SecurityConfig {
+            linux_tpm_tools_dir: Some(harness.tools_dir),
+            linux_tpm_device_path: Some(harness.device_path),
+            linux_tpm_master_key_sealed_object_path: Some(sealed_root.join("master-key")),
+            ..SecurityConfig::default()
+        };
+
+        let first =
+            load_or_initialize_master_key_from_tpm(&security).expect("provision sealed master key");
+        let second =
+            load_or_initialize_master_key_from_tpm(&security).expect("reload sealed master key");
+
+        assert_eq!(first.len(), 32);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn master_key_falls_back_to_nv_index_when_sealed_tools_are_missing() {
+        let harness = TestTpmHarness::install("master-key-fallback");
+        for tool in [
+            "tpm2_createprimary",
+            "tpm2_create",
+            "tpm2_load",
+            "tpm2_unseal",
+        ] {
+            fs::remove_file(harness.tools_dir.join(tool)).expect("remove sealed tool");
+        }
+        let security = SecurityConfig {
+            linux_tpm_tools_dir: Some(harness.tools_dir),
+            linux_tpm_device_path: Some(harness.device_path),
+            linux_tpm_master_key_sealed_object_path: Some(
+                env::temp_dir().join("aegis-master-key-fallback/master-key"),
+            ),
+            linux_tpm_master_key_nv_index: Some("0x150001a".to_string()),
+            linux_tpm_auto_provision_nv: true,
+            ..SecurityConfig::default()
+        };
+
+        let first =
+            load_or_initialize_master_key_from_tpm(&security).expect("provision fallback key");
+        let second =
+            load_or_initialize_master_key_from_tpm(&security).expect("reload fallback key");
 
         assert_eq!(first.len(), 32);
         assert_eq!(first, second);

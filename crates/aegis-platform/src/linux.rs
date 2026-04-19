@@ -163,6 +163,8 @@ struct LinuxEbpfPlannedBundle {
     name: String,
     object_path: PathBuf,
     pin_path: PathBuf,
+    map_pin_path: Option<PathBuf>,
+    auto_attach: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -171,9 +173,10 @@ struct LinuxEbpfPlannedAttachment {
     name: String,
     kind: String,
     target: String,
-    program_pin_path: PathBuf,
+    program_pin_path: Option<PathBuf>,
     link_pin_path: PathBuf,
     attach_argv: Vec<String>,
+    auto_attach: bool,
 }
 
 impl LinuxEbpfPlannedAttachment {
@@ -195,6 +198,10 @@ struct LinuxEbpfBundleManifestEntry {
     object: String,
     #[serde(default)]
     pin_subdir: Option<String>,
+    #[serde(default)]
+    map_pin_subdir: Option<String>,
+    #[serde(default)]
+    auto_attach: bool,
     #[serde(default)]
     modes: Vec<String>,
     #[serde(default)]
@@ -852,10 +859,15 @@ fn refresh_kernel_runtime(state: &mut LinuxState) {
                 .clone()
                 .unwrap_or_else(|| bundle.name.clone()),
         );
+        let map_pin_path = bundle
+            .map_pin_subdir
+            .clone()
+            .map(|subdir| state.kernel.pin_root.join(subdir));
         for attachment in bundle.attachments {
             state.kernel.planned_attachments.push(plan_attachment(
                 &bundle.name,
                 &bundle_pin_path,
+                bundle.auto_attach,
                 attachment,
             ));
         }
@@ -863,6 +875,8 @@ fn refresh_kernel_runtime(state: &mut LinuxState) {
             pin_path: bundle_pin_path,
             name: bundle.name,
             object_path,
+            map_pin_path,
+            auto_attach: bundle.auto_attach,
         });
     }
 
@@ -969,23 +983,30 @@ fn load_ebpf_manifest(path: &Path) -> Result<LinuxEbpfManifest> {
 fn plan_attachment(
     bundle_name: &str,
     bundle_pin_path: &Path,
+    bundle_auto_attach: bool,
     attachment: LinuxEbpfAttachmentManifestEntry,
 ) -> LinuxEbpfPlannedAttachment {
-    let program_pin_name = attachment
-        .program_pin
-        .unwrap_or_else(|| attachment.name.clone());
     let link_pin_name = attachment
         .link_pin
         .unwrap_or_else(|| format!("{}.link", attachment.name));
+    let program_pin_path = if bundle_auto_attach {
+        None
+    } else {
+        let program_pin_name = attachment
+            .program_pin
+            .unwrap_or_else(|| attachment.name.clone());
+        Some(bundle_pin_path.join(program_pin_name))
+    };
 
     LinuxEbpfPlannedAttachment {
         bundle_name: bundle_name.to_string(),
         name: attachment.name,
         kind: attachment.kind,
         target: attachment.target,
-        program_pin_path: bundle_pin_path.join(program_pin_name),
+        program_pin_path,
         link_pin_path: bundle_pin_path.join(link_pin_name),
         attach_argv: attachment.attach_argv,
+        auto_attach: bundle_auto_attach,
     }
 }
 
@@ -1030,19 +1051,27 @@ fn attempt_bpf_bundle_load(kernel: &mut LinuxKernelRuntimeState) -> Result<()> {
         fs::create_dir_all(&bundle.pin_path)
             .with_context(|| format!("create ebpf pin dir {}", bundle.pin_path.display()))?;
 
-        let status = Command::new("bpftool")
+        let mut command = Command::new("bpftool");
+        command
             .arg("prog")
             .arg("loadall")
             .arg(&bundle.object_path)
-            .arg(&bundle.pin_path)
-            .status()
-            .with_context(|| {
-                format!(
-                    "load ebpf bundle {} from {}",
-                    bundle.name,
-                    bundle.object_path.display()
-                )
-            })?;
+            .arg(&bundle.pin_path);
+        if let Some(map_pin_path) = &bundle.map_pin_path {
+            fs::create_dir_all(map_pin_path)
+                .with_context(|| format!("create ebpf map pin dir {}", map_pin_path.display()))?;
+            command.arg("pinmaps").arg(map_pin_path);
+        }
+        if bundle.auto_attach {
+            command.arg("autoattach");
+        }
+        let status = command.status().with_context(|| {
+            format!(
+                "load ebpf bundle {} from {}",
+                bundle.name,
+                bundle.object_path.display()
+            )
+        })?;
         if !status.success() {
             anyhow::bail!(
                 "bpftool loadall failed for bundle {} with status {}",
@@ -1066,11 +1095,27 @@ fn attempt_bpf_attachment_reconcile(kernel: &mut LinuxKernelRuntimeState) -> Res
         if attachment.link_pin_path.exists() {
             continue;
         }
-        if !attachment.program_pin_path.exists() {
+        if attachment.auto_attach {
+            failures.push(format!(
+                "{} missing auto-attached link {}",
+                attachment.identifier(),
+                attachment.link_pin_path.display()
+            ));
+            continue;
+        }
+        let Some(program_pin_path) = &attachment.program_pin_path else {
             failures.push(format!(
                 "{} missing program pin {}",
                 attachment.identifier(),
-                attachment.program_pin_path.display()
+                attachment.link_pin_path.display()
+            ));
+            continue;
+        };
+        if !program_pin_path.exists() {
+            failures.push(format!(
+                "{} missing program pin {}",
+                attachment.identifier(),
+                program_pin_path.display()
             ));
             continue;
         }
@@ -1134,11 +1179,21 @@ fn attempt_bpf_attachment_reconcile(kernel: &mut LinuxKernelRuntimeState) -> Res
 fn substitute_attachment_arg(attachment: &LinuxEbpfPlannedAttachment, arg: &str) -> String {
     let bundle_pin = attachment
         .program_pin_path
-        .parent()
-        .unwrap_or_else(|| Path::new(""));
+        .as_deref()
+        .and_then(Path::parent)
+        .unwrap_or_else(|| {
+            attachment
+                .link_pin_path
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+        });
     arg.replace(
         "{program_pin}",
-        &attachment.program_pin_path.to_string_lossy(),
+        &attachment
+            .program_pin_path
+            .as_deref()
+            .unwrap_or_else(|| Path::new(""))
+            .to_string_lossy(),
     )
     .replace("{link_pin}", &attachment.link_pin_path.to_string_lossy())
     .replace("{bundle}", &attachment.bundle_name)
@@ -2184,15 +2239,14 @@ mod tests {
       "name": "process",
       "object": "process.bpf.o",
       "pin_subdir": "process",
+      "auto_attach": true,
       "modes": ["full"],
       "attachments": [
         {
-          "name": "sched_exec",
+          "name": "aegis_sched_exec",
           "kind": "tracepoint",
           "target": "sched/sched_process_exec",
-          "program_pin": "sched_exec",
-          "link_pin": "sched_exec.link",
-          "attach_argv": ["link", "create", "{link_pin}", "type", "tracing", "pinned", "{program_pin}", "tracepoint", "sched", "sched_process_exec"]
+          "link_pin": "aegis_sched_exec"
         }
       ]
     }
@@ -2201,8 +2255,7 @@ mod tests {
         );
         fs::write(assets_root.join("process.bpf.o"), b"process").expect("write process bundle");
         fs::create_dir_all(pin_root.join("process")).expect("create pin dir");
-        fs::write(pin_root.join("process/sched_exec"), b"program").expect("write program pin");
-        fs::write(pin_root.join("process/sched_exec.link"), b"link").expect("write link pin");
+        fs::write(pin_root.join("process/aegis_sched_exec"), b"link").expect("write link pin");
 
         let mut platform = LinuxPlatform::with_host_capabilities_for_test(full_capabilities());
         platform.configure_kernel_runtime_for_test(Some(assets_root), Some(pin_root), false, true);
@@ -2217,7 +2270,7 @@ mod tests {
         assert_eq!(kernel.loaded_bundles, vec!["process".to_string()]);
         assert_eq!(
             kernel.attached_links,
-            vec!["process:sched_exec".to_string()]
+            vec!["process:aegis_sched_exec".to_string()]
         );
         assert!(
             platform
@@ -2240,14 +2293,14 @@ mod tests {
       "name": "process",
       "object": "process.bpf.o",
       "pin_subdir": "process",
+      "auto_attach": true,
       "modes": ["full"],
       "attachments": [
         {
-          "name": "sched_exec",
+          "name": "aegis_sched_exec",
           "kind": "tracepoint",
           "target": "sched/sched_process_exec",
-          "program_pin": "sched_exec",
-          "link_pin": "sched_exec.link"
+          "link_pin": "aegis_sched_exec"
         }
       ]
     }
@@ -2256,7 +2309,6 @@ mod tests {
         );
         fs::write(assets_root.join("process.bpf.o"), b"process").expect("write process bundle");
         fs::create_dir_all(pin_root.join("process")).expect("create pin dir");
-        fs::write(pin_root.join("process/sched_exec"), b"program").expect("write program pin");
 
         let mut platform = LinuxPlatform::with_host_capabilities_for_test(full_capabilities());
         platform.configure_kernel_runtime_for_test(Some(assets_root), Some(pin_root), false, true);
@@ -2273,11 +2325,13 @@ mod tests {
         let kernel = platform.kernel_runtime_snapshot_for_test();
 
         assert!(!report.passed);
-        assert!(report.details.contains("unattached=process:sched_exec"));
+        assert!(report
+            .details
+            .contains("unattached=process:aegis_sched_exec"));
         assert!(kernel
             .last_error
             .as_deref()
             .unwrap_or_default()
-            .contains("missing attach argv"));
+            .contains("missing auto-attached link"));
     }
 }

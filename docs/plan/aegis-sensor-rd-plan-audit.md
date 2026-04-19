@@ -122,24 +122,24 @@
 
 从“计划覆盖”维度看，终态能力项仍在研发文档中；从“仓库代码实现”维度看，在 `C08` 完成后，仓库内 agent 主链已闭合，且 Linux 平台用户态运行时已于 2026-04-19 进一步收口。当前仍未落地的仅剩：
 
-- Linux 内核侧真实 `.bpf.o` 资产、`tracepoint/kprobe/LSM` attach 物料，以及实际 attach、强制执行与特权安装链路
+- Linux eBPF 真机强制执行验收与特权安装链最终收口（真实 `.bpf.o` 资产、`tracepoint/kprobe/LSM` attach 物料、安装脚本与 pin/link/map 布局已入仓）
 - Windows 驱动 / ELAM / WFP / Minifilter 的真实系统级交付
 - macOS ESF / Network Extension / System Extension 的真实系统级交付
-- Windows/macOS 正式硬件根信任，以及 Linux sealed object / attestation 级别 TPM 绑定
+- Windows/macOS 正式硬件根信任，以及 Linux attestation / quote 级别 TPM 绑定
 
 ### 5.2 功能妥协
 
 当前主要妥协已从第一轮的“骨架化闭环”收缩到系统级交付边界。当前事实妥协只剩：
 
-- Linux 侧虽已具备真实用户态探测、响应、eBPF loader/pin/link 状态机与 attach contract，但真实 `.bpf.o` 资产和内核侧强制策略应用仍未正式进入当前仓库
+- Linux 侧虽已具备真实用户态探测、响应、eBPF 资产、loader/pin/link 状态机与特权安装/验证脚本，但测试机因启用 `bpf` LSM 后离线，内核侧强制执行真机验收尚未收口
 - Windows / macOS 仍未进入驱动、System Extension、签名和授权链路的真实系统级交付
-- Windows/macOS 正式硬件根信任仍未进入当前仓库，Linux TPM 当前仍停留在 NV index provider，而非 sealed object / attestation
+- Windows/macOS 正式硬件根信任仍未进入当前仓库，Linux TPM 虽已具备 sealed-object 主密钥路径与 NV fallback，但 attestation / quote 级别绑定仍未进入当前仓库
 
 ### 5.3 设计妥协
 
 设计上保留了终态目标，但实现层仍存在以下事实上的降级：
 
-- Linux 已不再是纯 in-memory provider 注入，且 TPM-backed key/rollback provider 已落地，但真实高危执行仍主要停留在用户态信号、文件物料和 firewall manifest 层，内核态强制执行未闭合
+- Linux 已不再是纯 in-memory provider 注入，且 TPM-backed key/rollback provider 与 sealed-object 主路径已落地，但内核态强制执行仍缺最终真机验收闭环
 - Windows / macOS 真实平台集成仍主要停留在基线/注入与状态表达层，尚未进入系统级强制执行面
 
 ## 6. 收口计划

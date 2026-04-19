@@ -167,6 +167,8 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub linux_tpm_device_path: Option<PathBuf>,
     #[serde(default)]
+    pub linux_tpm_master_key_sealed_object_path: Option<PathBuf>,
+    #[serde(default)]
     pub linux_tpm_master_key_nv_index: Option<String>,
     #[serde(default)]
     pub linux_tpm_rollback_nv_index: Option<String>,
@@ -182,6 +184,7 @@ impl Default for SecurityConfig {
             memory_lock_best_effort: true,
             linux_tpm_tools_dir: None,
             linux_tpm_device_path: None,
+            linux_tpm_master_key_sealed_object_path: None,
             linux_tpm_master_key_nv_index: None,
             linux_tpm_rollback_nv_index: None,
             linux_tpm_auto_provision_nv: false,
@@ -324,6 +327,10 @@ mod tests {
         assert!(restored.security.use_os_credential_store);
         assert!(restored.security.linux_tpm_tools_dir.is_none());
         assert!(restored.security.linux_tpm_device_path.is_none());
+        assert!(restored
+            .security
+            .linux_tpm_master_key_sealed_object_path
+            .is_none());
         assert!(restored.security.linux_tpm_master_key_nv_index.is_none());
         assert!(restored.security.linux_tpm_rollback_nv_index.is_none());
         assert!(!restored.security.linux_tpm_auto_provision_nv);

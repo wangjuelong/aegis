@@ -1,8 +1,8 @@
 # Aegis Linux 平台运行时收口记录
 
 > 时间：2026-04-19
-> 范围：`crates/aegis-platform/src/linux.rs`、`crates/aegis-core/src/self_protection.rs`、`crates/aegis-core/src/comms.rs`、`crates/aegis-core/src/linux_tpm.rs`、`crates/aegis-core/src/config.rs`
-> 目标：把 Linux 相关能力从“纯 in-memory baseline/stub + 硬件根信任缺口”推进到“具备真实主机探测、真实用户态事件采集、真实响应落盘、eBPF attach contract、TPM-backed key/rollback provider”的可验证状态。
+> 范围：`crates/aegis-platform/src/linux.rs`、`crates/aegis-core/src/self_protection.rs`、`crates/aegis-core/src/comms.rs`、`crates/aegis-core/src/linux_tpm.rs`、`crates/aegis-core/src/config.rs`、`packaging/linux-ebpf/`、`scripts/linux-*.sh`
+> 目标：把 Linux 相关能力从“纯 in-memory baseline/stub + 硬件根信任缺口”推进到“具备真实主机探测、真实用户态事件采集、真实响应落盘、真实 eBPF 资产与安装链、TPM-backed key/rollback provider、sealed-object 主密钥路径”的可验证状态。
 
 ## 1. 本次收口内容
 
@@ -16,13 +16,15 @@
 - 隔离、取证、保护 manifest 的真实物料落盘
 - eBPF attachment/link manifest contract 与 link 完整性状态
 - Linux TPM NV index-backed 主密钥与 rollback anchor provider
+- Linux 真实 eBPF 资产、`autoattach`/`pinmaps` 装载模型与特权安装/验证脚本
+- Linux TPM sealed-object 主密钥路径与 NV fallback
 - Linux 容器环境下的测试验证
 
 本次**不谎称完成**以下事项：
 
-- 真实 `tracepoint/kprobe/LSM` BPF 资产与正式 attach argv 物料
-- 需要 root/特权安装链路的内核强制执行面
-- Linux TPM sealed object / policy session / attestation 级别硬件根信任
+- Linux eBPF 强制执行面的最终真机验收闭环
+- Linux TPM sealed object 的测试机 create/unseal 真机验收
+- Linux TPM policy session / attestation / quote 级别硬件根信任
 - Windows / macOS 的正式硬件根信任与系统级交付
 
 ## 2. 已交付能力
@@ -68,10 +70,11 @@ Linux 平台已新增面向内核侧集成的真实状态机：
 
 说明：
 
-- 默认不会主动加载 eBPF 程序
-- 仅当显式设置 `AEGIS_LINUX_LOAD_BPF=1` 或 `AEGIS_LINUX_ATTACH_BPF=1` 时，才会尝试 `bpftool`
-- attach 执行已进入代码，但依赖 manifest 中真实 `attach_argv` 和真实 `.bpf.o` / program pin 物料
-- 当前已完成的是 bundle/load/pin/link 生命周期与状态诚实性，不是完整的 tracepoint/LSM 资产交付闭环
+- 运行时 manifest 已升级为真实 `autoattach` / `pinmaps` 语义，可识别 auto-attached link 与 pinned map 布局
+- 仓库已新增 `packaging/linux-ebpf/manifest.json`、`process.bpf.c`、`file.bpf.c`、`network.bpf.c` 与 `build.sh`
+- 仓库已新增 `scripts/linux-ebpf-{sync,install,verify,uninstall}.sh`，覆盖远端同步、编译、装载、校验、卸载链路
+- `linux-ebpf-verify.sh` 会在执行 smoke test 前显式检查活动 LSM 是否包含 `bpf`，避免把环境问题误判成功能故障
+- 当前缺口不再是“资产未入仓”，而是测试机启用 `bpf` LSM 后离线，导致最终强制执行真机验收尚未收口
 
 ### 2.4 Linux TPM-backed 主密钥与 rollback anchor
 
@@ -85,8 +88,10 @@ Linux 平台已新增面向内核侧集成的真实状态机：
 
 说明：
 
-- 当前实现基于 TPM NV index，不是 sealed object + policy session
+- 当前实现已新增 sealed-object 主密钥路径、sealed 优先 / NV fallback 与 `TPM2TOOLS_TCTI=device:/dev/tpmrm0` 设备绑定
+- 仓库已新增 `scripts/linux-tpm-sealed-verify.sh`，用于测试机上的 `createprimary/create/load/unseal` 真机 roundtrip 验收
 - owner/index auth 通过环境变量注入，避免把敏感认证材料固化进配置文件
+- rollback anchor 仍基于 TPM NV index；policy session / attestation 尚未进入当前仓库
 
 ### 2.5 真实用户态事件采集
 
@@ -120,6 +125,8 @@ Linux 平台已新增面向内核侧集成的真实状态机：
 - `cargo test -p aegis-core`
 - `cargo test -p aegis-platform`
 - `cargo test --workspace`
+- `cargo test -p aegis-core linux_tpm -- --nocapture`
+- `bash -n scripts/linux-ebpf-install.sh scripts/linux-ebpf-verify.sh scripts/linux-ebpf-sync.sh scripts/linux-ebpf-uninstall.sh packaging/linux-ebpf/build.sh scripts/linux-tpm-sealed-verify.sh`
 
 ### 3.2 Linux 容器验证
 
@@ -146,18 +153,39 @@ docker run --rm \
 - `aegis-core` `119/119` 通过
 - `aegis-platform` `22/22` 通过
 
+### 3.3 Linux 测试机验证
+
+测试机来源：`docs/env/开发环境.md`
+
+已确认：
+
+- `bpftool`、`clang`、`llc`、`libbpf-dev` 已存在
+- `/dev/tpm0` 与 `/dev/tpmrm0` 已存在
+- 真实 `process/file/network` BPF 资产可在测试机编译成功
+- `scripts/linux-ebpf-install.sh` 已成功完成远端编译、装载，并产生真实 pin/link/map
+- `bpftool link show` 已确认 `tracepoint`、`kprobe` 与 `lsm/*` link 被创建
+
+补充说明：
+
+- 初始失败根因已定位为测试机活动 LSM 顺序不含 `bpf`
+- 已把 `lsm=lockdown,capability,bpf,landlock,yama,apparmor,ima,evm` 写入测试机 GRUB 配置并触发重启
+- 当前测试机在重启后离线，因此：
+  - `scripts/linux-ebpf-verify.sh` 的最终强制执行 smoke test 尚未补完
+  - `scripts/linux-tpm-sealed-verify.sh` 的 `create + unseal` 真机 roundtrip 尚未补完
+
 ## 4. 剩余差距
 
 Linux 相关未完成项已收缩为：
 
-- tracepoint/kprobe/LSM 的真实 `.bpf.o` 资产与正式 attach argv 物料
-- 可执行阻断、文件阻断、网络阻断等 LSM 强制执行面
-- 需要特权的真实强制执行链
-- Linux TPM sealed object / attestation / policy session 级别硬件根信任
+- eBPF 强制执行链在 Linux 测试机恢复后的最终真机验收
+- TPM sealed-object `create + unseal` 在 Linux 测试机恢复后的最终真机验收
+- Linux TPM attestation / quote / policy session 级别硬件根信任
 
 因此，Linux 平台现在可以诚实地标记为：
 
 - 用户态运行时：已收口
 - 内核态 loader/pin/link 生命周期与 attach contract：已进入代码
+- 内核态真实资产与特权安装链：已进入代码
 - Linux TPM-backed key protection / rollback anchor：已进入代码
-- 内核态真实资产交付与强制执行：未收口
+- Linux TPM sealed-object 主密钥路径：已进入代码
+- Linux 测试机最终强制执行验收：未收口

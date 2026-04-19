@@ -810,7 +810,12 @@ fn load_or_initialize_rollback_status(
                 format!("linux tpm rollback anchor unavailable: {error}"),
             ),
         }
-    } else if tpm_runtime.available() && security.linux_tpm_rollback_nv_index.is_none() {
+    } else if tpm_runtime.rollback_configured() {
+        append_status_error(
+            &mut last_error,
+            "linux tpm rollback anchor is configured but the required nv tools or device are unavailable",
+        );
+    } else if tpm_runtime.nv_available() {
         append_status_error(
             &mut last_error,
             "linux tpm available but rollback nv index is not configured",
