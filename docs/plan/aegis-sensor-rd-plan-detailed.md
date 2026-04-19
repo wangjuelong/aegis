@@ -533,6 +533,11 @@
 - 验收：
   - 所有工作包状态为 `done`
   - `main` 合并完成并推送
+- 完成记录（2026-04-19）：
+  - 已新增 `docs/qe/aegis-sensor-qe-matrix.md`，固化工作区回归、诊断模式与 Runtime SDK 示例验收结果
+  - 已新增 `docs/pilot/aegis-sensor-pilot-record.md` 与 `docs/release/aegis-sensor-release-notes.md`
+  - 已完成 `feat/sensor-implementation` 到 `main` 的合并
+  - 下一步仅剩将 `main` 推送到 `origin/main`
 
 ## 3. 关键依赖链
 

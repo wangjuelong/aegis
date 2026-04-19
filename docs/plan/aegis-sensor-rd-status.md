@@ -37,4 +37,4 @@
 | P24 | Upgrade / Migration / Canary Gate / Diagnose | done | 已建立升级计划、灰度门控、迁移协同与 `--diagnose` 诊断输出 |
 | P25 | Container Host Agent / Sidecar Lite | done | 已建立容器元数据映射、宿主机 DaemonSet / sidecar lite 契约与容器横移/逃逸检测测试 |
 | P26 | Runtime SDK / Cloud API Connector | done | 已建立 Runtime SDK 契约、云端 connector 映射/缓冲接口与最小接入示例 |
-| P27 | QE / Pilot / Merge / Release | doing | 当前补齐测试矩阵、试点记录、发布说明并准备合并主线 |
+| P27 | QE / Pilot / Merge / Release | done | 已补齐 QE/试点/发布文档并完成 `main` 合并，待推送 `origin/main` |
