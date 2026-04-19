@@ -282,6 +282,11 @@
   - 将专项检测统一接入规则与 storylines
 - 验收：
   - 测试覆盖勒索信号聚合、ASR 命中、身份告警、欺骗触发
+- 完成记录（2026-04-19）：
+  - 已建立 `RansomwareStateMachine`，支持重命名、高熵写入、canary 与影子删除多信号聚合
+  - 已建立 `AsrPolicyDomain`、`IdentityThreatDetector` 与 `DeceptionRegistry`
+  - 已建立 `SpecializedDetectionEngine`，统一输出专项检测 findings 并保留 storyline_id
+  - 已通过勒索聚合、ASR 命中、身份暴力破解与欺骗触发测试
 
 ### P16：Vuln Scan / Passive Discovery / AI Monitor
 
