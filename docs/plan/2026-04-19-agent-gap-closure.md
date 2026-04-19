@@ -209,6 +209,13 @@
 
 - 测试覆盖插件超时/崩溃、热更新验签失败、watchdog 失联检测
 
+**完成记录（2026-04-19）**
+
+- 已新增 `PluginHost` 与 `PluginManifest`，实现 `.wasm` 模块校验、崩溃预算、超时/崩溃状态与自动禁用逻辑
+- 已建立 `HotUpdateManifestVerifier`，补齐升级清单验签、artifact 哈希校验与 rollback artifact 校验
+- 已建立 `WatchdogLinkMonitor` 与 agent/watchdog 双向心跳模型，并在 `watchdog` 二进制中实跑监测链路
+- 已通过 `cargo fmt --all`、`cargo test --workspace`、`cargo run -p aegis-agentd -- --diagnose`、`cargo run -p aegis-watchdog`、`cargo run -p aegis-updater`
+
 ### G05：容器、Sidecar 与 Serverless 运行时接入
 
 **目标**

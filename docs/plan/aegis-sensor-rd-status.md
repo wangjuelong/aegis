@@ -47,6 +47,6 @@
 | G01 | 高危操作执行链路加固 | done | 已交付持久化审批、Remote Shell 会话控制、Playbook/Session Lock 运行时与审计测试 |
 | G02 | 通信回退运行时与诊断扩展 | done | 已交付四级回退状态机、恢复探测、通信诊断字段与 `--diagnose` 实跑验证 |
 | G03 | WAL 加密、恢复与证据链加固 | done | 已交付加密 WAL/Journal、分级密钥派生、快照恢复校验与证据链反篡改验证 |
-| G04 | 插件宿主、Watchdog 与 Updater 热更新链路 | todo | 待实现 WASM 插件宿主、热更新验签与双向心跳 |
+| G04 | 插件宿主、Watchdog 与 Updater 热更新链路 | done | 已交付 WASM 插件宿主、热更新验签、回滚工件校验与 watchdog 心跳监测 |
 | G05 | 容器、Sidecar 与 Serverless 运行时接入 | todo | 待实现 sidecar、本地控制面与 connector runner |
 | G06 | 平台执行基线收口 | todo | 待将平台 no-op 动作收口为有状态执行基线 |

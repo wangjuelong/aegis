@@ -2,7 +2,7 @@
 
 - 发布日期：2026-04-19
 - 合入目标：`main`
-- 发布来源：`feat/sensor-implementation`
+- 发布来源：`feat/agent-gap-closure`
 
 ## 1. 本次交付
 
@@ -11,14 +11,17 @@
 - Rust workspace、平台抽象、统一事件模型、运行时编排、Ring Buffer / Spill / WAL
 - Windows / Linux / macOS 平台基线与 mock harness
 - IOC / Rule VM / Temporal / YARA / ML / Storyline / 专项检测 / AI 监控
-- 响应执行、自保护、审批链、升级门控、诊断模式
+- 响应执行、自保护、审批链、升级门控、诊断模式、WASM 插件宿主
 - 容器宿主机模式、sidecar lite、Runtime SDK、Cloud API Connector
+- watchdog / updater 热更新链路、升级清单验签与 rollback artifact 校验
 
 ## 2. 验证摘要
 
 - `cargo fmt --all`：通过
-- `cargo test --workspace`：通过，89 项单元测试 + 全部 doc tests 通过
+- `cargo test --workspace`：通过，102 项单元测试 + 全部 doc tests 通过
 - `cargo run -p aegis-agentd -- --diagnose`：通过
+- `cargo run -p aegis-watchdog`：通过
+- `cargo run -p aegis-updater`：通过
 - `cargo run -p aegis-core --example runtime_sdk_connector`：通过
 
 相关 QE 细节见 [`docs/qe/aegis-sensor-qe-matrix.md`](../qe/aegis-sensor-qe-matrix.md)。
@@ -32,7 +35,7 @@
 ## 4. 回滚说明
 
 - 所有工作包均按“代码提交 + 文档提交”形成独立提交对，可按工作包粒度回退。
-- 升级与回滚模型已在 `upgrade`、`recovery`、`wal` 模块中建立基线，可作为后续发布工程化的直接输入。
+- 升级与回滚模型已在 `upgrade`、`recovery`、`wal` 模块中建立基线，并补齐清单验签与 rollback artifact 校验，可作为后续发布工程化的直接输入。
 
 ## 5. 已知边界
 
