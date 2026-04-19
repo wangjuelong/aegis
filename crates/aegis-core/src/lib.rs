@@ -7,6 +7,7 @@ pub mod hashing;
 pub mod health;
 pub mod ioc;
 pub mod migrations;
+pub mod ml;
 pub mod orchestrator;
 pub mod process_tree;
 pub mod ring_buffer;
