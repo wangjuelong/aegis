@@ -363,6 +363,18 @@ impl DiagnoseKeyProtectionStatus {
     }
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiagnoseReplayStatus {
+    pub last_acked_sequence_id: u64,
+    pub pending_batches: usize,
+    pub high_priority_pending_batches: usize,
+    pub normal_pending_batches: usize,
+    pub retry_pending_batches: usize,
+    pub in_flight_sequence_id: Option<u64>,
+    pub oldest_pending_created_at_ms: Option<i64>,
+    pub last_error: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct DiagnoseBundle {
     pub connection: DiagnoseConnectionStatus,
@@ -374,6 +386,8 @@ pub struct DiagnoseBundle {
     pub wal: DiagnoseWalStatus,
     #[serde(default)]
     pub key_protection: DiagnoseKeyProtectionStatus,
+    #[serde(default)]
+    pub replay: DiagnoseReplayStatus,
     pub resources: AgentHealth,
     pub runtime_signals: RuntimeHealthSignals,
     pub runtime_bridge: Option<RuntimeBridgeStatus>,
@@ -396,6 +410,8 @@ pub struct AgentRuntimeSnapshot {
     pub wal: DiagnoseWalStatus,
     #[serde(default)]
     pub key_protection: DiagnoseKeyProtectionStatus,
+    #[serde(default)]
+    pub replay: DiagnoseReplayStatus,
     pub resources: AgentHealth,
     pub runtime_bridge: Option<RuntimeBridgeStatus>,
     pub plugin_status: Vec<PluginHealthStatus>,
@@ -493,6 +509,7 @@ impl DiagnoseCollector {
         ring_buffer_utilization_ratio: f32,
         wal: DiagnoseWalStatus,
         key_protection: DiagnoseKeyProtectionStatus,
+        replay: DiagnoseReplayStatus,
         resources: AgentHealth,
         runtime_bridge: Option<RuntimeBridgeStatus>,
         plugin_status: Vec<PluginHealthStatus>,
@@ -510,6 +527,7 @@ impl DiagnoseCollector {
             ring_buffer_utilization_ratio,
             wal,
             key_protection,
+            replay,
             runtime_signals: resources.runtime_signals.clone(),
             resources,
             runtime_bridge,
@@ -541,6 +559,7 @@ impl AgentRuntimeSnapshot {
             self.ring_buffer_utilization_ratio,
             self.wal.clone(),
             self.key_protection.clone(),
+            self.replay.clone(),
             self.resources.clone(),
             self.runtime_bridge.clone(),
             self.plugin_status.clone(),
@@ -554,7 +573,7 @@ mod tests {
     use super::{
         AgentRuntimeSnapshot, CanaryGateDecision, CanaryGateThresholds, CanaryObservation,
         DiagnoseCertificateStatus, DiagnoseCollector, DiagnoseConnectionStatus,
-        DiagnoseKeyProtectionStatus, DiagnoseSensorStatus, DiagnoseWalStatus,
+        DiagnoseKeyProtectionStatus, DiagnoseReplayStatus, DiagnoseSensorStatus, DiagnoseWalStatus,
         HotUpdateManifestVerifier, RolloutGateEvaluator, RuntimeStateStore,
         UpdateVerificationSnapshot, UpgradeArtifact, UpgradePlanner, WatchdogLinkMonitor,
         WatchdogRuntimeSnapshot,
@@ -765,6 +784,7 @@ mod tests {
                 quarantined_segments: 1,
             },
             DiagnoseKeyProtectionStatus::default(),
+            DiagnoseReplayStatus::default(),
             health(),
             Some(RuntimeBridgeStatus {
                 control_socket_path: Some(
@@ -861,6 +881,7 @@ mod tests {
                 quarantined_segments: 0,
             },
             key_protection: DiagnoseKeyProtectionStatus::default(),
+            replay: DiagnoseReplayStatus::default(),
             resources: health(),
             runtime_bridge: None,
             plugin_status: vec![PluginHealthStatus {

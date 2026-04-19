@@ -393,11 +393,12 @@ pub enum JournalActionKind {
     Isolate,
     FilesystemRollback,
     SessionLock,
+    TelemetryReplay,
 }
 
 impl JournalActionKind {
     fn is_lightweight(self) -> bool {
-        matches!(self, Self::Kill | Self::Quarantine)
+        matches!(self, Self::Kill | Self::Quarantine | Self::TelemetryReplay)
     }
 }
 
@@ -589,6 +590,189 @@ impl ForensicPersistenceCoordinator {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplayLane {
+    HighPriority,
+    Normal,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PendingBatchRecord {
+    pub batch_id: Uuid,
+    pub lane: ReplayLane,
+    pub events: Vec<TelemetryEvent>,
+    pub created_at_ms: i64,
+    pub in_flight_sequence_id: Option<u64>,
+    pub last_attempt_ms: Option<i64>,
+    pub next_retry_ms: Option<i64>,
+    pub attempt_count: u32,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PendingBatchStateSnapshot {
+    pub last_acked_sequence_id: u64,
+    pub pending_batches: Vec<PendingBatchRecord>,
+}
+
+pub struct PendingBatchStore {
+    path: PathBuf,
+    state: PendingBatchStateSnapshot,
+}
+
+impl PendingBatchStore {
+    pub fn load(path: impl Into<PathBuf>) -> Result<Self, CoreError> {
+        let path = path.into();
+        if let Some(parent) = path.parent() {
+            create_dir_all(parent)?;
+        }
+        let state = match File::open(&path) {
+            Ok(file) => serde_json::from_reader(BufReader::new(file))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                PendingBatchStateSnapshot::default()
+            }
+            Err(error) => return Err(CoreError::from(error)),
+        };
+        let store = Self { path, state };
+        store.persist()?;
+        Ok(store)
+    }
+
+    pub fn queue_batch(
+        &mut self,
+        lane: ReplayLane,
+        events: Vec<TelemetryEvent>,
+        created_at_ms: i64,
+    ) -> Result<PendingBatchRecord, CoreError> {
+        let record = PendingBatchRecord {
+            batch_id: Uuid::now_v7(),
+            lane,
+            events,
+            created_at_ms,
+            in_flight_sequence_id: None,
+            last_attempt_ms: None,
+            next_retry_ms: None,
+            attempt_count: 0,
+            last_error: None,
+        };
+        self.state.pending_batches.push(record.clone());
+        self.persist()?;
+        Ok(record)
+    }
+
+    pub fn snapshot(&self) -> PendingBatchStateSnapshot {
+        self.state.clone()
+    }
+
+    pub fn next_ready_batch(
+        &self,
+        now_ms: i64,
+        normal_lane_ready: bool,
+    ) -> Option<PendingBatchRecord> {
+        if let Some(in_flight) = self
+            .state
+            .pending_batches
+            .iter()
+            .find(|batch| batch.in_flight_sequence_id.is_some())
+        {
+            let retry_ready = in_flight
+                .next_retry_ms
+                .map(|retry_at_ms| now_ms >= retry_at_ms)
+                .unwrap_or(true);
+            return retry_ready.then(|| in_flight.clone());
+        }
+
+        self.state
+            .pending_batches
+            .iter()
+            .find(|batch| batch.lane == ReplayLane::HighPriority)
+            .cloned()
+            .or_else(|| {
+                normal_lane_ready.then(|| {
+                    self.state
+                        .pending_batches
+                        .iter()
+                        .find(|batch| batch.lane == ReplayLane::Normal)
+                        .cloned()
+                })?
+            })
+    }
+
+    pub fn mark_sent(
+        &mut self,
+        batch_id: Uuid,
+        sent_at_ms: i64,
+        retry_after_ms: i64,
+    ) -> Result<PendingBatchRecord, CoreError> {
+        let next_sequence_id = self.state.last_acked_sequence_id.saturating_add(1);
+        let Some(record) = self
+            .state
+            .pending_batches
+            .iter_mut()
+            .find(|record| record.batch_id == batch_id)
+        else {
+            return Err(CoreError::Crypto(format!(
+                "pending batch {batch_id} not found"
+            )));
+        };
+
+        if record.in_flight_sequence_id.is_none() {
+            record.in_flight_sequence_id = Some(next_sequence_id);
+        }
+        record.last_attempt_ms = Some(sent_at_ms);
+        record.next_retry_ms = Some(sent_at_ms.saturating_add(retry_after_ms.max(1)));
+        record.attempt_count = record.attempt_count.saturating_add(1);
+        record.last_error = None;
+        let snapshot = record.clone();
+        self.persist()?;
+        Ok(snapshot)
+    }
+
+    pub fn defer_retry(
+        &mut self,
+        sequence_id: u64,
+        next_retry_ms: i64,
+        error: impl Into<String>,
+    ) -> Result<(), CoreError> {
+        let Some(record) = self
+            .state
+            .pending_batches
+            .iter_mut()
+            .find(|record| record.in_flight_sequence_id == Some(sequence_id))
+        else {
+            return Err(CoreError::Crypto(format!(
+                "in-flight batch with sequence {sequence_id} not found"
+            )));
+        };
+        record.next_retry_ms = Some(next_retry_ms.max(0));
+        record.last_error = Some(error.into());
+        self.persist()
+    }
+
+    pub fn acknowledge(
+        &mut self,
+        sequence_id: u64,
+    ) -> Result<Option<PendingBatchRecord>, CoreError> {
+        let Some(index) = self
+            .state
+            .pending_batches
+            .iter()
+            .position(|record| record.in_flight_sequence_id == Some(sequence_id))
+        else {
+            return Ok(None);
+        };
+        let record = self.state.pending_batches.remove(index);
+        self.state.last_acked_sequence_id = self.state.last_acked_sequence_id.max(sequence_id);
+        self.persist()?;
+        Ok(Some(record))
+    }
+
+    fn persist(&self) -> Result<(), CoreError> {
+        std::fs::write(&self.path, serde_json::to_vec_pretty(&self.state)?)?;
+        Ok(())
+    }
+}
+
 fn next_sequence(path: &Path) -> Result<u64, CoreError> {
     match File::open(path) {
         Ok(file) => Ok(BufReader::new(file).lines().count() as u64),
@@ -608,8 +792,8 @@ fn file_name(path: &Path) -> Result<String, CoreError> {
 mod tests {
     use super::{
         ActionLogRecord, ActionPersistence, EmergencyAuditRing, EvidenceRecord, ForensicJournal,
-        ForensicPersistenceCoordinator, JournalActionKind, JournalWriteResult, TelemetryWal,
-        WalPressureLevel,
+        ForensicPersistenceCoordinator, JournalActionKind, JournalWriteResult, PendingBatchStore,
+        ReplayLane, TelemetryWal, WalPressureLevel,
     };
     use crate::self_protection::{DerivedKeyTier, KeyDerivationService};
     use aegis_model::{
@@ -762,6 +946,72 @@ mod tests {
             .expect("append evidence");
 
         assert_eq!(result, JournalWriteResult::EvidenceZoneFull);
+        let _ = remove_dir_all(root);
+    }
+
+    #[test]
+    fn pending_batch_store_assigns_sequence_on_send_and_advances_on_ack() {
+        let root = test_root("pending-batch-store");
+        let path = root.join("pending-batches.json");
+        let mut store = PendingBatchStore::load(&path).expect("load batch store");
+        let batch = store
+            .queue_batch(ReplayLane::Normal, vec![telemetry(Priority::Normal)], 1_000)
+            .expect("queue batch");
+
+        let sent = store
+            .mark_sent(batch.batch_id, 1_100, 250)
+            .expect("mark sent");
+
+        assert_eq!(sent.in_flight_sequence_id, Some(1));
+        assert_eq!(store.snapshot().last_acked_sequence_id, 0);
+
+        let acknowledged = store.acknowledge(1).expect("acknowledge batch");
+
+        assert_eq!(
+            acknowledged.expect("acknowledged batch").batch_id,
+            batch.batch_id
+        );
+        assert_eq!(store.snapshot().last_acked_sequence_id, 1);
+        assert!(store.snapshot().pending_batches.is_empty());
+        let _ = remove_dir_all(root);
+    }
+
+    #[test]
+    fn pending_batch_store_prefers_high_priority_and_retries_inflight_first() {
+        let root = test_root("pending-batch-priority");
+        let path = root.join("pending-batches.json");
+        let mut store = PendingBatchStore::load(&path).expect("load batch store");
+        let normal = store
+            .queue_batch(ReplayLane::Normal, vec![telemetry(Priority::Normal)], 1_000)
+            .expect("queue normal");
+        let high = store
+            .queue_batch(
+                ReplayLane::HighPriority,
+                vec![telemetry(Priority::High)],
+                1_001,
+            )
+            .expect("queue high");
+
+        let first_ready = store
+            .next_ready_batch(1_050, false)
+            .expect("first ready batch");
+        assert_eq!(first_ready.batch_id, high.batch_id);
+
+        store
+            .mark_sent(high.batch_id, 1_100, 250)
+            .expect("mark high sent");
+        assert!(store.next_ready_batch(1_200, true).is_none());
+        let retry_ready = store
+            .next_ready_batch(1_360, true)
+            .expect("retry ready batch");
+        assert_eq!(retry_ready.batch_id, high.batch_id);
+        assert_eq!(retry_ready.in_flight_sequence_id, Some(1));
+
+        store.acknowledge(1).expect("ack high");
+        let second_ready = store
+            .next_ready_batch(1_400, true)
+            .expect("second ready batch");
+        assert_eq!(second_ready.batch_id, normal.batch_id);
         let _ = remove_dir_all(root);
     }
 }

@@ -7,8 +7,10 @@ use aegis_core::self_protection::{DerivedKeyTier, KeyDerivationService, Protecti
 use aegis_core::transport_drivers::TransportAgentContext;
 use aegis_core::upgrade::{
     AgentRuntimeSnapshot, DiagnoseCertificateStatus, DiagnoseCollector, DiagnoseConnectionStatus,
-    DiagnoseKeyProtectionStatus, DiagnoseSensorStatus, DiagnoseWalStatus, RuntimeStateStore,
+    DiagnoseKeyProtectionStatus, DiagnoseReplayStatus, DiagnoseSensorStatus, DiagnoseWalStatus,
+    RuntimeStateStore,
 };
+use aegis_core::wal::{PendingBatchStore, ReplayLane};
 use aegis_model::{
     AgentSupervisorHeartbeat, LineageCounters, PluginHealthStatus, RuntimeBridgeStatus,
     RuntimeHealthSignals, TelemetryIntegrity,
@@ -159,6 +161,7 @@ fn build_agent_runtime_snapshot(
     .unwrap_or_default();
     let rollback_status = load_rollback_status(config);
     let (wal, key_protection) = diagnose_storage_security(config, &rollback_status);
+    let replay = load_replay_status(config);
     let plugin_status = collect_plugin_status(config);
     let active_update_id = RuntimeStateStore::load_update_snapshot(config)
         .ok()
@@ -228,6 +231,7 @@ fn build_agent_runtime_snapshot(
         ring_buffer_utilization_ratio: 0.0,
         wal,
         key_protection: key_protection.clone(),
+        replay,
         resources: health,
         runtime_bridge,
         plugin_status,
@@ -341,4 +345,62 @@ fn protection_posture_from_key_status(status: &DiagnoseKeyProtectionStatus) -> P
 
 fn command_replay_path(config: &AppConfig) -> PathBuf {
     config.storage.state_root.join("command-replay-ledger.db")
+}
+
+fn load_replay_status(config: &AppConfig) -> DiagnoseReplayStatus {
+    match PendingBatchStore::load(replay_store_path(config)) {
+        Ok(store) => {
+            let snapshot = store.snapshot();
+            let pending_batches = snapshot.pending_batches.len();
+            let high_priority_pending_batches = snapshot
+                .pending_batches
+                .iter()
+                .filter(|batch| batch.lane == ReplayLane::HighPriority)
+                .count();
+            let normal_pending_batches = snapshot
+                .pending_batches
+                .iter()
+                .filter(|batch| batch.lane == ReplayLane::Normal)
+                .count();
+            let retry_pending_batches = snapshot
+                .pending_batches
+                .iter()
+                .filter(|batch| batch.last_error.is_some())
+                .count();
+            let in_flight_sequence_id = snapshot
+                .pending_batches
+                .iter()
+                .filter_map(|batch| batch.in_flight_sequence_id)
+                .min();
+            let oldest_pending_created_at_ms = snapshot
+                .pending_batches
+                .iter()
+                .map(|batch| batch.created_at_ms)
+                .min();
+            let last_error = snapshot
+                .pending_batches
+                .iter()
+                .filter_map(|batch| batch.last_error.clone())
+                .next();
+
+            DiagnoseReplayStatus {
+                last_acked_sequence_id: snapshot.last_acked_sequence_id,
+                pending_batches,
+                high_priority_pending_batches,
+                normal_pending_batches,
+                retry_pending_batches,
+                in_flight_sequence_id,
+                oldest_pending_created_at_ms,
+                last_error,
+            }
+        }
+        Err(error) => DiagnoseReplayStatus {
+            last_error: Some(error.to_string()),
+            ..DiagnoseReplayStatus::default()
+        },
+    }
+}
+
+fn replay_store_path(config: &AppConfig) -> PathBuf {
+    config.storage.state_root.join("telemetry-replay.json")
 }

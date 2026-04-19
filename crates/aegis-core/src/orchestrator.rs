@@ -15,15 +15,23 @@ use crate::ml::{
     FeatureExtractor, ModelInput, ModelKind, ModelOutput, ModelRegistry, OnnxRuntimeSession,
     OodScorer, RegisteredModel,
 };
-use crate::response_executor::{ResponseAuditLog, ResponseExecutor, TerminationRequest};
+use crate::response_executor::{
+    ResponseActionKind, ResponseAuditLog, ResponseAuditRecord, ResponseExecutor, TerminationRequest,
+};
 use crate::rule_vm::{CompareOp, CompiledRule, Instruction, RuleField, RuleValue, RuleVm};
 use crate::runtime_sdk::{CloudConnectorRunner, RuntimeEventEmitter, SERVERLESS_CONTRACT_VERSION};
 use crate::script_decode::{ScriptDecodePipeline, ScriptDecodeReport};
+use crate::self_protection::{DerivedKeyTier, KeyDerivationService};
 use crate::specialized_detection::{
     DeceptionKind, DeceptionObject, DetectionFinding, SpecializedDetectionEngine,
 };
 use crate::temporal::{TemporalSnapshot, TemporalStateBuffer};
 use crate::transport_drivers::TransportAgentContext;
+use crate::wal::{
+    ActionLogRecord, EmergencyAuditRing, ForensicJournal, ForensicPersistenceCoordinator,
+    JournalActionKind, PendingBatchRecord, PendingBatchStore, ReplayLane, TelemetryWal,
+    WalPressureLevel,
+};
 use crate::yara::{EnqueueDisposition, YaraMatch, YaraResult, YaraScanTarget, YaraScheduler};
 use aegis_model::{
     Alert, ClientAck, ClientAckStatus, CloudApiConnectorContract, CloudLogSourceKind,
@@ -59,7 +67,11 @@ const COMMAND_POLL_INTERVAL_MS: u64 = 50;
 const NORMAL_BATCH_MAX_EVENTS_DEFAULT: usize = 100;
 const NORMAL_BATCH_MAX_EVENTS_LIMIT: usize = 500;
 const NORMAL_BATCH_FLUSH_INTERVAL_MS: u64 = 1_000;
-const FLOW_CONTROL_POLL_INTERVAL_MS: u64 = 100;
+const UPLINK_REPLAY_POLL_INTERVAL_MS: u64 = 100;
+const UPLINK_RETRY_INTERVAL_MS: i64 = 1_000;
+const TELEMETRY_WAL_SEGMENT_BYTES: u64 = 256 * 1024;
+const FORENSIC_EVIDENCE_CAPACITY_BYTES: u64 = 4 * 1024 * 1024;
+const FORENSIC_ACTION_CAPACITY_BYTES: u64 = 4 * 1024 * 1024;
 const NETWORK_ISOLATION_TTL_SECS: u64 = 5 * 60;
 const LOOPBACK_SERVER_SIGNING_KEY_ID: &str = "server-k1";
 const LOOPBACK_ADMIN_SIGNING_KEY_ID: &str = "approver-admin-k1";
@@ -204,6 +216,7 @@ impl Orchestrator {
                 "comms-rx".to_string(),
                 "comms-tx-high".to_string(),
                 "comms-tx-normal".to_string(),
+                "uplink-replay".to_string(),
                 "comms-link-manager".to_string(),
                 "response-executor".to_string(),
                 "telemetry-drain".to_string(),
@@ -233,6 +246,7 @@ impl Orchestrator {
         let detection_runtime = Arc::new(Mutex::new(DetectionRuntime::new()));
         let metrics = Arc::new(Mutex::new(RuntimeMetrics::default()));
         let uplink_control = Arc::new(Mutex::new(UplinkControlState::default()));
+        let replay_runtime = Arc::new(Mutex::new(UplinkReplayRuntime::new(&self.config)?));
         let platform = build_runtime_platform();
         let command_runtime = Arc::new(Mutex::new(CommandExecutionRuntime::new(
             &self.config,
@@ -303,6 +317,7 @@ impl Orchestrator {
             handle: tokio::spawn(comms_rx_task(
                 Arc::clone(&comms_runtime),
                 Arc::clone(&uplink_control),
+                Arc::clone(&replay_runtime),
                 command_runtime,
                 metrics.clone(),
                 shutdown_rx.clone(),
@@ -314,8 +329,7 @@ impl Orchestrator {
                 self.config.tenant_id.clone(),
                 self.config.agent_id.clone(),
                 alert_rx_hi,
-                Arc::clone(&comms_runtime),
-                Arc::clone(&uplink_control),
+                Arc::clone(&replay_runtime),
                 shutdown_rx.clone(),
             )),
         });
@@ -334,7 +348,19 @@ impl Orchestrator {
             handle: tokio::spawn(response_executor_task(
                 response_audit_path,
                 Arc::clone(&platform),
+                Arc::clone(&replay_runtime),
                 response_rx,
+                shutdown_rx.clone(),
+            )),
+        });
+        tasks.push(RuntimeTask {
+            name: "uplink-replay",
+            handle: tokio::spawn(uplink_replay_task(
+                self.config.tenant_id.clone(),
+                self.config.agent_id.clone(),
+                Arc::clone(&comms_runtime),
+                Arc::clone(&uplink_control),
+                Arc::clone(&replay_runtime),
                 shutdown_rx.clone(),
             )),
         });
@@ -349,11 +375,9 @@ impl Orchestrator {
         tasks.push(RuntimeTask {
             name: "telemetry-drain",
             handle: tokio::spawn(telemetry_drain_task(
-                self.config.tenant_id.clone(),
-                self.config.agent_id.clone(),
                 telemetry_rx,
-                Arc::clone(&comms_runtime),
                 Arc::clone(&uplink_control),
+                Arc::clone(&replay_runtime),
                 shutdown_rx.clone(),
             )),
         });
@@ -412,7 +436,6 @@ struct RuntimeMetrics {
 
 #[derive(Debug)]
 struct UplinkControlState {
-    next_sequence_id: u64,
     normal_max_batch_events: usize,
     pause_low_priority: bool,
     suggested_rate_eps: Option<u32>,
@@ -423,7 +446,6 @@ struct UplinkControlState {
 impl Default for UplinkControlState {
     fn default() -> Self {
         Self {
-            next_sequence_id: 1,
             normal_max_batch_events: NORMAL_BATCH_MAX_EVENTS_DEFAULT,
             pause_low_priority: false,
             suggested_rate_eps: None,
@@ -434,12 +456,6 @@ impl Default for UplinkControlState {
 }
 
 impl UplinkControlState {
-    fn reserve_sequence_id(&mut self) -> u64 {
-        let sequence_id = self.next_sequence_id;
-        self.next_sequence_id = self.next_sequence_id.saturating_add(1);
-        sequence_id
-    }
-
     fn normal_batch_limit(&self) -> usize {
         self.normal_max_batch_events
             .clamp(1, NORMAL_BATCH_MAX_EVENTS_LIMIT)
@@ -469,25 +485,6 @@ impl UplinkControlState {
         true
     }
 
-    fn normal_wait_duration(&self, now_ms: i64) -> Duration {
-        let mut wait_ms = FLOW_CONTROL_POLL_INTERVAL_MS;
-        if let Some(until_ms) = self.cooldown_until_ms {
-            if now_ms < until_ms {
-                wait_ms = wait_ms.min((until_ms - now_ms) as u64);
-            }
-        }
-        if let Some(rate_eps) = self.suggested_rate_eps.filter(|rate| *rate > 0) {
-            let spacing_ms = ((1_000_u64 + u64::from(rate_eps) - 1) / u64::from(rate_eps)) as i64;
-            if let Some(last_send_ms) = self.last_normal_batch_sent_ms {
-                let next_send_ms = last_send_ms.saturating_add(spacing_ms);
-                if now_ms < next_send_ms {
-                    wait_ms = wait_ms.min((next_send_ms - now_ms) as u64);
-                }
-            }
-        }
-        Duration::from_millis(wait_ms.max(1))
-    }
-
     fn note_normal_batch_sent(&mut self, now_ms: i64) {
         self.last_normal_batch_sent_ms = Some(now_ms);
     }
@@ -503,6 +500,145 @@ impl UplinkControlState {
         self.cooldown_until_ms = hint
             .cooldown_ms
             .map(|cooldown_ms| now_ms.saturating_add(i64::from(cooldown_ms)));
+    }
+}
+
+struct UplinkReplayRuntime {
+    telemetry_wal: TelemetryWal,
+    pending_batches: PendingBatchStore,
+    forensic: ForensicPersistenceCoordinator,
+}
+
+impl UplinkReplayRuntime {
+    fn new(config: &AppConfig) -> Result<Self> {
+        let key_service = KeyDerivationService::from_config(config)?;
+        let telemetry_key = key_service.derive_material(
+            &config.tenant_id,
+            &config.agent_id,
+            DerivedKeyTier::TelemetryWal,
+            1,
+        );
+        let journal_key = key_service.derive_material(
+            &config.tenant_id,
+            &config.agent_id,
+            DerivedKeyTier::ForensicJournal,
+            1,
+        );
+        Ok(Self {
+            telemetry_wal: TelemetryWal::new(
+                &config.storage.spill_path,
+                TELEMETRY_WAL_SEGMENT_BYTES,
+                telemetry_key,
+            )?,
+            pending_batches: PendingBatchStore::load(replay_store_path(config))?,
+            forensic: ForensicPersistenceCoordinator::new(
+                ForensicJournal::new(
+                    forensic_uplink_root(config),
+                    FORENSIC_EVIDENCE_CAPACITY_BYTES,
+                    FORENSIC_ACTION_CAPACITY_BYTES,
+                    journal_key,
+                )?,
+                EmergencyAuditRing::new(256),
+            ),
+        })
+    }
+
+    fn queue_batch(
+        &mut self,
+        lane: ReplayLane,
+        events: Vec<TelemetryEvent>,
+        created_at_ms: i64,
+    ) -> Result<Uuid> {
+        for event in &events {
+            self.telemetry_wal.append(event, WalPressureLevel::Normal)?;
+        }
+        let record = self
+            .pending_batches
+            .queue_batch(lane, events, created_at_ms)?;
+        self.record_transition(
+            record.batch_id,
+            format!(
+                "queued {:?} telemetry batch with {} event(s)",
+                lane,
+                record.events.len()
+            ),
+        )?;
+        Ok(record.batch_id)
+    }
+
+    fn next_ready_batch(&self, now_ms: i64, normal_lane_ready: bool) -> Option<PendingBatchRecord> {
+        self.pending_batches
+            .next_ready_batch(now_ms, normal_lane_ready)
+    }
+
+    fn mark_sent(&mut self, batch_id: Uuid, sent_at_ms: i64) -> Result<PendingBatchRecord> {
+        let record =
+            self.pending_batches
+                .mark_sent(batch_id, sent_at_ms, UPLINK_RETRY_INTERVAL_MS)?;
+        self.record_transition(
+            batch_id,
+            format!(
+                "sent telemetry batch seq={} attempt={} events={}",
+                record.in_flight_sequence_id.unwrap_or_default(),
+                record.attempt_count,
+                record.events.len()
+            ),
+        )?;
+        Ok(record)
+    }
+
+    fn acknowledge(&mut self, sequence_id: u64) -> Result<Option<PendingBatchRecord>> {
+        let record = self.pending_batches.acknowledge(sequence_id)?;
+        if let Some(record) = &record {
+            self.record_transition(
+                record.batch_id,
+                format!("acknowledged telemetry batch seq={sequence_id}"),
+            )?;
+        }
+        Ok(record)
+    }
+
+    fn defer_retry(&mut self, sequence_id: u64, next_retry_ms: i64, error: String) -> Result<()> {
+        self.pending_batches
+            .defer_retry(sequence_id, next_retry_ms, error.clone())?;
+        self.record_transition(
+            Uuid::now_v7(),
+            format!("scheduled telemetry replay retry for seq={sequence_id}: {error}"),
+        )?;
+        Ok(())
+    }
+
+    fn record_response_audit(&mut self, records: &[ResponseAuditRecord]) -> Result<()> {
+        for record in records {
+            self.persist_forensic_action(
+                record.action_id,
+                format!(
+                    "response_audit action={:?} target={} success={} detail={}",
+                    record.action, record.target, record.success, record.detail
+                ),
+                forensic_action_kind(record.action),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn record_transition(&mut self, action_id: Uuid, detail: String) -> Result<()> {
+        self.persist_forensic_action(action_id, detail, JournalActionKind::TelemetryReplay)
+    }
+
+    fn persist_forensic_action(
+        &mut self,
+        action_id: Uuid,
+        detail: String,
+        kind: JournalActionKind,
+    ) -> Result<()> {
+        let _ = self.forensic.persist_action(ActionLogRecord {
+            action_id,
+            command_id: None,
+            kind,
+            detail,
+        })?;
+        Ok(())
     }
 }
 
@@ -1239,6 +1375,7 @@ async fn decision_router_task(
 async fn comms_rx_task(
     comms_runtime: Arc<Mutex<CommunicationRuntime>>,
     uplink_control: Arc<Mutex<UplinkControlState>>,
+    replay_runtime: Arc<Mutex<UplinkReplayRuntime>>,
     command_runtime: Arc<Mutex<CommandExecutionRuntime>>,
     metrics: Arc<Mutex<RuntimeMetrics>>,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -1287,11 +1424,33 @@ async fn comms_rx_task(
                     }
                     DownlinkMessage::BatchAck(batch_ack) => {
                         if batch_ack.status == aegis_model::BatchAckStatus::Accepted {
+                            if let Err(error) = replay_runtime
+                                .lock()
+                                .expect("uplink replay runtime poisoned")
+                                .acknowledge(batch_ack.sequence_id)
+                            {
+                                debug!(%error, sequence_id = batch_ack.sequence_id, "failed to acknowledge replay batch");
+                            }
                             let mut snapshot = metrics.lock().expect("runtime metrics poisoned");
                             snapshot.lineage_counters.grpc_acked = snapshot
                                 .lineage_counters
                                 .grpc_acked
                                 .saturating_add(u64::from(batch_ack.accepted_events.max(1)));
+                        } else {
+                            let retry_at_ms = now_unix_ms().saturating_add(
+                                i64::from(batch_ack.retry_after_ms.max(UPLINK_RETRY_INTERVAL_MS as u32)),
+                            );
+                            let reason = batch_ack
+                                .reason
+                                .clone()
+                                .unwrap_or_else(|| format!("status={:?}", batch_ack.status));
+                            if let Err(error) = replay_runtime
+                                .lock()
+                                .expect("uplink replay runtime poisoned")
+                                .defer_retry(batch_ack.sequence_id, retry_at_ms, reason)
+                            {
+                                debug!(%error, sequence_id = batch_ack.sequence_id, "failed to defer replay batch");
+                            }
                         }
                         debug!(
                             batch_id = %batch_ack.batch_id,
@@ -1325,8 +1484,7 @@ async fn alert_uplink_high_task(
     tenant_id: String,
     agent_id: String,
     mut alert_rx: mpsc::Receiver<Alert>,
-    comms_runtime: Arc<Mutex<CommunicationRuntime>>,
-    uplink_control: Arc<Mutex<UplinkControlState>>,
+    replay_runtime: Arc<Mutex<UplinkReplayRuntime>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     loop {
@@ -1346,15 +1504,9 @@ async fn alert_uplink_high_task(
                             agent_id.clone(),
                             now_unix_ns(),
                         );
-                        if let Err(error) = send_event_batch(
-                            &tenant_id,
-                            &agent_id,
-                            vec![alert_event],
-                            1,
-                            now_unix_ms(),
-                            &comms_runtime,
-                            &uplink_control,
-                        ) {
+                        if let Err(error) =
+                            queue_event_batch(ReplayLane::HighPriority, vec![alert_event], &replay_runtime)
+                        {
                             debug!(
                                 %error,
                                 alert_id = %alert.alert_id,
@@ -1408,6 +1560,7 @@ async fn alert_normalizer_task(
 async fn response_executor_task(
     audit_path: PathBuf,
     platform: Arc<dyn PlatformRuntime>,
+    replay_runtime: Arc<Mutex<UplinkReplayRuntime>>,
     mut response_rx: mpsc::Receiver<ResponseAction>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
@@ -1429,7 +1582,16 @@ async fn response_executor_task(
                     Some(response) => {
                         let result = apply_response_action(platform.as_ref(), audit.clone(), response);
                         match result {
-                            Ok(report) => debug!(records = report.records.len(), "response-executor applied action"),
+                            Ok(report) => {
+                                if let Err(error) = replay_runtime
+                                    .lock()
+                                    .expect("uplink replay runtime poisoned")
+                                    .record_response_audit(&report.records)
+                                {
+                                    debug!(%error, "response-executor failed to persist forensic action log");
+                                }
+                                debug!(records = report.records.len(), "response-executor applied action");
+                            }
                             Err(error) => debug!(%error, "response-executor failed to apply action"),
                         }
                     }
@@ -1441,38 +1603,28 @@ async fn response_executor_task(
 }
 
 async fn telemetry_drain_task(
-    tenant_id: String,
-    agent_id: String,
     mut telemetry_rx: mpsc::Receiver<TelemetryEvent>,
-    comms_runtime: Arc<Mutex<CommunicationRuntime>>,
     uplink_control: Arc<Mutex<UplinkControlState>>,
+    replay_runtime: Arc<Mutex<UplinkReplayRuntime>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let mut buffer = Vec::new();
     let mut flush_ticker = interval(Duration::from_millis(NORMAL_BATCH_FLUSH_INTERVAL_MS));
     flush_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    flush_ticker.tick().await;
 
     loop {
-        let now_ms = now_unix_ms();
-        let (normal_lane_ready, max_batch_events, wait_duration) = {
-            let control = uplink_control.lock().expect("uplink control poisoned");
-            (
-                control.normal_lane_ready(now_ms),
-                control.normal_batch_limit(),
-                control.normal_wait_duration(now_ms),
-            )
-        };
+        let max_batch_events = uplink_control
+            .lock()
+            .expect("uplink control poisoned")
+            .normal_batch_limit();
         tokio::select! {
             changed = shutdown_rx.changed() => {
                 if changed.is_ok() && *shutdown_rx.borrow() {
                     if !buffer.is_empty() {
                         let _ = flush_normal_telemetry_buffer(
-                            &tenant_id,
-                            &agent_id,
                             &mut buffer,
-                            max_batch_events,
-                            &comms_runtime,
-                            &uplink_control,
+                            &replay_runtime,
                         );
                     }
                     debug!("telemetry-drain received shutdown");
@@ -1480,67 +1632,108 @@ async fn telemetry_drain_task(
                 }
             }
             _ = flush_ticker.tick(), if !buffer.is_empty() => {
-                if normal_lane_ready {
-                    let _ = flush_normal_telemetry_buffer(
-                        &tenant_id,
-                        &agent_id,
-                        &mut buffer,
-                        max_batch_events,
-                        &comms_runtime,
-                        &uplink_control,
-                    );
-                }
+                let _ = flush_normal_telemetry_buffer(&mut buffer, &replay_runtime);
             }
-            maybe_event = telemetry_rx.recv(), if normal_lane_ready && buffer.len() < max_batch_events => {
+            maybe_event = telemetry_rx.recv() => {
                 match maybe_event {
                     Some(event) => {
                         buffer.push(event);
                         if buffer.len() >= max_batch_events {
-                            let _ = flush_normal_telemetry_buffer(
-                                &tenant_id,
-                                &agent_id,
-                                &mut buffer,
-                                max_batch_events,
-                                &comms_runtime,
-                                &uplink_control,
-                            );
+                            let _ = flush_normal_telemetry_buffer(&mut buffer, &replay_runtime);
                         }
                     }
                     None => {
                         if !buffer.is_empty() {
-                            let _ = flush_normal_telemetry_buffer(
-                                &tenant_id,
-                                &agent_id,
-                                &mut buffer,
-                                max_batch_events,
-                                &comms_runtime,
-                                &uplink_control,
-                            );
+                            let _ = flush_normal_telemetry_buffer(&mut buffer, &replay_runtime);
                         }
                         break;
                     }
                 }
             }
-            _ = tokio::time::sleep(wait_duration), if !normal_lane_ready => {
-                if !buffer.is_empty() {
-                    let now_ms = now_unix_ms();
-                    let ready_after_wait = uplink_control
-                        .lock()
-                        .expect("uplink control poisoned")
-                        .normal_lane_ready(now_ms);
-                    if ready_after_wait {
-                        let max_batch_events = uplink_control
+        }
+    }
+}
+
+async fn uplink_replay_task(
+    tenant_id: String,
+    agent_id: String,
+    comms_runtime: Arc<Mutex<CommunicationRuntime>>,
+    uplink_control: Arc<Mutex<UplinkControlState>>,
+    replay_runtime: Arc<Mutex<UplinkReplayRuntime>>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let mut ticker = interval(Duration::from_millis(UPLINK_REPLAY_POLL_INTERVAL_MS));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_ok() && *shutdown_rx.borrow() {
+                    debug!("uplink-replay received shutdown");
+                    break;
+                }
+            }
+            _ = ticker.tick() => {
+                let now_ms = now_unix_ms();
+                let normal_lane_ready = uplink_control
+                    .lock()
+                    .expect("uplink control poisoned")
+                    .normal_lane_ready(now_ms);
+                let next_batch = replay_runtime
+                    .lock()
+                    .expect("uplink replay runtime poisoned")
+                    .next_ready_batch(now_ms, normal_lane_ready);
+                let Some(next_batch) = next_batch else {
+                    continue;
+                };
+                let sent_batch = match replay_runtime
+                    .lock()
+                    .expect("uplink replay runtime poisoned")
+                    .mark_sent(next_batch.batch_id, now_ms)
+                {
+                    Ok(batch) => batch,
+                    Err(error) => {
+                        debug!(%error, batch_id = %next_batch.batch_id, "failed to mark replay batch as sent");
+                        continue;
+                    }
+                };
+                let Some(sequence_hint) = sent_batch.in_flight_sequence_id else {
+                    continue;
+                };
+                let send_result = send_event_batch(
+                    &tenant_id,
+                    &agent_id,
+                    sent_batch.events.clone(),
+                    sent_batch.events.len().max(1),
+                    sequence_hint,
+                    now_ms,
+                    &comms_runtime,
+                );
+                match send_result {
+                    Ok(()) => {
+                        if sent_batch.lane == ReplayLane::Normal {
+                            uplink_control
+                                .lock()
+                                .expect("uplink control poisoned")
+                                .note_normal_batch_sent(now_ms);
+                        }
+                    }
+                    Err(error) => {
+                        if let Err(retry_error) = replay_runtime
                             .lock()
-                            .expect("uplink control poisoned")
-                            .normal_batch_limit();
-                        let _ = flush_normal_telemetry_buffer(
-                            &tenant_id,
-                            &agent_id,
-                            &mut buffer,
-                            max_batch_events,
-                            &comms_runtime,
-                            &uplink_control,
-                        );
+                            .expect("uplink replay runtime poisoned")
+                            .defer_retry(
+                                sequence_hint,
+                                now_ms.saturating_add(UPLINK_RETRY_INTERVAL_MS),
+                                error.to_string(),
+                            )
+                        {
+                            debug!(
+                                %retry_error,
+                                sequence_id = sequence_hint,
+                                "failed to persist replay retry state"
+                            );
+                        }
                     }
                 }
             }
@@ -1553,14 +1746,10 @@ fn send_event_batch(
     agent_id: &str,
     events: Vec<TelemetryEvent>,
     max_batch_events: usize,
+    sequence_hint: u64,
     sent_at_ms: i64,
     comms_runtime: &Arc<Mutex<CommunicationRuntime>>,
-    uplink_control: &Arc<Mutex<UplinkControlState>>,
 ) -> Result<()> {
-    let sequence_hint = uplink_control
-        .lock()
-        .expect("uplink control poisoned")
-        .reserve_sequence_id();
     let batch = TelemetryBatchBuilder::new(max_batch_events).build(
         tenant_id.to_string(),
         agent_id.to_string(),
@@ -1574,39 +1763,32 @@ fn send_event_batch(
     Ok(())
 }
 
+fn queue_event_batch(
+    lane: ReplayLane,
+    events: Vec<TelemetryEvent>,
+    replay_runtime: &Arc<Mutex<UplinkReplayRuntime>>,
+) -> Result<()> {
+    replay_runtime
+        .lock()
+        .expect("uplink replay runtime poisoned")
+        .queue_batch(lane, events, now_unix_ms())?;
+    Ok(())
+}
+
 fn flush_normal_telemetry_buffer(
-    tenant_id: &str,
-    agent_id: &str,
     buffer: &mut Vec<TelemetryEvent>,
-    max_batch_events: usize,
-    comms_runtime: &Arc<Mutex<CommunicationRuntime>>,
-    uplink_control: &Arc<Mutex<UplinkControlState>>,
+    replay_runtime: &Arc<Mutex<UplinkReplayRuntime>>,
 ) -> Result<()> {
     if buffer.is_empty() {
         return Ok(());
     }
 
     let events = std::mem::take(buffer);
-    let sent_at_ms = now_unix_ms();
-    match send_event_batch(
-        tenant_id,
-        agent_id,
-        events.clone(),
-        max_batch_events,
-        sent_at_ms,
-        comms_runtime,
-        uplink_control,
-    ) {
-        Ok(()) => {
-            uplink_control
-                .lock()
-                .expect("uplink control poisoned")
-                .note_normal_batch_sent(sent_at_ms);
-            Ok(())
-        }
+    match queue_event_batch(ReplayLane::Normal, events.clone(), replay_runtime) {
+        Ok(()) => Ok(()),
         Err(error) => {
             *buffer = events;
-            debug!(%error, "telemetry-drain failed to send batch");
+            debug!(%error, "telemetry-drain failed to queue batch");
             Err(error)
         }
     }
@@ -2030,12 +2212,31 @@ fn command_replay_path(config: &AppConfig) -> PathBuf {
     config.storage.state_root.join("command-replay-ledger.db")
 }
 
+fn replay_store_path(config: &AppConfig) -> PathBuf {
+    config.storage.state_root.join("telemetry-replay.json")
+}
+
 fn approval_queue_path(config: &AppConfig) -> PathBuf {
     config.storage.state_root.join("approval-queue.db")
 }
 
+fn forensic_uplink_root(config: &AppConfig) -> PathBuf {
+    config.storage.forensic_path.join("uplink-replay")
+}
+
 fn remote_shell_audit_root(config: &AppConfig) -> PathBuf {
     config.storage.state_root.join("remote-shell")
+}
+
+fn forensic_action_kind(action: ResponseActionKind) -> JournalActionKind {
+    match action {
+        ResponseActionKind::Suspend
+        | ResponseActionKind::Assess
+        | ResponseActionKind::Kill
+        | ResponseActionKind::KillProtected => JournalActionKind::Kill,
+        ResponseActionKind::Quarantine => JournalActionKind::Quarantine,
+        ResponseActionKind::NetworkIsolate => JournalActionKind::Isolate,
+    }
 }
 
 fn loopback_remote_shell_policy() -> RemoteShellPolicy {
@@ -2207,8 +2408,7 @@ mod tests {
     }
 
     fn loopback_test_config(name: &str) -> AppConfig {
-        let mut config = AppConfig::default();
-        config.storage.state_root = temp_state_root(name);
+        let mut config = AppConfig::default().with_state_root(temp_state_root(name));
         config.communication.development_allow_loopback = true;
         config
     }
@@ -2406,9 +2606,8 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_executes_response_flow_for_malicious_script() {
-        let mut config = AppConfig::default();
         let state_root = temp_state_root("runtime-flow");
-        config.storage.state_root = state_root.clone();
+        let config = AppConfig::default().with_state_root(state_root.clone());
         let orchestrator = Orchestrator::new(config.clone());
         let artifacts = orchestrator.bootstrap().expect("bootstrap should work");
         let event_tx = artifacts.channels.event_tx.clone();
@@ -2468,23 +2667,46 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(1_250)).await;
 
-        let batches = event_batches(&handle);
-        assert!(batches.iter().any(|batch| {
-            batch.events.len() == 1
-                && matches!(batch.events[0].payload, EventPayload::Alert(_))
-                && batch.events[0].severity == Severity::High
+        let first_batches = event_batches(&handle);
+        let high_batch = first_batches
+            .iter()
+            .find(|batch| {
+                batch.events.len() == 1
+                    && matches!(batch.events[0].payload, EventPayload::Alert(_))
+                    && batch.events[0].severity == Severity::High
+            })
+            .expect("high priority batch sent first")
+            .clone();
+        assert_eq!(high_batch.sequence_hint, 1);
+
+        handle.inject_downlink(DownlinkMessage::BatchAck(BatchAck {
+            batch_id: high_batch.batch_id,
+            sequence_id: high_batch.sequence_hint,
+            status: BatchAckStatus::Accepted,
+            retry_after_ms: 0,
+            reason: None,
+            acked_at: now_unix_ms(),
+            accepted_events: high_batch.events.len() as u32,
+            rejected_events: 0,
         }));
-        assert!(batches.iter().any(|batch| {
-            batch.events.len() >= 3
-                && batch.events.iter().any(|event| {
-                    matches!(event.payload, EventPayload::Alert(_))
-                        && event.severity == Severity::Low
-                })
-                && batch
-                    .events
-                    .iter()
-                    .any(|event| event.event_type == EventType::ProcessCreate)
-        }));
+        tokio::time::sleep(Duration::from_millis(1_250)).await;
+
+        let second_batches = event_batches(&handle);
+        let normal_batch = second_batches
+            .iter()
+            .find(|batch| {
+                batch.events.len() >= 3
+                    && batch.events.iter().any(|event| {
+                        matches!(event.payload, EventPayload::Alert(_))
+                            && event.severity == Severity::Low
+                    })
+                    && batch
+                        .events
+                        .iter()
+                        .any(|event| event.event_type == EventType::ProcessCreate)
+            })
+            .expect("normal lane batch sent after ack");
+        assert_eq!(normal_batch.sequence_hint, 2);
 
         runtime
             .graceful_shutdown(Duration::from_secs(1))
@@ -2540,18 +2762,42 @@ mod tests {
         }));
 
         tokio::time::sleep(Duration::from_millis(1_250)).await;
-        let batches = event_batches(&handle);
-        assert!(batches.iter().any(|batch| batch.events.len() == 2));
-        assert!(batches.iter().any(|batch| batch.events.len() == 1));
+        let first_batches = event_batches(&handle);
+        let first_batch = first_batches
+            .iter()
+            .find(|batch| batch.events.len() == 2)
+            .expect("first normal batch obeys flow-control batch size")
+            .clone();
+        assert_eq!(first_batch.sequence_hint, 1);
 
         handle.inject_downlink(DownlinkMessage::BatchAck(BatchAck {
-            batch_id: Uuid::now_v7(),
-            sequence_id: 1,
+            batch_id: first_batch.batch_id,
+            sequence_id: first_batch.sequence_hint,
             status: BatchAckStatus::Accepted,
             retry_after_ms: 0,
             reason: None,
             acked_at: now_unix_ms(),
-            accepted_events: 2,
+            accepted_events: first_batch.events.len() as u32,
+            rejected_events: 0,
+        }));
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let second_batches = event_batches(&handle);
+        let second_batch = second_batches
+            .iter()
+            .find(|batch| batch.events.len() == 1)
+            .expect("second normal batch waits for ack frontier")
+            .clone();
+        assert_eq!(second_batch.sequence_hint, 2);
+
+        handle.inject_downlink(DownlinkMessage::BatchAck(BatchAck {
+            batch_id: second_batch.batch_id,
+            sequence_id: second_batch.sequence_hint,
+            status: BatchAckStatus::Accepted,
+            retry_after_ms: 0,
+            reason: None,
+            acked_at: now_unix_ms(),
+            accepted_events: second_batch.events.len() as u32,
             rejected_events: 0,
         }));
 
@@ -2559,7 +2805,7 @@ mod tests {
         let heartbeats = handle.take_heartbeats();
         assert!(heartbeats
             .iter()
-            .any(|heartbeat| heartbeat.health.lineage_counters.grpc_acked >= 2));
+            .any(|heartbeat| heartbeat.health.lineage_counters.grpc_acked >= 3));
 
         runtime
             .graceful_shutdown(Duration::from_secs(1))
