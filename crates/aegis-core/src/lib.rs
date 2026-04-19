@@ -20,6 +20,7 @@ pub mod recovery;
 pub mod response_executor;
 pub mod ring_buffer;
 pub mod rule_vm;
+pub mod runtime_sdk;
 pub mod script_decode;
 pub mod self_protection;
 pub mod specialized_detection;

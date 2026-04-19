@@ -738,12 +738,127 @@ pub struct UpdateChunk {
     pub eof: bool,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RuntimeProviderKind {
+    AwsLambda,
+    AwsFargate,
+    AzureFunctions,
+    AzureContainerInstances,
+    GoogleCloudRun,
+    Wasm,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RuntimeSignalKind {
+    HttpRequest,
+    HttpResponse,
+    FileAccess,
+    ProcessSpawn,
+    SocketConnect,
+    EnvRead,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeMetadata {
+    pub provider: RuntimeProviderKind,
+    pub service: String,
+    pub runtime: String,
+    pub region: Option<String>,
+    pub account_id: Option<String>,
+    pub invocation_id: String,
+    pub cold_start: bool,
+    pub function_name: Option<String>,
+    pub container_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeSdkEvent {
+    pub contract_version: String,
+    pub tenant_id: String,
+    pub agent_id: String,
+    pub sequence_hint: u64,
+    pub signal_kind: RuntimeSignalKind,
+    pub metadata: RuntimeMetadata,
+    pub process: ProcessContext,
+    pub labels: BTreeMap<String, String>,
+    pub attributes: BTreeMap<String, String>,
+    pub occurred_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeHeartbeat {
+    pub contract_version: String,
+    pub tenant_id: String,
+    pub agent_id: String,
+    pub metadata: RuntimeMetadata,
+    pub policy_version: String,
+    pub active_invocations: u32,
+    pub buffered_events: usize,
+    pub dropped_events_total: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimePolicyContract {
+    pub contract_version: String,
+    pub policy_version: String,
+    pub blocked_env_keys: Vec<String>,
+    pub blocked_destinations: Vec<String>,
+    pub max_request_body_bytes: u32,
+    pub require_response_sampling: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CloudLogSourceKind {
+    AwsCloudTrail,
+    AwsCloudWatch,
+    AzureMonitor,
+    GcpAuditLog,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CloudApiRecord {
+    pub contract_version: String,
+    pub tenant_id: String,
+    pub connector_id: String,
+    pub source: CloudLogSourceKind,
+    pub account_id: String,
+    pub region: Option<String>,
+    pub service: String,
+    pub action: String,
+    pub principal: Option<String>,
+    pub resource_id: Option<String>,
+    pub request_id: String,
+    pub observed_at_ms: i64,
+    pub attributes: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CloudConnectorCursor {
+    pub source: CloudLogSourceKind,
+    pub shard: String,
+    pub checkpoint: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CloudApiConnectorContract {
+    pub contract_version: String,
+    pub connector_id: String,
+    pub source: CloudLogSourceKind,
+    pub poll_interval_secs: u32,
+    pub max_batch_records: usize,
+    pub cursor: Option<CloudConnectorCursor>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
+        CloudApiConnectorContract, CloudApiRecord, CloudConnectorCursor, CloudLogSourceKind,
         EventBatch, EventPayload, EventType, FileContext, NormalizedEvent, Priority,
-        ProcessContext, Severity, TelemetryEvent, TelemetryIntegrity, UplinkMessage,
+        ProcessContext, RuntimeHeartbeat, RuntimeMetadata, RuntimePolicyContract,
+        RuntimeProviderKind, RuntimeSdkEvent, RuntimeSignalKind, Severity, TelemetryEvent,
+        TelemetryIntegrity, UplinkMessage,
     };
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     #[test]
@@ -820,5 +935,86 @@ mod tests {
             }
             _ => panic!("expected event batch"),
         }
+    }
+
+    #[test]
+    fn runtime_and_cloud_contracts_capture_serverless_shapes() {
+        let metadata = RuntimeMetadata {
+            provider: RuntimeProviderKind::AwsLambda,
+            service: "orders-api".to_string(),
+            runtime: "python3.12".to_string(),
+            region: Some("ap-southeast-1".to_string()),
+            account_id: Some("123456789012".to_string()),
+            invocation_id: "invoke-1".to_string(),
+            cold_start: true,
+            function_name: Some("orders-handler".to_string()),
+            container_id: None,
+        };
+        let event = RuntimeSdkEvent {
+            contract_version: "serverless.v1".to_string(),
+            tenant_id: "tenant-a".to_string(),
+            agent_id: "runtime-sdk".to_string(),
+            sequence_hint: 10,
+            signal_kind: RuntimeSignalKind::HttpRequest,
+            metadata: metadata.clone(),
+            process: ProcessContext {
+                pid: 7,
+                name: "python".to_string(),
+                ..ProcessContext::default()
+            },
+            labels: BTreeMap::from([("route".to_string(), "/orders".to_string())]),
+            attributes: BTreeMap::from([("method".to_string(), "POST".to_string())]),
+            occurred_at_ms: 1_713_000_000_000,
+        };
+        let heartbeat = RuntimeHeartbeat {
+            contract_version: "serverless.v1".to_string(),
+            tenant_id: "tenant-a".to_string(),
+            agent_id: "runtime-sdk".to_string(),
+            metadata,
+            policy_version: "policy-7".to_string(),
+            active_invocations: 2,
+            buffered_events: 8,
+            dropped_events_total: 0,
+        };
+        let policy = RuntimePolicyContract {
+            contract_version: "serverless.v1".to_string(),
+            policy_version: "policy-7".to_string(),
+            blocked_env_keys: vec!["AWS_SECRET_ACCESS_KEY".to_string()],
+            blocked_destinations: vec!["169.254.169.254".to_string()],
+            max_request_body_bytes: 8192,
+            require_response_sampling: true,
+        };
+        let connector = CloudApiConnectorContract {
+            contract_version: "serverless.v1".to_string(),
+            connector_id: "aws-cloudtrail".to_string(),
+            source: CloudLogSourceKind::AwsCloudTrail,
+            poll_interval_secs: 60,
+            max_batch_records: 500,
+            cursor: Some(CloudConnectorCursor {
+                source: CloudLogSourceKind::AwsCloudTrail,
+                shard: "us-east-1".to_string(),
+                checkpoint: "event-42".to_string(),
+            }),
+        };
+        let record = CloudApiRecord {
+            contract_version: "serverless.v1".to_string(),
+            tenant_id: "tenant-a".to_string(),
+            connector_id: "aws-cloudtrail".to_string(),
+            source: CloudLogSourceKind::AwsCloudTrail,
+            account_id: "123456789012".to_string(),
+            region: Some("us-east-1".to_string()),
+            service: "lambda.amazonaws.com".to_string(),
+            action: "Invoke".to_string(),
+            principal: Some("svc-orders".to_string()),
+            resource_id: Some("arn:aws:lambda:us-east-1:123456789012:function:orders".to_string()),
+            request_id: "req-42".to_string(),
+            observed_at_ms: 1_713_000_100_000,
+            attributes: BTreeMap::from([("sourceIp".to_string(), "10.0.0.8".to_string())]),
+        };
+
+        assert_eq!(event.contract_version, heartbeat.contract_version);
+        assert_eq!(heartbeat.policy_version, policy.policy_version);
+        assert_eq!(connector.contract_version, record.contract_version);
+        assert_eq!(record.source, CloudLogSourceKind::AwsCloudTrail);
     }
 }
