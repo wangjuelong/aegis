@@ -20,10 +20,12 @@ pub(crate) struct LinuxTpmRuntime {
     pub(crate) hardware_present: bool,
     pub(crate) nv_tools_ready: bool,
     pub(crate) sealed_object_tools_ready: bool,
+    pub(crate) policy_session_tools_ready: bool,
     pub(crate) quote_tools_ready: bool,
     pub(crate) attestation_ak_path: Option<PathBuf>,
     pub(crate) attestation_pcrs: Option<String>,
     pub(crate) master_key_sealed_object_path: Option<PathBuf>,
+    pub(crate) master_key_pcrs: Option<String>,
     pub(crate) master_key_index: Option<String>,
     pub(crate) rollback_index: Option<String>,
     pub(crate) auto_provision: bool,
@@ -42,12 +44,20 @@ impl LinuxTpmRuntime {
         self.hardware_present && self.sealed_object_tools_ready
     }
 
+    pub(crate) fn policy_session_available(&self) -> bool {
+        self.hardware_present && self.policy_session_tools_ready
+    }
+
     pub(crate) fn quote_available(&self) -> bool {
         self.hardware_present && self.quote_tools_ready
     }
 
     pub(crate) fn master_key_configured(&self) -> bool {
         self.master_key_sealed_object_path.is_some() || self.master_key_index.is_some()
+    }
+
+    pub(crate) fn master_key_policy_configured(&self) -> bool {
+        self.master_key_sealed_object_path.is_some() && self.master_key_pcrs.is_some()
     }
 
     pub(crate) fn attestation_configured(&self) -> bool {
@@ -83,7 +93,9 @@ impl LinuxTpmRuntime {
     }
 
     pub(crate) fn master_key_sealed_enabled(&self) -> bool {
-        self.sealed_object_available() && self.master_key_sealed_object_path.is_some()
+        self.sealed_object_available()
+            && self.master_key_sealed_object_path.is_some()
+            && (self.master_key_pcrs.is_none() || self.policy_session_available())
     }
 
     pub(crate) fn master_key_nv_enabled(&self) -> bool {
@@ -122,6 +134,13 @@ pub(crate) fn detect_linux_tpm_runtime(security: &SecurityConfig) -> LinuxTpmRun
     ]
     .into_iter()
     .all(|tool| resolve_tool(security, tool).is_some());
+    let policy_session_tools_ready = [
+        "tpm2_createpolicy",
+        "tpm2_startauthsession",
+        "tpm2_policypcr",
+    ]
+    .into_iter()
+    .all(|tool| resolve_tool(security, tool).is_some());
     let quote_tools_ready = [
         "tpm2_createek",
         "tpm2_createak",
@@ -135,10 +154,12 @@ pub(crate) fn detect_linux_tpm_runtime(security: &SecurityConfig) -> LinuxTpmRun
         hardware_present,
         nv_tools_ready,
         sealed_object_tools_ready,
+        policy_session_tools_ready,
         quote_tools_ready,
         attestation_ak_path: security.linux_tpm_attestation_ak_path.clone(),
         attestation_pcrs: sanitize_pcrs(security.linux_tpm_attestation_pcrs.as_deref()),
         master_key_sealed_object_path: security.linux_tpm_master_key_sealed_object_path.clone(),
+        master_key_pcrs: sanitize_pcrs(security.linux_tpm_master_key_pcrs.as_deref()),
         master_key_index: sanitize_index(security.linux_tpm_master_key_nv_index.as_deref()),
         rollback_index: sanitize_index(security.linux_tpm_rollback_nv_index.as_deref()),
         auto_provision: security.linux_tpm_auto_provision_nv,
@@ -159,6 +180,11 @@ pub(crate) fn load_or_initialize_master_key_from_tpm(security: &SecurityConfig) 
                 Ok(secret) => return Ok(secret),
                 Err(error) => failures.push(format!("sealed object provider failed: {error}")),
             }
+        } else if runtime.master_key_policy_configured() && !runtime.policy_session_available() {
+            failures.push(
+                "sealed object provider configured with pcr policy but required policy session tools are unavailable"
+                    .to_string(),
+            );
         } else {
             failures.push(
                 "sealed object provider configured but required tools are unavailable".to_string(),
@@ -474,6 +500,8 @@ fn create_sealed_object(
     let temp_dir = temp_runtime_dir("create")?;
     let secret_path = temp_dir.join("secret.bin");
     let primary_ctx = temp_dir.join("primary.ctx");
+    let policy_path = temp_dir.join("policy.dat");
+    let policy_pcrs = sanitize_pcrs(security.linux_tpm_master_key_pcrs.as_deref());
     fs::write(&secret_path, secret)
         .with_context(|| format!("write sealed object input {}", secret_path.display()))?;
 
@@ -489,6 +517,10 @@ fn create_sealed_object(
         }
         run_command(create_primary, "create tpm primary for sealed object")?;
 
+        if let Some(pcrs) = policy_pcrs.as_deref() {
+            create_pcr_policy(security, pcrs, &policy_path)?;
+        }
+
         let mut create = build_tool_command(security, "tpm2_create")?;
         create
             .arg("-C")
@@ -499,6 +531,9 @@ fn create_sealed_object(
             .arg(private_path)
             .arg("-i")
             .arg(&secret_path);
+        if policy_pcrs.is_some() {
+            create.arg("-L").arg(&policy_path);
+        }
         run_command(create, "create sealed tpm object")?;
         Ok(())
     })();
@@ -516,6 +551,8 @@ fn unseal_master_key_from_sealed_object(
     let temp_dir = temp_runtime_dir("unseal")?;
     let primary_ctx = temp_dir.join("primary.ctx");
     let object_ctx = temp_dir.join("object.ctx");
+    let session_ctx = temp_dir.join("session.ctx");
+    let policy_pcrs = sanitize_pcrs(security.linux_tpm_master_key_pcrs.as_deref());
 
     let result = (|| -> Result<Vec<u8>> {
         let mut create_primary = build_tool_command(security, "tpm2_createprimary")?;
@@ -540,8 +577,17 @@ fn unseal_master_key_from_sealed_object(
             .arg(&object_ctx);
         run_command(load, "load sealed tpm object")?;
 
+        if let Some(pcrs) = policy_pcrs.as_deref() {
+            start_pcr_policy_session(security, pcrs, &session_ctx)?;
+        }
+
         let mut unseal = build_tool_command(security, "tpm2_unseal")?;
         unseal.arg("-c").arg(&object_ctx);
+        if policy_pcrs.is_some() {
+            unseal
+                .arg("-p")
+                .arg(format!("session:{}", session_ctx.display()));
+        }
         let output = run_command(unseal, "unseal tpm master key")?;
         let secret = output.stdout;
         if secret.len() != MASTER_KEY_SIZE {
@@ -555,9 +601,39 @@ fn unseal_master_key_from_sealed_object(
     })();
 
     best_effort_flush_context(security, &object_ctx);
+    if policy_pcrs.is_some() {
+        best_effort_flush_context(security, &session_ctx);
+    }
     best_effort_flush_context(security, &primary_ctx);
     let _ = fs::remove_dir_all(&temp_dir);
     result
+}
+
+fn create_pcr_policy(security: &SecurityConfig, pcrs: &str, policy_path: &Path) -> Result<()> {
+    let mut createpolicy = build_tool_command(security, "tpm2_createpolicy")?;
+    createpolicy
+        .arg("--policy-pcr")
+        .arg("-l")
+        .arg(pcrs)
+        .arg("-L")
+        .arg(policy_path);
+    run_command(createpolicy, "create tpm pcr policy")?;
+    Ok(())
+}
+
+fn start_pcr_policy_session(
+    security: &SecurityConfig,
+    pcrs: &str,
+    session_path: &Path,
+) -> Result<()> {
+    let mut session = build_tool_command(security, "tpm2_startauthsession")?;
+    session.arg("--policy-session").arg("-S").arg(session_path);
+    run_command(session, "start tpm policy session")?;
+
+    let mut policypcr = build_tool_command(security, "tpm2_policypcr")?;
+    policypcr.arg("-S").arg(session_path).arg("-l").arg(pcrs);
+    run_command(policypcr, "apply tpm pcr policy")?;
+    Ok(())
 }
 
 fn sealed_object_artifact_paths(base_path: &Path) -> (PathBuf, PathBuf) {
@@ -797,8 +873,11 @@ impl TestTpmHarness {
             "tpm2_quote",
             "tpm2_checkquote",
             "tpm2_createprimary",
+            "tpm2_createpolicy",
             "tpm2_create",
             "tpm2_load",
+            "tpm2_startauthsession",
+            "tpm2_policypcr",
             "tpm2_unseal",
             "tpm2_flushcontext",
         ] {
@@ -1054,10 +1133,31 @@ case "$tool" in
     done
     printf 'primary' > "$context"
     ;;
+  tpm2_createpolicy)
+    policy=
+    pcr_list=
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -L)
+          policy="$2"
+          shift 2
+          ;;
+        -l)
+          pcr_list="$2"
+          shift 2
+          ;;
+        *)
+          shift
+          ;;
+      esac
+    done
+    printf '%s' "$pcr_list" > "$policy"
+    ;;
   tpm2_create)
     public=
     private=
     input=
+    policy=
     while [ "$#" -gt 0 ]; do
       case "$1" in
         -u)
@@ -1072,6 +1172,10 @@ case "$tool" in
           input="$2"
           shift 2
           ;;
+        -L)
+          policy="$2"
+          shift 2
+          ;;
         *)
           shift
           ;;
@@ -1079,6 +1183,9 @@ case "$tool" in
     done
     printf 'public' > "$public"
     cat "$input" > "$private"
+    if [ -n "$policy" ]; then
+      cat "$policy" > "$private.policy"
+    fi
     ;;
   tpm2_load)
     private=
@@ -1099,13 +1206,16 @@ case "$tool" in
       esac
     done
     cat "$private" > "$context"
+    if [ -f "$private.policy" ]; then
+      cat "$private.policy" > "$context.policy"
+    fi
     ;;
-  tpm2_unseal)
-    context=
+  tpm2_startauthsession)
+    session=
     while [ "$#" -gt 0 ]; do
       case "$1" in
-        -c)
-          context="$2"
+        -S)
+          session="$2"
           shift 2
           ;;
         *)
@@ -1113,9 +1223,62 @@ case "$tool" in
           ;;
       esac
     done
+    : > "$session"
+    ;;
+  tpm2_policypcr)
+    session=
+    pcr_list=
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -S)
+          session="$2"
+          shift 2
+          ;;
+        -l)
+          pcr_list="$2"
+          shift 2
+          ;;
+        *)
+          shift
+          ;;
+      esac
+    done
+    printf '%s' "$pcr_list" > "$session.policy"
+    ;;
+  tpm2_unseal)
+    context=
+    auth=
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -c)
+          context="$2"
+          shift 2
+          ;;
+        -p)
+          auth="$2"
+          shift 2
+          ;;
+        *)
+          shift
+          ;;
+      esac
+    done
+    if [ -f "$context.policy" ]; then
+      case "$auth" in
+        session:*)
+          session_ctx="${{auth#session:}}"
+          ;;
+        *)
+          exit 1
+          ;;
+      esac
+      [ -f "$session_ctx.policy" ] || exit 1
+      [ "$(cat "$session_ctx.policy")" = "$(cat "$context.policy")" ] || exit 1
+    fi
     cat "$context"
     ;;
   tpm2_flushcontext)
+    rm -f "$1.policy"
     exit 0
     ;;
 esac
@@ -1141,6 +1304,7 @@ mod tests {
         let security = SecurityConfig {
             linux_tpm_tools_dir: Some(harness.tools_dir),
             linux_tpm_device_path: Some(harness.device_path),
+            linux_tpm_master_key_pcrs: Some("sha256:0,7".to_string()),
             linux_tpm_attestation_ak_path: Some(env::temp_dir().join("aegis-attestation-ak")),
             linux_tpm_attestation_pcrs: Some("sha256:0,7".to_string()),
             linux_tpm_master_key_nv_index: Some("0x1500016".to_string()),
@@ -1151,6 +1315,7 @@ mod tests {
         let runtime = detect_linux_tpm_runtime(&security);
         assert!(runtime.available());
         assert!(runtime.attestation_enabled());
+        assert!(runtime.policy_session_available());
         assert!(runtime.master_key_enabled());
         assert!(runtime.rollback_enabled());
     }
@@ -1232,6 +1397,56 @@ mod tests {
 
         assert_eq!(first.len(), 32);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn master_key_round_trips_through_tpm_policy_sealed_object() {
+        let harness = TestTpmHarness::install("master-key-policy-sealed");
+        let sealed_root = env::temp_dir().join("aegis-master-key-policy-sealed");
+        let security = SecurityConfig {
+            linux_tpm_tools_dir: Some(harness.tools_dir),
+            linux_tpm_device_path: Some(harness.device_path),
+            linux_tpm_master_key_sealed_object_path: Some(sealed_root.join("master-key")),
+            linux_tpm_master_key_pcrs: Some("sha256:0,7".to_string()),
+            ..SecurityConfig::default()
+        };
+
+        let first =
+            load_or_initialize_master_key_from_tpm(&security).expect("provision policy master key");
+        let second =
+            load_or_initialize_master_key_from_tpm(&security).expect("reload policy master key");
+
+        assert_eq!(first.len(), 32);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn master_key_policy_rejects_wrong_pcrs() {
+        let harness = TestTpmHarness::install("master-key-policy-reject");
+        let sealed_root = env::temp_dir().join("aegis-master-key-policy-reject");
+        let security = SecurityConfig {
+            linux_tpm_tools_dir: Some(harness.tools_dir.clone()),
+            linux_tpm_device_path: Some(harness.device_path.clone()),
+            linux_tpm_master_key_sealed_object_path: Some(sealed_root.join("master-key")),
+            linux_tpm_master_key_pcrs: Some("sha256:0,7".to_string()),
+            ..SecurityConfig::default()
+        };
+
+        let first =
+            load_or_initialize_master_key_from_tpm(&security).expect("provision policy master key");
+        assert_eq!(first.len(), 32);
+
+        let wrong_security = SecurityConfig {
+            linux_tpm_tools_dir: Some(harness.tools_dir),
+            linux_tpm_device_path: Some(harness.device_path),
+            linux_tpm_master_key_sealed_object_path: Some(sealed_root.join("master-key")),
+            linux_tpm_master_key_pcrs: Some("sha256:0,8".to_string()),
+            ..SecurityConfig::default()
+        };
+
+        let error = load_or_initialize_master_key_from_tpm(&wrong_security)
+            .expect_err("wrong pcrs should reject unseal");
+        assert!(error.to_string().contains("unseal tpm master key failed"));
     }
 
     #[test]
