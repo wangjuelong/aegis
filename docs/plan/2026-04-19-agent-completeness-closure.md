@@ -132,6 +132,10 @@ cargo test --workspace
 
 ### C02：下行命令、持久化重放防护与高危执行链
 
+**状态**
+
+- `done`（2026-04-19，代码提交：`ba818b8`）
+
 **目标**
 
 - 建立 `comms-rx`、持久化 replay ledger、命令验证、ACK 生成以及对 `ResponseExecutor` / `ApprovalQueue` / `RemoteShellRuntime` / `PlaybookRuntime` / `SessionLockRuntime` 的执行桥接。
@@ -160,6 +164,35 @@ cargo test --workspace
   - 重放命令被拒绝
   - 高危命令在审批不足时被拒绝
   - Remote Shell / Playbook / Session Lock 至少一条真实执行链可打通
+
+**本次实际落地**
+
+- 实际改动文件收敛为：
+  - `crates/aegis-core/src/comms.rs`
+  - `crates/aegis-core/src/orchestrator.rs`
+  - `crates/aegis-agentd/src/main.rs`
+- `TransportDriver` 已补齐 downlink 轮询接口，`CommunicationRuntime` 新增 `poll_downlink`、loopback 注入/回收句柄与测试支撑，不再只有 uplink 回退状态机。
+- `CommandReplayLedger` 已从进程内 `HashMap` 升级为 sqlite 持久化账本，进程重启后仍可拒绝命令重放。
+- 主运行时新增 `comms-rx` 后台任务与 `CommandExecutionRuntime`，打通 `SignedServerCommand -> validate -> execute -> ClientAck` 闭环。
+- 已将 `kill-process`、`quarantine-file`、`network-isolate`、`remote-shell`、`playbook`、`session-lock` 映射到真实执行桥接，其中高危路径通过 `ApprovalQueue` / `RemoteShellRuntime` / `PlaybookRuntime` / `SessionLockRuntime` 落地。
+- 新增闭环测试：
+  - `communication_runtime_polls_loopback_downlink_and_records_uplink`
+  - `command_replay_ledger_persists_across_reopen`
+  - `runtime_accepts_kill_command_and_rejects_replay`
+  - `runtime_rejects_remote_shell_without_required_approvers`
+  - `runtime_executes_session_lock_command`
+
+**验证**
+
+```bash
+cargo fmt --all
+cargo test --workspace
+```
+
+**完成后仍保留的后续项**
+
+- `C03` 负责将插件宿主从 wasm 文件校验器升级为真实 `wasmtime` 沙箱。
+- `C04` 负责将 watchdog / updater / diagnose 与运行态状态快照绑定。
 
 ### C03：真实 `wasmtime` 插件宿主
 
