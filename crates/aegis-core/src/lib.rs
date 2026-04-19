@@ -1,4 +1,5 @@
 pub mod adaptive_whitelist;
+pub mod amsi;
 pub mod config;
 pub mod dispatch;
 pub mod error;
@@ -10,5 +11,7 @@ pub mod orchestrator;
 pub mod process_tree;
 pub mod ring_buffer;
 pub mod rule_vm;
+pub mod script_decode;
 pub mod spill;
 pub mod temporal;
+pub mod yara;
