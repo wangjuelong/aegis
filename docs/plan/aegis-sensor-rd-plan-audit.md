@@ -33,8 +33,8 @@
 - 传输栈 loopback/demo 化缺口已由 C05（提交 `7961edd`）收口
 - 主密钥 provider、rollback floor、敏感内存强化与 `key_protection` 诊断状态已由 C06（提交 `dccb1ce`）收口
 - `TelemetryWal` / `ForensicJournal` 的 ACK-gated replay、待确认窗口与 `replay` 诊断状态已由 C07（提交 `3e34dcc`）收口
-- 但仓库内仍然存在未闭合项：
-  - `upload_artifact` / `pull_update` 仍停留在 proto / driver 测试层，未进入 agent 运行时闭环
+- `upload_artifact` / `pull_update`、`update-state.json` 生命周期状态与 updater/`--diagnose` 共享状态面已由 C08（提交 `99ef1a0`）收口
+- 至此，第三轮在当前仓库内可闭合的 agent 差距已全部收口
 - 平台真实内核/系统集成与 TPM/Secure Enclave 绑定仍属于外部工程
 
 ## 2. 审计方法
@@ -118,25 +118,23 @@
 
 ### 5.1 功能缺失
 
-从“计划覆盖”维度看，终态能力项仍在研发文档中；但从“仓库代码实现”维度看，在 `C07` 完成后，剩余缺失仍包含明确的仓内研发项：
+从“计划覆盖”维度看，终态能力项仍在研发文档中；但从“仓库代码实现”维度看，在 `C08` 完成后，**仓库内已无新的 agent 研发缺口**。当前仍未落地的仅剩仓库外部工程：
 
-- `upload_artifact` / `pull_update` 仍未进入运行时任务闭环
 - 三平台真实内核/系统集成未落地
 - TPM / Secure Enclave / OS keystore 的正式硬件绑定仍未落地
 
 ### 5.2 功能妥协
 
-当前主要妥协已从第一轮的“骨架化闭环”收缩，但仍存在两类事实妥协：
+当前主要妥协已从第一轮的“骨架化闭环”收缩到仓库边界本身。当前事实妥协只剩：
 
-- 仓库内仍有正式链路未闭合：升级产物传输链
-- 驱动 / System Extension / eBPF/LSM 等系统级集成与硬件根信任仍未进入当前仓库
+- 驱动 / System Extension / eBPF/LSM 等系统级集成仍未进入当前仓库
+- TPM / Secure Enclave / OS keystore 的正式硬件根信任仍未进入当前仓库
 
 ### 5.3 设计妥协
 
 设计上保留了终态目标，但实现层仍存在以下事实上的降级：
 
 - 真实平台集成仍降为 in-memory provider 注入
-- 升级传输链仍未进入主运行时，只完成了 proto 与最小测试服务
 - 真实高危执行仍未进入跨平台系统级强制执行面
 
 ## 6. 收口计划
@@ -145,7 +143,7 @@
 
 - `docs/plan/2026-04-19-agent-round3-closure.md`
 
-该计划将第三轮仓库内可闭合工作扩展为 `C05-C08` 四个工作包。当前 `C05-C07` 已完成；`C08` 继续收口升级传输主链，直到仓库内可落地差距不再残留。
+该计划将第三轮仓库内可闭合工作扩展为 `C05-C08` 四个工作包。当前 `C05-C08` 已全部完成，且重新复核后不再发现新的仓库内 agent 完整性研发项。
 
 ## 7. 剩余说明
 

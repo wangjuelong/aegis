@@ -250,6 +250,26 @@
   - rollback artifact 缺失会阻断高风险升级
   - `aegis-updater` / `aegis-agentd --diagnose` 输出一致的升级状态
 
+**完成记录（2026-04-19）**
+
+- 已通过提交 `99ef1a0` 完成代码收口：
+  - `health-reporter` 现在会消费 heartbeat 返回的升级公告，并将 `pending_update_ids` / `config_changed` 正式写入共享 `update-state.json`
+  - 新增 `update-manager` 主任务，负责真实执行 `pull_update`、分段组装 manifest / artifact / rollback artifact、签名与 digest 校验、兼容性规划与阶段状态持久化
+  - `upload_artifact` 已不再停留在 proto / 驱动测试层，而是作为升级状态回执通道，由运行时把终态 `update-state` 回传到控制平面
+  - `aegis-updater` 不再伪造本地 staged 包；现在仅消费真实 staged manifest / artifact / rollback，并把 `Verifying` / `Ready` / `Rejected` 状态写回同一份快照
+  - `aegis-agentd --diagnose` 现在会直接读取正式 `update-state.json`，输出 `phase`、`pending_update_ids`、`transport_channel`、staged 路径、重试计数、最近错误与最近成功时间
+  - 新增运行时测试覆盖升级 Ready/Failed 两条主路径，明确验证 rollback artifact 缺失会阻断升级
+- 已通过以下验证：
+  - `cargo fmt --all`
+  - `cargo test --workspace`
+  - `AEGIS_STATE_ROOT=$(mktemp -d) cargo run -p aegis-agentd -- --diagnose`
+- 本工作包完成后，第三轮在当前仓库内可闭合的 agent 完整性缺口已全部收口
+
+**本工作包完成后仍明确保留的边界**
+
+- 三平台真实内核/系统集成仍属于仓库外部工程
+- TPM / Secure Enclave / 正式硬件绑定仍属于外部工程，本轮仅完成仓库内受控降级与状态诚实化
+
 ## 4. 执行与提交要求
 
 每个工作包按以下节奏执行：

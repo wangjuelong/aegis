@@ -69,4 +69,4 @@
 | C05 | 传输栈正式化 | done | 已由 `7961edd` 正式接入配置化通信运行时、四类真实驱动、统一 transport proto、批量遥测/告警上行、`BatchAck` 与流控落地，并通过 `cargo test --workspace` 与 `cargo run -p aegis-agentd -- --diagnose` |
 | C06 | 密钥保护、回滚保护与敏感内存强化 | done | 已由 `dccb1ce` 接入主密钥 provider、rollback floor、敏感内存锁页/零化与 `key_protection` 诊断状态，并通过 `cargo test --workspace` 与 `cargo run -p aegis-agentd -- --diagnose` |
 | C07 | WAL / Journal ACK-gated replay 正式闭环 | done | 已由 `3e34dcc` 打通 `PendingBatchStore` / `uplink-replay`、统一 ACK-gated `sequence_id` 前沿、`replay` 诊断输出与响应审计 `ForensicJournal` 关联，并通过 `cargo test --workspace` 与 `cargo run -p aegis-agentd -- --diagnose` |
-| C08 | 升级产物传输与运行时更新闭环 | doing | 当前仅剩将 `upload_artifact` / `pull_update` 纳入 agent / updater 主运行时与诊断状态面 |
+| C08 | 升级产物传输与运行时更新闭环 | done | 已由 `99ef1a0` 打通 heartbeat 升级公告、`update-manager` 主任务、真实 `pull_update` / `upload_artifact` 闭环、`update-state.json` 生命周期状态与 updater/`--diagnose` 共享状态面，并通过 `cargo test --workspace` 与 `AEGIS_STATE_ROOT=$(mktemp -d) cargo run -p aegis-agentd -- --diagnose` |
