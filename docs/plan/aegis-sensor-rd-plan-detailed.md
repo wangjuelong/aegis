@@ -448,6 +448,12 @@
   - 建立高水位降级与 `PARTIAL` 完整性标记
 - 验收：
   - 测试覆盖 WAL 回放、满载降级和 `PARTIAL` 标记传播
+- 完成记录（2026-04-19）：
+  - 已建立 `TelemetryWal`，支持分段写入、顺序回放与压力感知摘要化
+  - 已建立 `ForensicJournal`，覆盖 Evidence Zone 与 Action Log Zone 分区容量控制
+  - 已建立 `EmergencyAuditRing` 与 `ForensicPersistenceCoordinator`，支持轻量响应审计保底落盘路径
+  - 已建立高水位降级策略与 `TelemetryReplayResult` 的 `PARTIAL` 完整性传播
+  - 已通过 WAL 回放、Journal 满载、审计环回退与 `PARTIAL` 标记传播测试
 
 ### P24：Upgrade / Migration / Canary Gate / Diagnose
 

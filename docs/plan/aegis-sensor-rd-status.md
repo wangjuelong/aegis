@@ -33,8 +33,8 @@
 | P20 | Remote Shell / Session Lock / Approval Queue | done | 已建立审批队列、远程 shell 约束、playbook 与会话锁定审计模型 |
 | P21 | Self-Protection / Keys / Crash Exploit Analysis | done | 已建立自保护状态机、密钥派生、证书生命周期 hook 与崩溃可利用性分析 |
 | P22 | Comms / SignedCommand / ApprovalProof | done | 已建立传输消息模型、签名命令验签、scope 校验、重放账本与审批证明校验 |
-| P23 | WAL / Forensic Journal / Emergency Audit Ring | doing | 当前进入 WAL、取证日志与紧急审计环实现 |
-| P24 | Upgrade / Migration / Canary Gate / Diagnose | todo | 依赖 P02/P22/P23 |
+| P23 | WAL / Forensic Journal / Emergency Audit Ring | done | 已建立 Telemetry WAL、Forensic Journal、Emergency Audit Ring 与 PARTIAL 完整性传播 |
+| P24 | Upgrade / Migration / Canary Gate / Diagnose | doing | 当前进入升级计划、灰度门控与诊断输出实现 |
 | P25 | Container Host Agent / Sidecar Lite | todo | 依赖 P09/P16/P22 |
 | P26 | Runtime SDK / Cloud API Connector | todo | 依赖 P22 |
 | P27 | QE / Pilot / Merge / Release | todo | 依赖 P00-P26 |
