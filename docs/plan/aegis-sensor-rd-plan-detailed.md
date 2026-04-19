@@ -405,6 +405,12 @@
   - 建立 crash triage 与 exploit suspicion 规则
 - 验收：
   - 测试覆盖密钥派生、自保护策略和崩溃可疑性判定
+- 完成记录（2026-04-19）：
+  - 已建立 `SelfProtectionManager`，支持关键进程/文件保护名单、篡改计数与防护姿态切换
+  - 已建立 `KeyDerivationService`，支持租户、Agent 与用途维度的派生密钥生成
+  - 已建立 `CertificateLifecycleHooks`，覆盖证书签发、轮换、吊销与生命周期审计
+  - 已建立 `CrashExploitAnalyzer`，支持崩溃 triage 与 exploit suspicion 规则判定
+  - 已通过自保护策略、密钥派生、证书生命周期与崩溃可疑性测试
 
 ### P22：Comms / SignedCommand / ApprovalProof
 

@@ -31,8 +31,8 @@
 | P18 | Block Decision / Network Isolate / Firewall | done | 已建立 TTL 阻断映射、隔离策略与 break-glass 审计测试 |
 | P19 | Registry / Filesystem Rollback / Forensics | done | 已建立回滚计划、文件恢复、证据链与取证归档测试 |
 | P20 | Remote Shell / Session Lock / Approval Queue | done | 已建立审批队列、远程 shell 约束、playbook 与会话锁定审计模型 |
-| P21 | Self-Protection / Keys / Crash Exploit Analysis | doing | 当前进入自保护、密钥派生与崩溃分析基线实现 |
-| P22 | Comms / SignedCommand / ApprovalProof | todo | 依赖 P03-P04 |
+| P21 | Self-Protection / Keys / Crash Exploit Analysis | done | 已建立自保护状态机、密钥派生、证书生命周期 hook 与崩溃可利用性分析 |
+| P22 | Comms / SignedCommand / ApprovalProof | doing | 当前进入通信主线、签名命令与审批证明校验实现 |
 | P23 | WAL / Forensic Journal / Emergency Audit Ring | todo | 依赖 P22 |
 | P24 | Upgrade / Migration / Canary Gate / Diagnose | todo | 依赖 P02/P22/P23 |
 | P25 | Container Host Agent / Sidecar Lite | todo | 依赖 P09/P16/P22 |
