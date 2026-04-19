@@ -67,4 +67,6 @@
 | 工作包 | 名称 | 状态 | 备注 |
 |--------|------|------|------|
 | C05 | 传输栈正式化 | done | 已由 `7961edd` 正式接入配置化通信运行时、四类真实驱动、统一 transport proto、批量遥测/告警上行、`BatchAck` 与流控落地，并通过 `cargo test --workspace` 与 `cargo run -p aegis-agentd -- --diagnose` |
-| C06 | 密钥保护、回滚保护与敏感内存强化 | doing | 下一步将主密钥 provider、rollback floor、敏感内存强化与诊断状态面真正落地 |
+| C06 | 密钥保护、回滚保护与敏感内存强化 | done | 已由 `dccb1ce` 接入主密钥 provider、rollback floor、敏感内存锁页/零化与 `key_protection` 诊断状态，并通过 `cargo test --workspace` 与 `cargo run -p aegis-agentd -- --diagnose` |
+| C07 | WAL / Journal ACK-gated replay 正式闭环 | doing | 下一步需要让 `sequence_id` 与 WAL/Journal 的确认、重试、回放完全受 `BatchAck` 驱动 |
+| C08 | 升级产物传输与运行时更新闭环 | todo | 当前 proto/driver 已在，但尚未纳入 agent/updater 主运行时闭环 |

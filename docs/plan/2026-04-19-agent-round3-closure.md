@@ -137,6 +137,93 @@
   - rollback floor 能拒绝回滚后的旧命令
   - 降级环境能被显式标记并写入状态输出
 
+**完成记录（2026-04-19）**
+
+- 已通过提交 `dccb1ce` 完成代码收口：
+  - 为 `AgentConfig` 新增 `security` 配置，统一控制 OS 凭据存储、文件后备与敏感内存锁定策略
+  - `KeyDerivationService` 已接入正式主密钥加载路径，支持 OS Credential Store 优先、文件后备降级与状态输出
+  - `DerivedKeyMaterial` 已增加 `zeroize` 用后清理；敏感主密钥缓冲新增 `mlock/munlock` 最佳努力锁页
+  - `CommandReplayLedger` 已增加 `issued_at` rollback floor、持久化锚点与交叉校验状态
+  - `--diagnose` 已新增 `key_protection` 输出，并改为读取真实 WAL / rollback 状态，不再使用静态占位值
+  - `aegis-agentd` 的 `self_protection_posture` 已改为基于当前密钥/回滚降级状态推导
+- 已通过以下验证：
+  - `cargo fmt --all`
+  - `cargo test --workspace`
+  - `AEGIS_STATE_ROOT=$(mktemp -d) cargo run -p aegis-agentd -- --diagnose`
+- 本轮诊断快照已能显示以下真实字段：
+  - `key_protection.active_tier`
+  - `key_protection.memory_lock_enabled`
+  - `key_protection.rollback_anchor`
+  - `key_protection.rollback_cross_check_ok`
+  - `wal.key_version`
+  - `self_protection_posture`
+
+**本工作包完成后仍明确保留的差距**
+
+- `TelemetryWal` / `ForensicJournal` 仍未进入 ACK-gated retry / replay 闭环
+- `upload_artifact` / `pull_update` 虽已有 proto/driver/test service，但尚未纳入 agent 运行时主任务闭环
+- TPM / Secure Enclave / 正式硬件绑定仍属于外部工程，本轮仅完成仓库内受控降级与状态诚实化
+
+### C07：WAL / Journal ACK-gated replay 正式闭环
+
+**目标**
+
+- 将 `TelemetryWal` / `ForensicJournal` 从“可独立读写”升级为“受 ACK 驱动的传输重放层”。
+- 让 `sequence_id`、重放窗口、失败重试与完整性标记遵循服务端 `BatchAck::Accepted` 语义，而不是本地发送即前推。
+
+**代码范围**
+
+- `crates/aegis-core/src/comms.rs`
+- `crates/aegis-core/src/orchestrator.rs`
+- `crates/aegis-core/src/wal.rs`
+- `crates/aegis-agentd/src/main.rs`
+- 相关测试与状态文档
+
+**交付**
+
+- `sequence_id` 仅在服务端接受后推进
+- 正常遥测、告警与重放队列共享统一 ACK / retry 语义
+- WAL 回放结果与 `TelemetryIntegrity`、重试状态、未确认窗口在诊断面可见
+- `ForensicJournal` 与高危动作审计具备正式落盘与回放关联
+
+**验收**
+
+- 单测或集成测试覆盖：
+  - 重试场景不会重复前推 `sequence_id`
+  - `BatchAck::Accepted` 后 WAL 项会被确认并退出待重放窗口
+  - 未确认或拒绝的批次会保留在重放队列
+  - 诊断面能展示待确认窗口与 replay 状态
+
+### C08：升级产物传输与运行时更新闭环
+
+**目标**
+
+- 将 `upload_artifact` / `pull_update` 从 proto / 驱动测试升级为 agent 运行时真实闭环。
+- 让 updater、runtime state、诊断面和控制平面传输状态共享同一条升级主链。
+
+**代码范围**
+
+- `crates/aegis-core/src/orchestrator.rs`
+- `crates/aegis-core/src/transport_drivers.rs`
+- `crates/aegis-core/src/upgrade.rs`
+- `crates/aegis-updater/src/main.rs`
+- `crates/aegis-agentd/src/main.rs`
+- 相关测试与状态文档
+
+**交付**
+
+- 运行时可正式拉取 update manifest / artifact / rollback artifact
+- updater 状态快照与 `--diagnose` 输出真实同步到当前升级阶段
+- 失败重试、校验失败、rollback artifact 缺失等错误有明确状态面
+
+**验收**
+
+- 单测或集成测试覆盖：
+  - update transport 能拉取 manifest 与 artifact
+  - 校验失败时会进入受控拒绝状态
+  - rollback artifact 缺失会阻断高风险升级
+  - `aegis-updater` / `aegis-agentd --diagnose` 输出一致的升级状态
+
 ## 4. 执行与提交要求
 
 每个工作包按以下节奏执行：
@@ -162,7 +249,7 @@ cargo test --workspace comms
 
 只有同时满足以下条件，才能认为本轮完成：
 
-- `C05-C06` 均已完成代码、测试、文档与中文提交
+- `C05-C08` 均已完成代码、测试、文档与中文提交
 - `docs/plan/aegis-sensor-rd-plan-audit.md` 的本轮审计结论不再把仓库内可落地项留在“外部工程”
 - `docs/plan/aegis-sensor-rd-status.md` 与本轮实际状态一致
 - 重新执行第一步审计后，不再发现新的仓库内 agent 完整性缺口

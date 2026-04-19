@@ -31,8 +31,8 @@
 - 插件宿主此前仍不是 `wasmtime` 沙箱，只是 wasm 文件校验器；该缺口已由 C03（提交 `4035bd2`）收口
 - `watchdog`、`updater`、`--diagnose` 的 demo/静态拼装缺口已由 C04（提交 `88c6de2`）收口
 - 传输栈 loopback/demo 化缺口已由 C05（提交 `7961edd`）收口
+- 主密钥 provider、rollback floor、敏感内存强化与 `key_protection` 诊断状态已由 C06（提交 `dccb1ce`）收口
 - 但仓库内仍然存在未闭合项：
-  - 主密钥 provider、rollback floor 与敏感内存强化尚未真正接线
   - `TelemetryWal` / `ForensicJournal` 还没有进入 ACK-gated retry / replay 闭环
   - `upload_artifact` / `pull_update` 仍停留在 proto / driver 测试层，未进入 agent 运行时闭环
 - 平台真实内核/系统集成与 TPM/Secure Enclave 绑定仍属于外部工程
@@ -118,9 +118,8 @@
 
 ### 5.1 功能缺失
 
-从“计划覆盖”维度看，终态能力项仍在研发文档中；但从“仓库代码实现”维度看，在 `C05` 完成后，剩余缺失**不只**在外部工程边界，仍包含明确的仓内研发项：
+从“计划覆盖”维度看，终态能力项仍在研发文档中；但从“仓库代码实现”维度看，在 `C06` 完成后，剩余缺失仍包含明确的仓内研发项：
 
-- 主密钥 provider、OS keystore/硬件绑定层级表达、rollback floor 与敏感内存强化未落地
 - `TelemetryWal` / `ForensicJournal` 尚未与传输 ACK / replay 正式接线
 - `upload_artifact` / `pull_update` 仍未进入运行时任务闭环
 - 三平台真实内核/系统集成未落地
@@ -130,7 +129,7 @@
 
 当前主要妥协已从第一轮的“骨架化闭环”收缩，但仍存在两类事实妥协：
 
-- 仓库内仍有正式链路未闭合：密钥保护、rollback floor、WAL/Journal 的 ACK-gated replay、升级产物传输链
+- 仓库内仍有正式链路未闭合：WAL/Journal 的 ACK-gated replay、升级产物传输链
 - 驱动 / System Extension / eBPF/LSM 等系统级集成与硬件根信任仍未进入当前仓库
 
 ### 5.3 设计妥协
@@ -148,7 +147,7 @@
 
 - `docs/plan/2026-04-19-agent-round3-closure.md`
 
-该计划将第三轮仓库内可闭合工作拆分为 `C05-C06` 两个工作包。当前 `C05` 已完成，`C06` 正在执行；待 `C06` 完成后，还需要重新复核 ACK/replay 与升级传输链是否需要继续拆包，直到仓库内可落地差距不再残留。
+该计划将第三轮仓库内可闭合工作扩展为 `C05-C08` 四个工作包。当前 `C05-C06` 已完成；`C07-C08` 继续收口 ACK/replay 与升级传输主链，直到仓库内可落地差距不再残留。
 
 ## 7. 剩余说明
 
