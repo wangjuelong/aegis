@@ -121,7 +121,7 @@ async fn main() -> Result<()> {
         "aegis-agentd runtime bootstrapped"
     );
 
-    let runtime = orchestrator.start(artifacts);
+    let runtime = orchestrator.start(artifacts)?;
     tokio::signal::ctrl_c().await?;
     let stopped_tasks = runtime.graceful_shutdown(shutdown_grace_period).await?;
 
