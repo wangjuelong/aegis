@@ -8,7 +8,8 @@ use aegis_core::upgrade::{
     DiagnoseCertificateStatus, DiagnoseCollector, DiagnoseSensorStatus, DiagnoseWalStatus,
 };
 use aegis_model::{
-    AgentSupervisorHeartbeat, LineageCounters, RuntimeHealthSignals, TelemetryIntegrity,
+    AgentSupervisorHeartbeat, LineageCounters, PluginHealthStatus, RuntimeHealthSignals,
+    TelemetryIntegrity,
 };
 use anyhow::Result;
 use std::collections::BTreeMap;
@@ -24,7 +25,7 @@ async fn main() -> Result<()> {
             .summary
             .runtime_bridge;
         let communication = CommunicationRuntime::with_loopback_drivers(3).snapshot();
-        let plugin_status = PluginHost::default().statuses();
+        let plugin_status = collect_plugin_status(&config);
         let health = HealthReporter::build_snapshot(
             "0.1.0",
             &format!("bundle-{}", config.policy_version.policy_bundle),
@@ -94,10 +95,10 @@ async fn main() -> Result<()> {
 
     let config = AppConfig::default();
     let shutdown_grace_period = config.shutdown_grace_period();
-    let orchestrator = Orchestrator::new(config);
+    let orchestrator = Orchestrator::new(config.clone());
     let artifacts = orchestrator.bootstrap()?;
     let summary = &artifacts.summary;
-    let plugin_status = PluginHost::default().statuses();
+    let plugin_status = collect_plugin_status(&config);
     let supervisor_heartbeat = AgentSupervisorHeartbeat {
         tenant_id: summary.tenant_id.clone(),
         agent_id: summary.agent_id.clone(),
@@ -135,4 +136,18 @@ fn now_unix_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .expect("system time before unix epoch")
         .as_millis() as i64
+}
+
+fn collect_plugin_status(config: &AppConfig) -> Vec<PluginHealthStatus> {
+    let mut plugin_host = PluginHost::default();
+    let manifest_root = config.storage.state_root.join("plugins");
+    if let Err(error) = plugin_host.load_manifests_from_dir(&manifest_root) {
+        return vec![PluginHealthStatus {
+            plugin_id: "__plugin_host__".to_string(),
+            healthy: false,
+            state: format!("load_error: {error}"),
+            crash_count: 1,
+        }];
+    }
+    plugin_host.run_all_once()
 }
