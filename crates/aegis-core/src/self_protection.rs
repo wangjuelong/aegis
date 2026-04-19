@@ -1,9 +1,10 @@
 use aegis_model::Severity;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum TamperSignal {
     IntegrityFailure,
     UnsignedModule,
@@ -11,7 +12,7 @@ pub enum TamperSignal {
     MemoryWrite,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ProtectionPosture {
     Normal,
     Hardened,

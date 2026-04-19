@@ -25,5 +25,6 @@ pub mod specialized_detection;
 pub mod spill;
 pub mod surface_monitor;
 pub mod temporal;
+pub mod upgrade;
 pub mod wal;
 pub mod yara;

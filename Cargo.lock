@@ -7,7 +7,9 @@ name = "aegis-agentd"
 version = "0.1.0"
 dependencies = [
  "aegis-core",
+ "aegis-model",
  "anyhow",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
