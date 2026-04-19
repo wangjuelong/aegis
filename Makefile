@@ -8,4 +8,3 @@ check:
 
 test:
 	cargo test --workspace
-
