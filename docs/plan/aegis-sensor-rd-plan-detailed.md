@@ -510,6 +510,12 @@
   - 建立最小接入示例与契约测试
 - 验收：
   - 测试覆盖 SDK 事件编码、connector 映射和契约兼容性
+- 完成记录（2026-04-19）：
+  - 已建立 `RuntimeSdkEvent` / `RuntimeHeartbeat` / `RuntimePolicyContract` 与 `CloudApiConnectorContract` 等共享契约
+  - 已建立 `RuntimeSdkEncoder`，支持运行时信号编码、契约版本校验与策略绑定校验
+  - 已建立 `CloudApiConnector` 与 `CloudConnectorBuffer`，覆盖 Cloud API 记录映射与游标缓冲
+  - 已建立 `crates/aegis-core/examples/runtime_sdk_connector.rs` 最小接入示例
+  - 已通过 SDK 事件编码、connector 映射、契约兼容性与示例运行验证
 
 ### P27：QE / Pilot / Merge / Release
 

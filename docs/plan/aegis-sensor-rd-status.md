@@ -36,5 +36,5 @@
 | P23 | WAL / Forensic Journal / Emergency Audit Ring | done | 已建立 Telemetry WAL、Forensic Journal、Emergency Audit Ring 与 PARTIAL 完整性传播 |
 | P24 | Upgrade / Migration / Canary Gate / Diagnose | done | 已建立升级计划、灰度门控、迁移协同与 `--diagnose` 诊断输出 |
 | P25 | Container Host Agent / Sidecar Lite | done | 已建立容器元数据映射、宿主机 DaemonSet / sidecar lite 契约与容器横移/逃逸检测测试 |
-| P26 | Runtime SDK / Cloud API Connector | doing | 当前进入 Runtime SDK 契约与云端 connector 映射实现 |
-| P27 | QE / Pilot / Merge / Release | todo | 依赖 P00-P26 |
+| P26 | Runtime SDK / Cloud API Connector | done | 已建立 Runtime SDK 契约、云端 connector 映射/缓冲接口与最小接入示例 |
+| P27 | QE / Pilot / Merge / Release | doing | 当前补齐测试矩阵、试点记录、发布说明并准备合并主线 |
