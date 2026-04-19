@@ -470,6 +470,12 @@
   - 建立 `--diagnose` 输出 bundle
 - 验收：
   - 测试覆盖 gate 判定、升级计划、diagnose bundle 生成
+- 完成记录（2026-04-19）：
+  - 已建立 `UpgradePlanner` 与 `UpgradePlan`，覆盖升级步骤、schema/config 迁移判定与回滚元数据保留
+  - 已建立 `RolloutGateEvaluator`，支持基于健康指标、WAL 压力与自保护姿态的 canary gate 判定
+  - 已建立 `DiagnoseCollector` / `DiagnoseBundle`，输出连接、证书、Sensor、WAL、资源与自保护状态
+  - 已接通 `aegis-agentd --diagnose` 输出路径，并验证 JSON 诊断包可生成
+  - 已通过升级计划、灰度门控与诊断包生成测试
 
 ### P25：Container Host Agent / Sidecar Lite
 

@@ -34,7 +34,7 @@
 | P21 | Self-Protection / Keys / Crash Exploit Analysis | done | 已建立自保护状态机、密钥派生、证书生命周期 hook 与崩溃可利用性分析 |
 | P22 | Comms / SignedCommand / ApprovalProof | done | 已建立传输消息模型、签名命令验签、scope 校验、重放账本与审批证明校验 |
 | P23 | WAL / Forensic Journal / Emergency Audit Ring | done | 已建立 Telemetry WAL、Forensic Journal、Emergency Audit Ring 与 PARTIAL 完整性传播 |
-| P24 | Upgrade / Migration / Canary Gate / Diagnose | doing | 当前进入升级计划、灰度门控与诊断输出实现 |
-| P25 | Container Host Agent / Sidecar Lite | todo | 依赖 P09/P16/P22 |
+| P24 | Upgrade / Migration / Canary Gate / Diagnose | done | 已建立升级计划、灰度门控、迁移协同与 `--diagnose` 诊断输出 |
+| P25 | Container Host Agent / Sidecar Lite | doing | 当前进入容器宿主机观测与 sidecar lite 契约实现 |
 | P26 | Runtime SDK / Cloud API Connector | todo | 依赖 P22 |
 | P27 | QE / Pilot / Merge / Release | todo | 依赖 P00-P26 |
