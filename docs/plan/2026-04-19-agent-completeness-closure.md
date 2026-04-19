@@ -196,6 +196,10 @@ cargo test --workspace
 
 ### C03：真实 `wasmtime` 插件宿主
 
+**状态**
+
+- `done`（2026-04-19，代码提交：`4035bd2`）
+
 **目标**
 
 - 用真实 `wasmtime` 沙箱替换当前“只校验文件头/哈希”的伪宿主。
@@ -220,6 +224,36 @@ cargo test --workspace
   - 正常 wasm 插件成功执行
   - 死循环或超预算插件被中断并标记超时/失败
   - trap 导致 crash 计数递增并在阈值后禁用
+
+**本次实际落地**
+
+- 实际改动文件收敛为：
+  - `Cargo.toml`
+  - `Cargo.lock`
+  - `crates/aegis-core/Cargo.toml`
+  - `crates/aegis-core/src/plugin_host.rs`
+  - `crates/aegis-agentd/src/main.rs`
+- 默认插件执行器已从“只校验 wasm 头和哈希”升级为真实 `wasmtime` 宿主，支持模块编译校验、实例化以及导出 `run` 函数调用。
+- 插件运行加入 fuel 预算控制，死循环/超预算路径会映射为 `timed_out`，trap 与非零返回值映射为 `crashed`。
+- `PluginHost` 新增 manifest 目录装载与 `run_all_once`，支持从默认插件目录发现插件并收集真实运行状态。
+- `aegis-agentd` 的 `--diagnose` 与 supervisor heartbeat 已改为从默认插件目录收集插件状态，不再固定读取空宿主列表。
+- 新增真实 wasm 测试：
+  - `plugin_host_executes_real_wasm_module`
+  - `plugin_host_maps_wasm_trap_to_crash`
+  - `plugin_host_times_out_infinite_wasm_loop`
+  - `plugin_host_loads_manifests_from_directory`
+
+**验证**
+
+```bash
+cargo fmt --all
+cargo test --workspace
+cargo run -p aegis-agentd -- --diagnose
+```
+
+**完成后仍保留的后续项**
+
+- `C04` 负责将 watchdog / updater / diagnose 与真实状态快照、热更新清单和观测链路绑定。
 
 ### C04：watchdog、updater 与诊断面运行态化
 

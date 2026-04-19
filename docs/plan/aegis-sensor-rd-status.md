@@ -59,5 +59,5 @@
 |--------|------|------|------|
 | C01 | 运行时检测/决策/响应闭环 | done | 已打通 `sensor-dispatch -> detection-pool -> decision-router -> alert/response/telemetry`，并通过 `cargo test --workspace` |
 | C02 | 下行命令、持久化重放防护与高危执行链 | done | 已打通 `comms-rx -> validate -> execute -> ack`，并通过 `cargo test --workspace` |
-| C03 | 真实 `wasmtime` 插件宿主 | todo | 目标是替换当前仅校验 wasm 头/哈希的伪宿主 |
+| C03 | 真实 `wasmtime` 插件宿主 | done | 已落地真实 `wasmtime` 宿主、fuel 预算和目录发现，并通过 `cargo test --workspace` |
 | C04 | watchdog、updater 与诊断面运行态化 | todo | 目标是用真实状态快照替代 demo 程序与静态诊断输出 |
