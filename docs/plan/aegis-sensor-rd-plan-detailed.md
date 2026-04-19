@@ -322,6 +322,11 @@
   - 建立响应动作结果模型
 - 验收：
   - 测试覆盖 suspend→assess→kill、quarantine、审计落盘
+- 完成记录（2026-04-19）：
+  - 已建立 `ResponseExecutor`、`TerminationRequest` 与两阶段终止审计模型
+  - 已建立 `ResponseAuditLog`，支持响应动作 JSONL 审计落盘
+  - 已建立文件隔离执行与隔离凭据回填
+  - 已通过 suspend→assess→kill、quarantine 与审计落盘测试
 
 ### P18：Block Decision / Network Isolate / Firewall
 
