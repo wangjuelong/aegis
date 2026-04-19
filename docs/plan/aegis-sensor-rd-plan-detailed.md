@@ -554,3 +554,31 @@
 - P00-P27 每个工作包都必须同时满足：代码、测试、文档三类交付齐全。
 - 任何源文档能力项如果只建立目录/接口、没有形成可验证行为，不得标记完成。
 - P27 完成前，不得宣称“所有研发计划已完成”。
+
+## 5. Agent 缺口收口工作包
+
+### G00：缺口审计与执行基线重建
+
+- 目标：建立新的 gap 收口计划，纠正“agent 已完整实现”的失真状态。
+- 交付：
+  - `docs/plan/2026-04-19-agent-gap-closure.md`
+  - `docs/plan/aegis-sensor-rd-status.md`
+  - `docs/plan/aegis-sensor-rd-plan-audit.md`
+- 依赖：无
+- 完成记录（2026-04-19）：
+  - 已建立 G00-G06 收口工作包、验证命令与提交约束
+  - 已同步修正状态文档与审计结论，明确当前仍存在功能缺口与设计妥协
+
+### G01：高危操作执行链路加固
+
+- 目标：将审批队列、Remote Shell、Playbook、Session Lock 从占位实现提升为可执行运行时。
+- 交付：
+  - `crates/aegis-core/src/high_risk_ops.rs`
+  - `docs/plan/2026-04-19-agent-gap-closure.md`
+  - `docs/plan/aegis-sensor-rd-status.md`
+- 依赖：G00
+- 完成记录（2026-04-19）：
+  - 已建立支持内存/SQLite 双后端的审批队列，实现审批人去重、TTL、过期失效与持久化恢复
+  - 已建立 Remote Shell 会话管理器，实现单端点并发控制、工作时间窗、命令黑白名单、会话 TTL 与 asciicast 风格审计输出
+  - 已为 Playbook 增加执行次数限制，为 Session Lock 增加锁定/释放状态管理与可撤销路径
+  - 已新增对应单元测试，并通过 `cargo fmt --all` 与 `cargo test --workspace`
