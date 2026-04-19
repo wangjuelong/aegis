@@ -15,6 +15,7 @@ pub mod process_tree;
 pub mod ring_buffer;
 pub mod rule_vm;
 pub mod script_decode;
+pub mod specialized_detection;
 pub mod spill;
 pub mod temporal;
 pub mod yara;
