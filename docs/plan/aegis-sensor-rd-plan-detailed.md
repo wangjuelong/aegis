@@ -557,6 +557,12 @@
 
 ## 5. Agent 缺口收口工作包
 
+> 说明（2026-04-19 第二轮修订）：
+> `G00-G06` 已完成的是“第一轮基线收口”，其交付主要是原语、契约和基础接线，不等于当前仓库已经满足
+> `docs/技术方案/sensor-final技术解决方案.md` 与 `docs/architecture/aegis-sensor-architecture.md` 的最终实现要求。
+> 第二轮仓库内完整性收口基线改为 `docs/plan/2026-04-19-agent-completeness-closure.md`，后续以 `C01-C04`
+> 为准继续推进。
+
 ### G00：缺口审计与执行基线重建
 
 - 目标：建立新的 gap 收口计划，纠正“agent 已完整实现”的失真状态。

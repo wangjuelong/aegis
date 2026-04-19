@@ -5,6 +5,8 @@
 - `todo`：未开始
 - `doing`：进行中
 - `done`：已完成并提交代码、文档
+- `baseline`：仅完成原型、契约或基础接线，不等于最终闭环
+- `superseded`：已被新的执行基线替代
 
 ## 工作包状态
 
@@ -43,10 +45,19 @@
 
 | 工作包 | 名称 | 状态 | 备注 |
 |--------|------|------|------|
-| G00 | 缺口审计与执行基线重建 | done | 已建立新的 gap 收口计划并修正状态/审计基线 |
-| G01 | 高危操作执行链路加固 | done | 已交付持久化审批、Remote Shell 会话控制、Playbook/Session Lock 运行时与审计测试 |
-| G02 | 通信回退运行时与诊断扩展 | done | 已交付四级回退状态机、恢复探测、通信诊断字段与 `--diagnose` 实跑验证 |
-| G03 | WAL 加密、恢复与证据链加固 | done | 已交付加密 WAL/Journal、分级密钥派生、快照恢复校验与证据链反篡改验证 |
-| G04 | 插件宿主、Watchdog 与 Updater 热更新链路 | done | 已交付 WASM 插件宿主、热更新验签、回滚工件校验与 watchdog 心跳监测 |
-| G05 | 容器、Sidecar 与 Serverless 运行时接入 | done | 已交付 unix socket sidecar 控制面、RuntimeEventEmitter / CloudConnectorRunner、runtime-bridge 拓扑与 `runtime_bridge` 诊断映射 |
-| G06 | 平台执行基线收口 | done | 已交付平台动作快照、TTL 阻断表、隔离/取证落地、provider 健康快照及 core 侧真实联动测试 |
+| G00 | 缺口审计与执行基线重建 | baseline | 已完成第一轮 gap 文档基线，但结论仍然偏乐观 |
+| G01 | 高危操作执行链路加固 | baseline | 模块原语已具备，但尚未接入主运行时命令链 |
+| G02 | 通信回退运行时与诊断扩展 | baseline | 仅完成 uplink 回退与诊断字段基础版，未形成 downlink/执行闭环 |
+| G03 | WAL 加密、恢复与证据链加固 | baseline | 已有 WAL 加密与校验能力，但仍与文档中的硬件绑定/正式密钥契约不一致 |
+| G04 | 插件宿主、Watchdog 与 Updater 热更新链路 | baseline | 当前仍停留在 demo/伪宿主级别，需第二轮收口 |
+| G05 | 容器、Sidecar 与 Serverless 运行时接入 | baseline | 契约与桥接对象已在，但不属于本轮完整性收口重点 |
+| G06 | 平台执行基线收口 | baseline | 平台状态快照已存在，但真实内核/系统集成不在当前仓库内闭合 |
+
+## 第二轮 Agent 完整性收口状态
+
+| 工作包 | 名称 | 状态 | 备注 |
+|--------|------|------|------|
+| C01 | 运行时检测/决策/响应闭环 | todo | 目标是把 core 原语接成主运行时闭环 |
+| C02 | 下行命令、持久化重放防护与高危执行链 | todo | 目标是建立 `comms-rx -> validate -> execute -> ack` 闭环 |
+| C03 | 真实 `wasmtime` 插件宿主 | todo | 目标是替换当前仅校验 wasm 头/哈希的伪宿主 |
+| C04 | watchdog、updater 与诊断面运行态化 | todo | 目标是用真实状态快照替代 demo 程序与静态诊断输出 |
