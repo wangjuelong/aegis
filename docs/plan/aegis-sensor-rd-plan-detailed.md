@@ -135,6 +135,13 @@
   - ETW / Ps / Ob / Minifilter / WFP / CmCallback 适配层
   - AMSI / Direct Syscall / IPC / DLL / VSS / Device Control 接口骨架
 - 依赖：P07
+- 实施分解：
+  - 建立 `windows` 平台模块与子传感器注册表
+  - 抽象 ETW、进程、文件、网络、注册表、脚本、内存、IPC、模块加载、快照保护、设备控制 11 类 provider
+  - 建立 Windows 事件到 `RawSensorEvent` 的转换入口与能力矩阵
+- 验收：
+  - 单元测试覆盖 provider 注册、能力矩阵、关键事件转换
+  - 不依赖目标主机即可在本地通过 cargo test；集成环境参考 `docs/env/开发环境.md`
 
 ### P09：Linux 平台采集基线
 
@@ -144,6 +151,13 @@
   - maps/ringbuf 抽象
   - 4 级降级路径骨架
 - 依赖：P07
+- 实施分解：
+  - 建立 `linux` 平台模块与 eBPF 程序装载抽象
+  - 建立 process/file/network/auth/container 事件 provider 与 maps/ringbuf façade
+  - 建立完整能力、tracepoint、fanotify、audit、最小模式 4 级降级模型
+- 验收：
+  - 单元测试覆盖降级决策、provider 能力矩阵、容器感知转换
+  - 平台描述与 `degrade_levels=4` 保持一致
 
 ### P10：macOS 平台采集基线
 
@@ -151,6 +165,12 @@
 - 交付：
   - macOS 平台接口与授权流程抽象
 - 依赖：P07
+- 实施分解：
+  - 建立 `macos` 平台模块与 ESF / NE / System Extension 抽象
+  - 抽象授权状态机、事件订阅集与网络隔离入口
+  - 建立 macOS 事件到 `RawSensorEvent` 的转换入口
+- 验收：
+  - 单元测试覆盖授权状态流转、能力矩阵、事件转换
 
 ### P11：IOC / Rule VM / Temporal
 
@@ -160,6 +180,12 @@
   - Rule VM
   - Temporal state buffer
 - 依赖：P03、P04、P05
+- 实施分解：
+  - 建立 IOC tier 索引、精确命中确认与风险级别映射
+  - 建立规则字节码、栈式求值器、字段读取与布尔组合
+  - 建立 temporal 窗口状态缓存与多事件匹配
+- 验收：
+  - 测试覆盖 IOC 命中、规则执行、时间窗口命中与误报旁路
 
 ### P12：YARA / Script Decode / AMSI Interlock
 
@@ -169,6 +195,12 @@
   - 脚本多层解混淆
   - AMSI fast-path 联动
 - 依赖：P11
+- 实施分解：
+  - 建立 YARA 扫描作业模型、调度器与结果缓存
+  - 建立脚本解混淆流水线（编码识别、base64/charcode/powershell 常见混淆还原）
+  - 建立 AMSI 命中与本地决策联动接口
+- 验收：
+  - 测试覆盖扫描任务调度、解混淆层计数、AMSI fast-path 分流
 
 ### P13：ML / OOD / Behavioral Models
 
@@ -178,6 +210,12 @@
   - Static / Behavioral / Script 三模型接口
   - OOD 判定骨架
 - 依赖：P11
+- 实施分解：
+  - 建立模型抽象层、推理输入输出协议与本地模型注册
+  - 建立静态、行为、脚本三类特征向量转换
+  - 建立 OOD 评分器与阈值决策
+- 验收：
+  - 测试覆盖特征提取、模型路由、OOD 判定与失败回退
 
 ### P14：Correlation / Storyline / Threat Feedback
 
@@ -187,6 +225,12 @@
   - Storyline engine
   - threat feedback / adaptive whitelist 回灌
 - 依赖：P03、P11、P13
+- 实施分解：
+  - 建立按主机/进程树/lineage 分片的关联缓存
+  - 建立 storyline 合并规则与自动叙事生成
+  - 建立云端 threat feedback 到本地 adaptive whitelist 的应用器
+- 验收：
+  - 测试覆盖跨事件关联、storyline 合并、误报回灌生效
 
 ### P15：专项检测能力
 
@@ -197,6 +241,12 @@
   - 身份威胁规则
   - 欺骗对象模型
 - 依赖：P11、P12、P14
+- 实施分解：
+  - 建立勒索软件多信号状态机
+  - 建立 ASR 域策略、身份威胁规则集与欺骗对象/触发器
+  - 将专项检测统一接入规则与 storylines
+- 验收：
+  - 测试覆盖勒索信号聚合、ASR 命中、身份告警、欺骗触发
 
 ### P16：Vuln Scan / Passive Discovery / AI Monitor
 
@@ -206,6 +256,12 @@
   - 被动网络资产发现
   - AI 工具 / 模型完整性 / DLP 监控
 - 依赖：P03、P04
+- 实施分解：
+  - 建立本地软件清单与 CVE 匹配器
+  - 建立被动网络发现缓存与资产聚合
+  - 建立 AI 应用风险监控、模型完整性与敏感数据外泄规则
+- 验收：
+  - 测试覆盖清单匹配、资产发现聚合与 AI 监控判定
 
 ### P17：Response Executor / Quarantine / Kill
 
@@ -215,6 +271,12 @@
   - quarantine
   - basic response audit
 - 依赖：P04、P07
+- 实施分解：
+  - 建立响应执行器、两阶段终止状态机与审计记录
+  - 建立文件隔离 vault 与恢复凭据
+  - 建立响应动作结果模型
+- 验收：
+  - 测试覆盖 suspend→assess→kill、quarantine、审计落盘
 
 ### P18：Block Decision / Network Isolate / Firewall
 
@@ -225,6 +287,12 @@
   - management-only / break-glass
   - firewall policy 层
 - 依赖：P17
+- 实施分解：
+  - 建立 block decision map 与 TTL 语义
+  - 建立网络隔离、release、management-only、break-glass 策略对象
+  - 建立防火墙策略编排器
+- 验收：
+  - 测试覆盖阻断命中、隔离释放和 break-glass 审计
 
 ### P19：Registry / Filesystem Rollback / Forensics
 
@@ -234,6 +302,12 @@
   - filesystem rollback
   - artifact bundle / evidence chain
 - 依赖：P17
+- 实施分解：
+  - 建立注册表回滚计划器与文件系统回滚计划器
+  - 建立证据链模型、artifact bundle、hash 证明
+  - 建立取证采集规范到归档对象的转换
+- 验收：
+  - 测试覆盖回滚计划生成、artifact bundle 完整性、证据链串联
 
 ### P20：Remote Shell / Session Lock / Approval Queue
 
@@ -244,6 +318,12 @@
   - pending approval queue
   - pre-approved playbook runtime
 - 依赖：P17、P18、P19
+- 实施分解：
+  - 建立远程 shell 会话策略、命令审计和超时控制
+  - 建立用户会话锁定动作与审批队列
+  - 建立预签名 playbook 执行上下文
+- 验收：
+  - 测试覆盖审批排队、playbook 约束、remote shell 审计
 
 ### P21：Self-Protection / Keys / Crash Exploit Analysis
 
@@ -254,6 +334,12 @@
   - cert lifecycle hooks
   - crash triage / exploit suspicion
 - 依赖：P07、P17
+- 实施分解：
+  - 建立自保护状态机、关键资源保护名单与策略开关
+  - 建立主密钥/派生密钥接口与证书生命周期 hook
+  - 建立 crash triage 与 exploit suspicion 规则
+- 验收：
+  - 测试覆盖密钥派生、自保护策略和崩溃可疑性判定
 
 ### P22：Comms / SignedCommand / ApprovalProof
 
@@ -263,6 +349,12 @@
   - SignedServerCommand 验签
   - target_scope / command_id / approval proof 校验
 - 依赖：P03、P04
+- 实施分解：
+  - 建立上行消息批处理与心跳模型
+  - 建立命令验签器、scope 校验器、去重账本
+  - 建立 approval proof 校验和命令执行前置检查
+- 验收：
+  - 测试覆盖签名校验、scope 违规、replay 拒绝、审批证明失败
 
 ### P23：WAL / Forensic Journal / Emergency Audit Ring
 
@@ -273,6 +365,12 @@
   - Emergency Audit Ring
   - `PARTIAL` 完整性标记
 - 依赖：P22
+- 实施分解：
+  - 建立 WAL 分段写入与回放
+  - 建立 Forensic Journal 与 Emergency Audit Ring
+  - 建立高水位降级与 `PARTIAL` 完整性标记
+- 验收：
+  - 测试覆盖 WAL 回放、满载降级和 `PARTIAL` 标记传播
 
 ### P24：Upgrade / Migration / Canary Gate / Diagnose
 
@@ -283,6 +381,12 @@
   - rollout gate evaluator
   - diagnose bundle
 - 依赖：P02、P22、P23
+- 实施分解：
+  - 建立升级计划对象、回滚元数据与迁移执行器对接
+  - 建立灰度 gate evaluator 与健康阈值判定
+  - 建立 `--diagnose` 输出 bundle
+- 验收：
+  - 测试覆盖 gate 判定、升级计划、diagnose bundle 生成
 
 ### P25：Container Host Agent / Sidecar Lite
 
@@ -292,6 +396,12 @@
   - sidecar lite
   - 容器特定检测骨架
 - 依赖：P09、P16、P22
+- 实施分解：
+  - 建立容器宿主机观测模型、K8s 元数据映射和 sidecar lite 契约
+  - 建立容器特定检测事件与横移/逃逸基础规则
+  - 建立 DaemonSet/sidecar 所需配置对象
+- 验收：
+  - 测试覆盖容器元数据映射、sidecar 契约和容器检测规则
 
 ### P26：Runtime SDK / Cloud API Connector
 
@@ -300,6 +410,12 @@
   - runtime sdk contracts
   - cloud api connector contracts
 - 依赖：P22
+- 实施分解：
+  - 建立 runtime sdk 事件/心跳/策略契约
+  - 建立 cloud API connector 的事件映射与缓冲接口
+  - 建立最小接入示例与契约测试
+- 验收：
+  - 测试覆盖 SDK 事件编码、connector 映射和契约兼容性
 
 ### P27：QE / Pilot / Merge / Release
 
@@ -310,6 +426,13 @@
   - merge to main
   - 发布说明
 - 依赖：P00-P26
+- 实施分解：
+  - 补齐测试矩阵、试点记录模板、发布说明模板
+  - 汇总验收结果并完成分支合并
+  - 推送 `main`
+- 验收：
+  - 所有工作包状态为 `done`
+  - `main` 合并完成并推送
 
 ## 3. 关键依赖链
 
