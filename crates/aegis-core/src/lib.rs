@@ -1,5 +1,6 @@
 pub mod adaptive_whitelist;
 pub mod amsi;
+pub mod comms;
 pub mod config;
 pub mod containment;
 pub mod correlation;

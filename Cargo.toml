@@ -20,6 +20,7 @@ authors = ["wangjuelong <juelongwang@163.com>"]
 anyhow = "1.0"
 base64 = "0.22"
 blake3 = "1.8"
+ed25519-dalek = "2.1"
 hex = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }

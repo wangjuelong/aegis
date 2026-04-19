@@ -583,6 +583,86 @@ pub struct CommandEnvelope {
     pub approval: ApprovalPolicy,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TargetScopeKind {
+    Agent,
+    Tenant,
+    AgentSet,
+    Global,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TargetScope {
+    pub kind: TargetScopeKind,
+    pub tenant_id: Option<String>,
+    pub agent_ids: Vec<String>,
+    pub max_fanout: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerCommand {
+    pub command_id: Uuid,
+    pub tenant_id: String,
+    pub agent_id: String,
+    pub command_type: String,
+    pub command_data: Vec<u8>,
+    pub issued_at_ms: i64,
+    pub ttl_ms: u32,
+    pub sequence_hint: u64,
+    pub approval: ApprovalPolicy,
+    pub target_scope: TargetScope,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SignedServerCommand {
+    pub payload: Vec<u8>,
+    pub signature: Vec<u8>,
+    pub signing_key_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct EventBatch {
+    pub batch_id: Uuid,
+    pub tenant_id: String,
+    pub agent_id: String,
+    pub sequence_hint: u64,
+    pub events: Vec<TelemetryEvent>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClientAck {
+    pub command_id: Uuid,
+    pub status: String,
+    pub detail: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BatchAck {
+    pub batch_id: Uuid,
+    pub accepted_events: u32,
+    pub rejected_events: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FlowControlHint {
+    pub pause_low_priority: bool,
+    pub max_batch_events: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub enum UplinkMessage {
+    EventBatch(EventBatch),
+    ClientAck(ClientAck),
+    FlowControlHint(FlowControlHint),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DownlinkMessage {
+    BatchAck(BatchAck),
+    ServerCommand(SignedServerCommand),
+    FlowControlHint(FlowControlHint),
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct LineageCounters {
     pub rb_produced: u64,
@@ -609,11 +689,60 @@ pub struct AgentHealth {
     pub lineage_counters: LineageCounters,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct HeartbeatRequest {
+    pub tenant_id: String,
+    pub agent_id: String,
+    pub health: AgentHealth,
+    pub wal_utilization_ratio: f32,
+    pub restart_epoch: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HeartbeatResponse {
+    pub server_time_ms: i64,
+    pub pending_update_ids: Vec<String>,
+    pub config_changed: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactChunk {
+    pub upload_id: Uuid,
+    pub artifact_kind: String,
+    pub chunk_index: u32,
+    pub bytes: Vec<u8>,
+    pub eof: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UploadResult {
+    pub upload_id: Uuid,
+    pub accepted_chunks: u32,
+    pub accepted_bytes: u64,
+    pub digest_hex: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateRequest {
+    pub tenant_id: String,
+    pub agent_id: String,
+    pub channel: String,
+    pub current_version: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateChunk {
+    pub artifact_id: String,
+    pub chunk_index: u32,
+    pub bytes: Vec<u8>,
+    pub eof: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        EventPayload, EventType, FileContext, NormalizedEvent, Priority, ProcessContext, Severity,
-        TelemetryEvent, TelemetryIntegrity,
+        EventBatch, EventPayload, EventType, FileContext, NormalizedEvent, Priority,
+        ProcessContext, Severity, TelemetryEvent, TelemetryIntegrity, UplinkMessage,
     };
     use std::path::PathBuf;
 
@@ -660,5 +789,36 @@ mod tests {
 
         assert_eq!(event.lineage.lineage_id, event.lineage_id);
         assert_eq!(event.lineage.checkpoints.len(), 1);
+    }
+
+    #[test]
+    fn uplink_message_wraps_event_batch() {
+        let event = TelemetryEvent::from_normalized(
+            &NormalizedEvent::new(
+                99,
+                EventType::Unknown,
+                Priority::Low,
+                Severity::Info,
+                ProcessContext::default(),
+                EventPayload::None,
+            ),
+            "tenant-a".to_string(),
+            "agent-a".to_string(),
+        );
+        let message = UplinkMessage::EventBatch(EventBatch {
+            batch_id: uuid::Uuid::now_v7(),
+            tenant_id: "tenant-a".to_string(),
+            agent_id: "agent-a".to_string(),
+            sequence_hint: 7,
+            events: vec![event],
+        });
+
+        match message {
+            UplinkMessage::EventBatch(batch) => {
+                assert_eq!(batch.tenant_id, "tenant-a");
+                assert_eq!(batch.events.len(), 1);
+            }
+            _ => panic!("expected event batch"),
+        }
     }
 }
