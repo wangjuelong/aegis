@@ -15,6 +15,7 @@ pub mod ioc;
 pub mod migrations;
 pub mod ml;
 pub mod orchestrator;
+pub mod plugin_host;
 pub mod process_tree;
 pub mod recovery;
 pub mod response_executor;

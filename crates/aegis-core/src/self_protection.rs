@@ -1,6 +1,7 @@
 use aegis_model::Severity;
+use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -64,6 +65,30 @@ pub struct KeyContext {
     pub purpose: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DerivedKeyTier {
+    TelemetryWal,
+    ForensicJournal,
+    RecoveryEvidence,
+}
+
+impl DerivedKeyTier {
+    fn label(self) -> &'static str {
+        match self {
+            Self::TelemetryWal => "telemetry-wal",
+            Self::ForensicJournal => "forensic-journal",
+            Self::RecoveryEvidence => "recovery-evidence",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DerivedKeyMaterial {
+    pub tier: DerivedKeyTier,
+    pub version: u32,
+    pub key_bytes: [u8; 32],
+}
+
 pub struct KeyDerivationService {
     root_secret: Vec<u8>,
 }
@@ -76,12 +101,43 @@ impl KeyDerivationService {
     }
 
     pub fn derive(&self, context: &KeyContext) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(&self.root_secret);
-        hasher.update(context.tenant_id.as_bytes());
-        hasher.update(context.agent_id.as_bytes());
-        hasher.update(context.purpose.as_bytes());
-        hex::encode(hasher.finalize())
+        hex::encode(self.derive_bytes(context, 32))
+    }
+
+    pub fn derive_bytes(&self, context: &KeyContext, len: usize) -> Vec<u8> {
+        let hk = Hkdf::<Sha256>::new(None, &self.root_secret);
+        let info = format!(
+            "aegis:{}:{}:{}",
+            context.tenant_id, context.agent_id, context.purpose
+        );
+        let mut output = vec![0u8; len];
+        hk.expand(info.as_bytes(), &mut output)
+            .expect("hkdf length is bounded");
+        output
+    }
+
+    pub fn derive_material(
+        &self,
+        tenant_id: &str,
+        agent_id: &str,
+        tier: DerivedKeyTier,
+        version: u32,
+    ) -> DerivedKeyMaterial {
+        let key_bytes = self.derive_bytes(
+            &KeyContext {
+                tenant_id: tenant_id.to_string(),
+                agent_id: agent_id.to_string(),
+                purpose: format!("{}.v{}", tier.label(), version),
+            },
+            32,
+        );
+        let mut material = [0u8; 32];
+        material.copy_from_slice(&key_bytes);
+        DerivedKeyMaterial {
+            tier,
+            version,
+            key_bytes: material,
+        }
     }
 }
 
@@ -216,8 +272,8 @@ impl CrashExploitAnalyzer {
 mod tests {
     use super::{
         CertificateLifecycleEvent, CertificateLifecycleHooks, CertificateRecord,
-        CrashExploitAnalyzer, CrashSample, KeyContext, KeyDerivationService, ProtectionPosture,
-        SelfProtectionManager, TamperSignal,
+        CrashExploitAnalyzer, CrashSample, DerivedKeyTier, KeyContext, KeyDerivationService,
+        ProtectionPosture, SelfProtectionManager, TamperSignal,
     };
     use aegis_model::Severity;
     use std::path::PathBuf;
@@ -260,6 +316,23 @@ mod tests {
 
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn tiered_key_material_is_stable_and_distinct() {
+        let service = KeyDerivationService::new("root-secret");
+        let telemetry_v1 =
+            service.derive_material("tenant-a", "agent-1", DerivedKeyTier::TelemetryWal, 1);
+        let telemetry_v1_again =
+            service.derive_material("tenant-a", "agent-1", DerivedKeyTier::TelemetryWal, 1);
+        let journal_v1 =
+            service.derive_material("tenant-a", "agent-1", DerivedKeyTier::ForensicJournal, 1);
+        let telemetry_v2 =
+            service.derive_material("tenant-a", "agent-1", DerivedKeyTier::TelemetryWal, 2);
+
+        assert_eq!(telemetry_v1, telemetry_v1_again);
+        assert_ne!(telemetry_v1.key_bytes, journal_v1.key_bytes);
+        assert_ne!(telemetry_v1.key_bytes, telemetry_v2.key_bytes);
     }
 
     #[test]

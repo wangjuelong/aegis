@@ -1,4 +1,4 @@
-use aegis_model::{AgentHealth, LineageCounters};
+use aegis_model::{AgentHealth, LineageCounters, RuntimeHealthSignals};
 use std::collections::BTreeMap;
 
 pub struct HealthReporter;
@@ -13,6 +13,7 @@ impl HealthReporter {
         memory_rss_mb: u64,
         queue_depths: BTreeMap<String, usize>,
         lineage_counters: LineageCounters,
+        runtime_signals: RuntimeHealthSignals,
     ) -> AgentHealth {
         let dropped_events_total = lineage_counters.rb_dropped;
 
@@ -26,6 +27,7 @@ impl HealthReporter {
             queue_depths,
             dropped_events_total,
             lineage_counters,
+            runtime_signals,
         }
     }
 }
@@ -33,7 +35,7 @@ impl HealthReporter {
 #[cfg(test)]
 mod tests {
     use super::HealthReporter;
-    use aegis_model::LineageCounters;
+    use aegis_model::{CommunicationChannelKind, LineageCounters, RuntimeHealthSignals};
     use std::collections::BTreeMap;
 
     #[test]
@@ -50,9 +52,20 @@ mod tests {
             128,
             BTreeMap::from([("event".to_string(), 32usize)]),
             counters,
+            RuntimeHealthSignals {
+                communication_channel: CommunicationChannelKind::Grpc,
+                adaptive_whitelist_size: 4,
+                etw_tamper_detected: false,
+                amsi_tamper_detected: false,
+                bpf_integrity_pass: true,
+            },
         );
 
         assert_eq!(snapshot.dropped_events_total, 7);
         assert_eq!(snapshot.queue_depths["event"], 32);
+        assert_eq!(
+            snapshot.runtime_signals.communication_channel,
+            CommunicationChannelKind::Grpc
+        );
     }
 }

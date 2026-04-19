@@ -20,6 +20,9 @@ pub enum CoreError {
     #[error("sqlite failed: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
+    #[error("cryptography failed: {0}")]
+    Crypto(String),
+
     #[error("unsupported config version: {found}, supported range: {min_supported}-{current}")]
     UnsupportedConfigVersion {
         found: u32,

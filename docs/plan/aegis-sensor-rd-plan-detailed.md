@@ -554,3 +554,138 @@
 - P00-P27 每个工作包都必须同时满足：代码、测试、文档三类交付齐全。
 - 任何源文档能力项如果只建立目录/接口、没有形成可验证行为，不得标记完成。
 - P27 完成前，不得宣称“所有研发计划已完成”。
+
+## 5. Agent 缺口收口工作包
+
+### G00：缺口审计与执行基线重建
+
+- 目标：建立新的 gap 收口计划，纠正“agent 已完整实现”的失真状态。
+- 交付：
+  - `docs/plan/2026-04-19-agent-gap-closure.md`
+  - `docs/plan/aegis-sensor-rd-status.md`
+  - `docs/plan/aegis-sensor-rd-plan-audit.md`
+- 依赖：无
+- 完成记录（2026-04-19）：
+  - 已建立 G00-G06 收口工作包、验证命令与提交约束
+  - 已同步修正状态文档与审计结论，明确当前仍存在功能缺口与设计妥协
+
+### G01：高危操作执行链路加固
+
+- 目标：将审批队列、Remote Shell、Playbook、Session Lock 从占位实现提升为可执行运行时。
+- 交付：
+  - `crates/aegis-core/src/high_risk_ops.rs`
+  - `docs/plan/2026-04-19-agent-gap-closure.md`
+  - `docs/plan/aegis-sensor-rd-status.md`
+- 依赖：G00
+- 完成记录（2026-04-19）：
+  - 已建立支持内存/SQLite 双后端的审批队列，实现审批人去重、TTL、过期失效与持久化恢复
+  - 已建立 Remote Shell 会话管理器，实现单端点并发控制、工作时间窗、命令黑白名单、会话 TTL 与 asciicast 风格审计输出
+  - 已为 Playbook 增加执行次数限制，为 Session Lock 增加锁定/释放状态管理与可撤销路径
+  - 已新增对应单元测试，并通过 `cargo fmt --all` 与 `cargo test --workspace`
+
+### G02：通信回退运行时与诊断扩展
+
+- 目标：建立通信回退状态机，并将通信健康、篡改信号与插件状态暴露到诊断面。
+- 交付：
+  - `crates/aegis-core/src/comms.rs`
+  - `crates/aegis-core/src/health.rs`
+  - `crates/aegis-core/src/orchestrator.rs`
+  - `crates/aegis-core/src/upgrade.rs`
+  - `crates/aegis-agentd/src/main.rs`
+  - `crates/aegis-model/src/lib.rs`
+  - `docs/qe/aegis-sensor-qe-matrix.md`
+  - `docs/plan/aegis-sensor-rd-status.md`
+- 依赖：G01
+- 完成记录（2026-04-19）：
+  - 已建立 `CommunicationRuntime` 与 `TransportDriver` 抽象，实现四级回退、失败阈值降级与高优先级通道恢复探测
+  - 已将通信状态扩展到 `HeartbeatRequest`、`AgentHealth` 与 `DiagnoseBundle`，补齐 `communication_channel`、篡改信号与 `plugin_status`
+  - 已将 telemetry/heartbeat 接入 orchestrator 的通信运行时，并增加 `comms-link-manager` 后台任务
+  - 已新增通信降级/恢复测试，并通过 `cargo fmt --all`、`cargo test --workspace` 与 `cargo run -p aegis-agentd -- --diagnose`
+
+### G03：WAL 加密、恢复与证据链加固
+
+- 目标：让 WAL、Forensic Journal、Rollback/Evidence 不再停留在明文 JSONL 与简单复制。
+- 交付：
+  - `Cargo.toml`
+  - `crates/aegis-core/Cargo.toml`
+  - `crates/aegis-core/src/error.rs`
+  - `crates/aegis-core/src/self_protection.rs`
+  - `crates/aegis-core/src/wal.rs`
+  - `crates/aegis-core/src/recovery.rs`
+  - `crates/aegis-core/src/upgrade.rs`
+  - `crates/aegis-agentd/src/main.rs`
+  - `docs/qe/aegis-sensor-qe-matrix.md`
+  - `docs/plan/aegis-sensor-rd-status.md`
+- 依赖：G02
+- 完成记录（2026-04-19）：
+  - 已建立 `DerivedKeyTier` / `DerivedKeyMaterial` 分级派生接口，为 WAL、Journal 与恢复证据链提供独立密钥版本域
+  - 已将 Telemetry WAL 与 Forensic Journal 升级为加密落盘格式，补齐 `XChaCha20-Poly1305` 加密、AAD、CRC 校验与损坏 segment 隔离
+  - 已增强 `FilesystemRollbackPlanner` 与 `EvidenceChain`，补齐 snapshot 大小/哈希/manifest 校验与 artifact 反篡改校验
+  - 已扩展 `DiagnoseWalStatus` 并通过 `cargo fmt --all`、`cargo test --workspace`、`cargo run -p aegis-agentd -- --diagnose`
+
+### G04：插件宿主、Watchdog 与 Updater 热更新链路
+
+- 目标：将插件、watchdog、updater 从 skeleton 收口为真实运行链路。
+- 交付：
+  - `crates/aegis-core/src/plugin_host.rs`
+  - `crates/aegis-core/src/upgrade.rs`
+  - `crates/aegis-core/src/lib.rs`
+  - `crates/aegis-model/src/lib.rs`
+  - `crates/aegis-agentd/src/main.rs`
+  - `crates/aegis-watchdog/Cargo.toml`
+  - `crates/aegis-watchdog/src/main.rs`
+  - `crates/aegis-updater/Cargo.toml`
+  - `crates/aegis-updater/src/main.rs`
+  - `docs/release/aegis-sensor-release-notes.md`
+  - `docs/qe/aegis-sensor-qe-matrix.md`
+  - `docs/plan/aegis-sensor-rd-status.md`
+- 依赖：G03
+- 完成记录（2026-04-19）：
+  - 已建立 `PluginHost` / `WasmPluginExecutor`，覆盖 `.wasm` 头校验、哈希校验、插件超时/崩溃记账与禁用策略
+  - 已建立 `HotUpdateManifest` 与 `HotUpdateManifestVerifier`，实现升级清单验签、artifact 与 rollback artifact 完整性验证
+  - 已建立 `AgentSupervisorHeartbeat`、`WatchdogHeartbeat` 与 `WatchdogLinkMonitor`，支持 watchdog 失联检测与异常告警
+  - 已将 `agentd`、`watchdog`、`updater` 接入共享运行时对象，并通过 `cargo fmt --all`、`cargo test --workspace`、`cargo run -p aegis-agentd -- --diagnose`、`cargo run -p aegis-watchdog`、`cargo run -p aegis-updater`
+
+### G05：容器、Sidecar 与 Serverless 运行时接入
+
+- 目标：将容器、sidecar 与 serverless 契约对象收口为可运行、可诊断的桥接能力。
+- 交付：
+  - `crates/aegis-core/src/container_mode.rs`
+  - `crates/aegis-core/src/runtime_sdk.rs`
+  - `crates/aegis-core/src/orchestrator.rs`
+  - `crates/aegis-core/src/upgrade.rs`
+  - `crates/aegis-core/examples/runtime_sdk_connector.rs`
+  - `crates/aegis-model/src/lib.rs`
+  - `crates/aegis-agentd/src/main.rs`
+  - `docs/pilot/aegis-sensor-pilot-record.md`
+  - `docs/qe/aegis-sensor-qe-matrix.md`
+  - `docs/plan/aegis-sensor-rd-status.md`
+- 依赖：G04
+- 完成记录（2026-04-19）：
+  - 已建立 `SidecarControlMessage` 与 `SidecarLocalControlPlane`，覆盖 unix socket 本地控制面绑定、发送与接收
+  - 已建立 `RuntimeEventEmitter` 与 `CloudConnectorRunner`，补齐 runtime heartbeat 绑定、事件缓存、connector flush/cursor 与运行态桥接状态快照
+  - 已将 `runtime-bridge` 纳入 `Orchestrator` 拓扑，并将 `RuntimeBridgeStatus` 接入 `DiagnoseBundle` 与 `aegis-agentd -- --diagnose`
+  - 已更新 `runtime_sdk_connector` 示例，实跑展示 connector 二次写入 flush 与 batch 计数
+  - 已通过 `cargo fmt --all`、`cargo test --workspace`、`cargo run -p aegis-core --example runtime_sdk_connector`、`cargo run -p aegis-agentd -- --diagnose`
+
+### G06：平台执行基线收口
+
+- 目标：将 Windows/Linux/macOS 平台从 no-op 响应提升为有状态、可审计、可回放的执行基线。
+- 交付：
+  - `crates/aegis-platform/src/traits.rs`
+  - `crates/aegis-platform/src/windows.rs`
+  - `crates/aegis-platform/src/linux.rs`
+  - `crates/aegis-platform/src/macos.rs`
+  - `crates/aegis-platform/src/lib.rs`
+  - `crates/aegis-core/src/response_executor.rs`
+  - `crates/aegis-core/src/recovery.rs`
+  - `docs/qe/aegis-sensor-qe-matrix.md`
+  - `docs/plan/aegis-sensor-rd-status.md`
+  - `docs/release/aegis-sensor-release-notes.md`
+- 依赖：G05
+- 完成记录（2026-04-19）：
+  - 已建立 `PlatformExecutionSnapshot`、`PlatformHealthSnapshot` 与 `BlockLease`，统一平台动作状态、阻断 TTL、隔离/释放与健康快照模型
+  - 已将 Windows/Linux/macOS 的 `quarantine_file`、`collect_forensics`、`block_*`、`network_isolate/release`、`protect_*` 等路径改为真实落地并写入平台状态
+  - 已补齐平台侧测试，覆盖文件隔离、取证工件、降级健康快照、阻断 TTL 与隔离释放
+  - 已补齐 `ResponseExecutor -> WindowsPlatform` 与 `RecoveryCoordinator -> LinuxPlatform` 的 core 侧真实联动测试
+  - 已通过 `cargo fmt --all`、`cargo test --workspace`、`cargo run -p aegis-agentd -- --diagnose`、`cargo run -p aegis-core --example runtime_sdk_connector`

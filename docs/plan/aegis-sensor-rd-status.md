@@ -38,3 +38,15 @@
 | P25 | Container Host Agent / Sidecar Lite | done | 已建立容器元数据映射、宿主机 DaemonSet / sidecar lite 契约与容器横移/逃逸检测测试 |
 | P26 | Runtime SDK / Cloud API Connector | done | 已建立 Runtime SDK 契约、云端 connector 映射/缓冲接口与最小接入示例 |
 | P27 | QE / Pilot / Merge / Release | done | 已补齐 QE/试点/发布文档并完成 `main` 合并，待推送 `origin/main` |
+
+## Agent 缺口收口状态
+
+| 工作包 | 名称 | 状态 | 备注 |
+|--------|------|------|------|
+| G00 | 缺口审计与执行基线重建 | done | 已建立新的 gap 收口计划并修正状态/审计基线 |
+| G01 | 高危操作执行链路加固 | done | 已交付持久化审批、Remote Shell 会话控制、Playbook/Session Lock 运行时与审计测试 |
+| G02 | 通信回退运行时与诊断扩展 | done | 已交付四级回退状态机、恢复探测、通信诊断字段与 `--diagnose` 实跑验证 |
+| G03 | WAL 加密、恢复与证据链加固 | done | 已交付加密 WAL/Journal、分级密钥派生、快照恢复校验与证据链反篡改验证 |
+| G04 | 插件宿主、Watchdog 与 Updater 热更新链路 | done | 已交付 WASM 插件宿主、热更新验签、回滚工件校验与 watchdog 心跳监测 |
+| G05 | 容器、Sidecar 与 Serverless 运行时接入 | done | 已交付 unix socket sidecar 控制面、RuntimeEventEmitter / CloudConnectorRunner、runtime-bridge 拓扑与 `runtime_bridge` 诊断映射 |
+| G06 | 平台执行基线收口 | done | 已交付平台动作快照、TTL 阻断表、隔离/取证落地、provider 健康快照及 core 侧真实联动测试 |
