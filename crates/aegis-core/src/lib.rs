@@ -19,6 +19,7 @@ pub mod response_executor;
 pub mod ring_buffer;
 pub mod rule_vm;
 pub mod script_decode;
+pub mod self_protection;
 pub mod specialized_detection;
 pub mod spill;
 pub mod surface_monitor;
