@@ -1,6 +1,7 @@
+use crate::comms::{RollbackProtectionAnchor, RollbackProtectionStatus};
 use crate::config::{AgentConfig, CURRENT_CONF_VERSION};
 use crate::migrations::{CURRENT_SCHEMA_VERSION, MIN_READER_SCHEMA_VERSION};
-use crate::self_protection::ProtectionPosture;
+use crate::self_protection::{KeyProtectionStatus, KeyProtectionTier, ProtectionPosture};
 use aegis_model::{
     AgentHealth, AgentSupervisorHeartbeat, CommunicationRuntimeStatus, HotUpdateManifest,
     PluginHealthStatus, RuntimeBridgeStatus, RuntimeHealthSignals, TelemetryIntegrity,
@@ -306,6 +307,62 @@ pub struct DiagnoseWalStatus {
     pub quarantined_segments: usize,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiagnoseKeyProtectionStatus {
+    pub active_tier: KeyProtectionTier,
+    pub degraded: bool,
+    pub hardware_root_available: bool,
+    pub memory_lock_supported: bool,
+    pub memory_lock_enabled: bool,
+    pub rollback_anchor: RollbackProtectionAnchor,
+    pub rollback_floor_issued_at_ms: Option<i64>,
+    pub rollback_fs_cross_check_ms: Option<i64>,
+    pub rollback_cross_check_ok: bool,
+    pub key_provider_error: Option<String>,
+    pub rollback_error: Option<String>,
+}
+
+impl Default for DiagnoseKeyProtectionStatus {
+    fn default() -> Self {
+        Self {
+            active_tier: KeyProtectionTier::InMemoryTestOnly,
+            degraded: true,
+            hardware_root_available: false,
+            memory_lock_supported: cfg!(unix),
+            memory_lock_enabled: false,
+            rollback_anchor: RollbackProtectionAnchor::Ephemeral,
+            rollback_floor_issued_at_ms: None,
+            rollback_fs_cross_check_ms: None,
+            rollback_cross_check_ok: false,
+            key_provider_error: None,
+            rollback_error: None,
+        }
+    }
+}
+
+impl DiagnoseKeyProtectionStatus {
+    pub fn from_runtime(
+        key_status: &KeyProtectionStatus,
+        rollback_status: &RollbackProtectionStatus,
+    ) -> Self {
+        Self {
+            active_tier: key_status.active_tier,
+            degraded: key_status.degraded
+                || rollback_status.degraded
+                || !rollback_status.cross_check_ok,
+            hardware_root_available: key_status.hardware_root_available,
+            memory_lock_supported: key_status.memory_lock_supported,
+            memory_lock_enabled: key_status.memory_lock_enabled,
+            rollback_anchor: rollback_status.anchor_kind,
+            rollback_floor_issued_at_ms: rollback_status.floor_issued_at_ms,
+            rollback_fs_cross_check_ms: rollback_status.fs_cross_check_ms,
+            rollback_cross_check_ok: rollback_status.cross_check_ok,
+            key_provider_error: key_status.last_error.clone(),
+            rollback_error: rollback_status.last_error.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct DiagnoseBundle {
     pub connection: DiagnoseConnectionStatus,
@@ -315,6 +372,8 @@ pub struct DiagnoseBundle {
     pub engine_versions: BTreeMap<String, String>,
     pub ring_buffer_utilization_ratio: f32,
     pub wal: DiagnoseWalStatus,
+    #[serde(default)]
+    pub key_protection: DiagnoseKeyProtectionStatus,
     pub resources: AgentHealth,
     pub runtime_signals: RuntimeHealthSignals,
     pub runtime_bridge: Option<RuntimeBridgeStatus>,
@@ -335,6 +394,8 @@ pub struct AgentRuntimeSnapshot {
     pub engine_versions: BTreeMap<String, String>,
     pub ring_buffer_utilization_ratio: f32,
     pub wal: DiagnoseWalStatus,
+    #[serde(default)]
+    pub key_protection: DiagnoseKeyProtectionStatus,
     pub resources: AgentHealth,
     pub runtime_bridge: Option<RuntimeBridgeStatus>,
     pub plugin_status: Vec<PluginHealthStatus>,
@@ -431,6 +492,7 @@ impl DiagnoseCollector {
         engine_versions: BTreeMap<String, String>,
         ring_buffer_utilization_ratio: f32,
         wal: DiagnoseWalStatus,
+        key_protection: DiagnoseKeyProtectionStatus,
         resources: AgentHealth,
         runtime_bridge: Option<RuntimeBridgeStatus>,
         plugin_status: Vec<PluginHealthStatus>,
@@ -447,6 +509,7 @@ impl DiagnoseCollector {
             engine_versions,
             ring_buffer_utilization_ratio,
             wal,
+            key_protection,
             runtime_signals: resources.runtime_signals.clone(),
             resources,
             runtime_bridge,
@@ -477,6 +540,7 @@ impl AgentRuntimeSnapshot {
             self.engine_versions.clone(),
             self.ring_buffer_utilization_ratio,
             self.wal.clone(),
+            self.key_protection.clone(),
             self.resources.clone(),
             self.runtime_bridge.clone(),
             self.plugin_status.clone(),
@@ -490,9 +554,10 @@ mod tests {
     use super::{
         AgentRuntimeSnapshot, CanaryGateDecision, CanaryGateThresholds, CanaryObservation,
         DiagnoseCertificateStatus, DiagnoseCollector, DiagnoseConnectionStatus,
-        DiagnoseSensorStatus, DiagnoseWalStatus, HotUpdateManifestVerifier, RolloutGateEvaluator,
-        RuntimeStateStore, UpdateVerificationSnapshot, UpgradeArtifact, UpgradePlanner,
-        WatchdogLinkMonitor, WatchdogRuntimeSnapshot,
+        DiagnoseKeyProtectionStatus, DiagnoseSensorStatus, DiagnoseWalStatus,
+        HotUpdateManifestVerifier, RolloutGateEvaluator, RuntimeStateStore,
+        UpdateVerificationSnapshot, UpgradeArtifact, UpgradePlanner, WatchdogLinkMonitor,
+        WatchdogRuntimeSnapshot,
     };
     use crate::config::AgentConfig;
     use crate::health::HealthReporter;
@@ -699,6 +764,7 @@ mod tests {
                 key_version: 1,
                 quarantined_segments: 1,
             },
+            DiagnoseKeyProtectionStatus::default(),
             health(),
             Some(RuntimeBridgeStatus {
                 control_socket_path: Some(
@@ -794,6 +860,7 @@ mod tests {
                 key_version: 1,
                 quarantined_segments: 0,
             },
+            key_protection: DiagnoseKeyProtectionStatus::default(),
             resources: health(),
             runtime_bridge: None,
             plugin_status: vec![PluginHealthStatus {

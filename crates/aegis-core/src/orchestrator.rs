@@ -570,7 +570,10 @@ impl CommandExecutionRuntime {
                 min_policy_version: format!("v{}", config.policy_version.policy_bundle.max(1)),
             },
             validator,
-            replay_ledger: CommandReplayLedger::new_persistent(command_replay_path(config))?,
+            replay_ledger: CommandReplayLedger::new_persistent_with_security(
+                command_replay_path(config),
+                &config.security,
+            )?,
             approval_queue: ApprovalQueue::new_persistent(approval_queue_path(config))?,
             remote_shell: RemoteShellRuntime::new(
                 loopback_remote_shell_policy(),

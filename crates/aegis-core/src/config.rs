@@ -158,6 +158,23 @@ impl Default for CommunicationConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecurityConfig {
+    pub use_os_credential_store: bool,
+    pub allow_file_fallback: bool,
+    pub memory_lock_best_effort: bool,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            use_os_credential_store: true,
+            allow_file_fallback: true,
+            memory_lock_best_effort: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StorageConfig {
     pub state_root: PathBuf,
     pub config_path: PathBuf,
@@ -190,6 +207,8 @@ pub struct AgentConfig {
     pub policy_version: PolicyVersion,
     #[serde(default)]
     pub communication: CommunicationConfig,
+    #[serde(default)]
+    pub security: SecurityConfig,
     pub runtime: RuntimeConfig,
     pub storage: StorageConfig,
 }
@@ -206,6 +225,7 @@ impl Default for AgentConfig {
             control_plane_url: "https://127.0.0.1:7443".to_string(),
             policy_version: PolicyVersion::default(),
             communication: CommunicationConfig::default(),
+            security: SecurityConfig::default(),
             runtime: RuntimeConfig::default(),
             storage: StorageConfig::default(),
         }
@@ -286,6 +306,7 @@ mod tests {
         assert_eq!(restored.policy_version.policy_bundle, 1);
         assert_eq!(restored.storage.agent_db_path, config.storage.agent_db_path);
         assert!(!restored.communication.development_allow_loopback);
+        assert!(restored.security.use_os_credential_store);
     }
 
     #[test]

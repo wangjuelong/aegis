@@ -1,13 +1,13 @@
-use aegis_core::comms::CommunicationRuntime;
+use aegis_core::comms::{CommandReplayLedger, CommunicationRuntime, RollbackProtectionStatus};
 use aegis_core::config::AppConfig;
 use aegis_core::health::HealthReporter;
 use aegis_core::orchestrator::Orchestrator;
 use aegis_core::plugin_host::PluginHost;
-use aegis_core::self_protection::ProtectionPosture;
+use aegis_core::self_protection::{DerivedKeyTier, KeyDerivationService, ProtectionPosture};
 use aegis_core::transport_drivers::TransportAgentContext;
 use aegis_core::upgrade::{
     AgentRuntimeSnapshot, DiagnoseCertificateStatus, DiagnoseCollector, DiagnoseConnectionStatus,
-    DiagnoseSensorStatus, DiagnoseWalStatus, RuntimeStateStore,
+    DiagnoseKeyProtectionStatus, DiagnoseSensorStatus, DiagnoseWalStatus, RuntimeStateStore,
 };
 use aegis_model::{
     AgentSupervisorHeartbeat, LineageCounters, PluginHealthStatus, RuntimeBridgeStatus,
@@ -157,6 +157,8 @@ fn build_agent_runtime_snapshot(
     )
     .map(|runtime| runtime.snapshot())
     .unwrap_or_default();
+    let rollback_status = load_rollback_status(config);
+    let (wal, key_protection) = diagnose_storage_security(config, &rollback_status);
     let plugin_status = collect_plugin_status(config);
     let active_update_id = RuntimeStateStore::load_update_snapshot(config)
         .ok()
@@ -224,17 +226,119 @@ fn build_agent_runtime_snapshot(
             ),
         ]),
         ring_buffer_utilization_ratio: 0.0,
-        wal: DiagnoseWalStatus {
-            telemetry_segments: 0,
-            forensic_root: config.storage.forensic_path.clone(),
-            completeness: TelemetryIntegrity::Full,
-            encrypted: true,
-            key_version: 1,
-            quarantined_segments: 0,
-        },
+        wal,
+        key_protection: key_protection.clone(),
         resources: health,
         runtime_bridge,
         plugin_status,
-        self_protection_posture: ProtectionPosture::Normal,
+        self_protection_posture: protection_posture_from_key_status(&key_protection),
     }
+}
+
+fn diagnose_storage_security(
+    config: &AppConfig,
+    rollback_status: &RollbackProtectionStatus,
+) -> (DiagnoseWalStatus, DiagnoseKeyProtectionStatus) {
+    let telemetry_segments = wal_segment_count(&config.storage.spill_path);
+    let quarantined_segments = wal_quarantine_count(&config.storage.spill_path);
+    let completeness = if quarantined_segments > 0 {
+        TelemetryIntegrity::Partial
+    } else {
+        TelemetryIntegrity::Full
+    };
+
+    match KeyDerivationService::from_config(config) {
+        Ok(service) => {
+            let material = service.derive_material(
+                &config.tenant_id,
+                &config.agent_id,
+                DerivedKeyTier::TelemetryWal,
+                1,
+            );
+            (
+                DiagnoseWalStatus {
+                    telemetry_segments,
+                    forensic_root: config.storage.forensic_path.clone(),
+                    completeness,
+                    encrypted: true,
+                    key_version: material.version,
+                    quarantined_segments,
+                },
+                DiagnoseKeyProtectionStatus::from_runtime(
+                    service.protection_status(),
+                    rollback_status,
+                ),
+            )
+        }
+        Err(error) => {
+            let mut key_protection = DiagnoseKeyProtectionStatus::default();
+            key_protection.rollback_anchor = rollback_status.anchor_kind;
+            key_protection.rollback_floor_issued_at_ms = rollback_status.floor_issued_at_ms;
+            key_protection.rollback_fs_cross_check_ms = rollback_status.fs_cross_check_ms;
+            key_protection.rollback_cross_check_ok = rollback_status.cross_check_ok;
+            key_protection.rollback_error = rollback_status.last_error.clone();
+            key_protection.key_provider_error = Some(error.to_string());
+            (
+                DiagnoseWalStatus {
+                    telemetry_segments,
+                    forensic_root: config.storage.forensic_path.clone(),
+                    completeness,
+                    encrypted: false,
+                    key_version: 0,
+                    quarantined_segments,
+                },
+                key_protection,
+            )
+        }
+    }
+}
+
+fn load_rollback_status(config: &AppConfig) -> RollbackProtectionStatus {
+    match CommandReplayLedger::new_persistent_with_security(
+        command_replay_path(config),
+        &config.security,
+    ) {
+        Ok(ledger) => ledger.rollback_status().clone(),
+        Err(error) => {
+            let mut status = RollbackProtectionStatus::default();
+            status.last_error = Some(error.to_string());
+            status
+        }
+    }
+}
+
+fn wal_segment_count(root: &Path) -> usize {
+    fs::read_dir(root)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(|entry| entry.ok()))
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .map(|name| name.starts_with("segment-") && name.ends_with(".wal"))
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+fn wal_quarantine_count(root: &Path) -> usize {
+    fs::read_dir(root.join("quarantine"))
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(|entry| entry.ok()))
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("corrupt"))
+        .count()
+}
+
+fn protection_posture_from_key_status(status: &DiagnoseKeyProtectionStatus) -> ProtectionPosture {
+    if status.degraded {
+        ProtectionPosture::Hardened
+    } else {
+        ProtectionPosture::Normal
+    }
+}
+
+fn command_replay_path(config: &AppConfig) -> PathBuf {
+    config.storage.state_root.join("command-replay-ledger.db")
 }

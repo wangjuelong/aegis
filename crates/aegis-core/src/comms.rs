@@ -1,4 +1,4 @@
-use crate::config::CommunicationConfig;
+use crate::config::{CommunicationConfig, SecurityConfig};
 use crate::transport_drivers::{build_transport_drivers, TransportAgentContext};
 use aegis_model::{
     AgentHealth, ApproverEntry, CommunicationChannelHealth, CommunicationChannelKind,
@@ -8,11 +8,14 @@ use aegis_model::{
 use anyhow::{anyhow, bail, Result};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -443,46 +446,103 @@ enum CommandReplayLedgerBackend {
     Sqlite(PathBuf),
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RollbackProtectionAnchor {
+    TpmNvCounter,
+    OsStoreCrossChecked,
+    FileBackedCrossChecked,
+    Ephemeral,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RollbackProtectionStatus {
+    pub anchor_kind: RollbackProtectionAnchor,
+    pub floor_issued_at_ms: Option<i64>,
+    pub fs_cross_check_ms: Option<i64>,
+    pub cross_check_ok: bool,
+    pub degraded: bool,
+    pub last_error: Option<String>,
+}
+
+impl Default for RollbackProtectionStatus {
+    fn default() -> Self {
+        Self {
+            anchor_kind: RollbackProtectionAnchor::Ephemeral,
+            floor_issued_at_ms: None,
+            fs_cross_check_ms: None,
+            cross_check_ok: false,
+            degraded: true,
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct RollbackAnchorRecord {
+    floor_issued_at_ms: Option<i64>,
+    updated_at_ms: i64,
+}
+
 pub struct CommandReplayLedger {
     backend: CommandReplayLedgerBackend,
+    rollback_status: RollbackProtectionStatus,
 }
 
 impl Default for CommandReplayLedger {
     fn default() -> Self {
         Self {
             backend: CommandReplayLedgerBackend::Memory(HashMap::new()),
+            rollback_status: RollbackProtectionStatus::default(),
         }
     }
 }
 
 impl CommandReplayLedger {
     pub fn new_persistent(path: PathBuf) -> Result<Self> {
+        Self::new_persistent_with_security(path, &SecurityConfig::default())
+    }
+
+    pub fn new_persistent_with_security(path: PathBuf, security: &SecurityConfig) -> Result<Self> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent)?;
         }
         initialize_replay_ledger_backend(&path)?;
+        let rollback_status = load_or_initialize_rollback_status(&path, security)?;
         Ok(Self {
             backend: CommandReplayLedgerBackend::Sqlite(path),
+            rollback_status,
         })
     }
 
     pub fn register(
         &mut self,
         command_id: Uuid,
+        issued_at_ms: i64,
         expires_at_ms: i64,
         now_ms: i64,
     ) -> Result<(), CommandValidationError> {
         self.prune(now_ms)?;
+        if let Some(floor_issued_at_ms) = self.rollback_status.floor_issued_at_ms {
+            if issued_at_ms < floor_issued_at_ms {
+                return Err(CommandValidationError::RollbackProtectionTriggered);
+            }
+        }
         match &mut self.backend {
             CommandReplayLedgerBackend::Memory(seen) => {
                 if seen.contains_key(&command_id) {
                     return Err(CommandValidationError::ReplayDetected);
                 }
                 seen.insert(command_id, expires_at_ms);
+                self.rollback_status.floor_issued_at_ms = Some(
+                    self.rollback_status
+                        .floor_issued_at_ms
+                        .map(|current| current.max(issued_at_ms))
+                        .unwrap_or(issued_at_ms),
+                );
                 Ok(())
             }
             CommandReplayLedgerBackend::Sqlite(path) => {
-                let connection = Connection::open(path)
+                let connection = Connection::open(path.as_path())
                     .map_err(|_| CommandValidationError::PersistenceFailure)?;
                 let existing = connection
                     .query_row(
@@ -502,9 +562,20 @@ impl CommandReplayLedger {
                         params![command_id.to_string(), expires_at_ms],
                     )
                     .map_err(|_| CommandValidationError::PersistenceFailure)?;
+                advance_rollback_status(
+                    &mut self.rollback_status,
+                    path.as_path(),
+                    issued_at_ms,
+                    now_ms,
+                )
+                .map_err(|_| CommandValidationError::PersistenceFailure)?;
                 Ok(())
             }
         }
+    }
+
+    pub fn rollback_status(&self) -> &RollbackProtectionStatus {
+        &self.rollback_status
     }
 
     fn prune(&mut self, now_ms: i64) -> Result<(), CommandValidationError> {
@@ -539,6 +610,203 @@ fn initialize_replay_ledger_backend(path: &Path) -> Result<()> {
         ",
     )?;
     Ok(())
+}
+
+fn load_or_initialize_rollback_status(
+    path: &Path,
+    security: &SecurityConfig,
+) -> Result<RollbackProtectionStatus> {
+    let now_ms = now_unix_ms();
+    let default_record = RollbackAnchorRecord {
+        floor_issued_at_ms: None,
+        updated_at_ms: now_ms,
+    };
+
+    if security.use_os_credential_store {
+        match load_or_initialize_rollback_record_from_keyring(path, &default_record) {
+            Ok(keyring_record) => {
+                let (mut sidecar_record, fs_cross_check_ms) =
+                    load_or_initialize_rollback_record_from_sidecar(path, &keyring_record)?;
+                let floor_issued_at_ms = max_floor(
+                    keyring_record.floor_issued_at_ms,
+                    sidecar_record.floor_issued_at_ms,
+                );
+                let cross_check_ok =
+                    keyring_record.floor_issued_at_ms == sidecar_record.floor_issued_at_ms;
+                let mut last_error = None;
+                if !cross_check_ok {
+                    last_error = Some(
+                        "rollback anchor mismatch detected between credential store and sidecar"
+                            .to_string(),
+                    );
+                    sidecar_record = RollbackAnchorRecord {
+                        floor_issued_at_ms,
+                        updated_at_ms: now_ms,
+                    };
+                    persist_rollback_record_to_keyring(path, &sidecar_record)?;
+                    persist_rollback_record_to_sidecar(path, &sidecar_record)?;
+                }
+                return Ok(RollbackProtectionStatus {
+                    anchor_kind: RollbackProtectionAnchor::OsStoreCrossChecked,
+                    floor_issued_at_ms,
+                    fs_cross_check_ms,
+                    cross_check_ok,
+                    degraded: true,
+                    last_error,
+                });
+            }
+            Err(error) => {
+                if security.allow_file_fallback {
+                    let (record, fs_cross_check_ms) =
+                        load_or_initialize_rollback_record_from_sidecar(path, &default_record)?;
+                    return Ok(RollbackProtectionStatus {
+                        anchor_kind: RollbackProtectionAnchor::FileBackedCrossChecked,
+                        floor_issued_at_ms: record.floor_issued_at_ms,
+                        fs_cross_check_ms,
+                        cross_check_ok: fs_cross_check_ms.is_some(),
+                        degraded: true,
+                        last_error: Some(format!(
+                            "credential store unavailable, fallback to file anchor: {error}"
+                        )),
+                    });
+                }
+                bail!("credential store unavailable and file fallback disabled: {error}");
+            }
+        }
+    }
+
+    let (record, fs_cross_check_ms) =
+        load_or_initialize_rollback_record_from_sidecar(path, &default_record)?;
+    Ok(RollbackProtectionStatus {
+        anchor_kind: RollbackProtectionAnchor::FileBackedCrossChecked,
+        floor_issued_at_ms: record.floor_issued_at_ms,
+        fs_cross_check_ms,
+        cross_check_ok: fs_cross_check_ms.is_some(),
+        degraded: true,
+        last_error: None,
+    })
+}
+
+fn advance_rollback_status(
+    status: &mut RollbackProtectionStatus,
+    path: &Path,
+    issued_at_ms: i64,
+    now_ms: i64,
+) -> Result<()> {
+    let next_floor = status
+        .floor_issued_at_ms
+        .map(|current| current.max(issued_at_ms))
+        .unwrap_or(issued_at_ms);
+    let record = RollbackAnchorRecord {
+        floor_issued_at_ms: Some(next_floor),
+        updated_at_ms: now_ms,
+    };
+
+    match status.anchor_kind {
+        RollbackProtectionAnchor::OsStoreCrossChecked => {
+            persist_rollback_record_to_keyring(path, &record)?;
+            persist_rollback_record_to_sidecar(path, &record)?;
+            status.fs_cross_check_ms = sidecar_mtime_ms(&rollback_anchor_sidecar_path(path));
+            status.cross_check_ok = true;
+        }
+        RollbackProtectionAnchor::FileBackedCrossChecked => {
+            persist_rollback_record_to_sidecar(path, &record)?;
+            status.fs_cross_check_ms = sidecar_mtime_ms(&rollback_anchor_sidecar_path(path));
+            status.cross_check_ok = status.fs_cross_check_ms.is_some();
+        }
+        RollbackProtectionAnchor::TpmNvCounter | RollbackProtectionAnchor::Ephemeral => {
+            status.cross_check_ok = false;
+        }
+    }
+
+    status.floor_issued_at_ms = record.floor_issued_at_ms;
+    Ok(())
+}
+
+fn rollback_anchor_sidecar_path(path: &Path) -> PathBuf {
+    path.with_extension("rollback-anchor.json")
+}
+
+fn rollback_anchor_keyring_account(path: &Path) -> String {
+    format!(
+        "rollback-anchor:{}",
+        blake3::hash(path.to_string_lossy().as_bytes()).to_hex()
+    )
+}
+
+fn load_or_initialize_rollback_record_from_keyring(
+    path: &Path,
+    default_record: &RollbackAnchorRecord,
+) -> Result<RollbackAnchorRecord> {
+    let entry = keyring::Entry::new(
+        "aegis-sensor/rollback-anchor",
+        &rollback_anchor_keyring_account(path),
+    )?;
+    match entry.get_password() {
+        Ok(serialized) => Ok(serde_json::from_str(&serialized)?),
+        Err(_) => {
+            persist_rollback_record_to_keyring(path, default_record)?;
+            Ok(default_record.clone())
+        }
+    }
+}
+
+fn persist_rollback_record_to_keyring(path: &Path, record: &RollbackAnchorRecord) -> Result<()> {
+    let entry = keyring::Entry::new(
+        "aegis-sensor/rollback-anchor",
+        &rollback_anchor_keyring_account(path),
+    )?;
+    entry.set_password(&serde_json::to_string(record)?)?;
+    Ok(())
+}
+
+fn load_or_initialize_rollback_record_from_sidecar(
+    path: &Path,
+    default_record: &RollbackAnchorRecord,
+) -> Result<(RollbackAnchorRecord, Option<i64>)> {
+    let sidecar = rollback_anchor_sidecar_path(path);
+    if !sidecar.exists() {
+        persist_rollback_record_to_sidecar(path, default_record)?;
+        return Ok((default_record.clone(), sidecar_mtime_ms(&sidecar)));
+    }
+
+    let record = serde_json::from_slice::<RollbackAnchorRecord>(&fs::read(&sidecar)?)?;
+    Ok((record, sidecar_mtime_ms(&sidecar)))
+}
+
+fn persist_rollback_record_to_sidecar(path: &Path, record: &RollbackAnchorRecord) -> Result<()> {
+    let sidecar = rollback_anchor_sidecar_path(path);
+    if let Some(parent) = sidecar.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&sidecar, serde_json::to_vec_pretty(record)?)?;
+    Ok(())
+}
+
+fn sidecar_mtime_ms(path: &Path) -> Option<i64> {
+    fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis() as i64)
+}
+
+fn max_floor(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
+}
+
+fn now_unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_millis() as i64
 }
 
 #[derive(Clone)]
@@ -621,7 +889,12 @@ impl CommandValidator {
         let expires_at_ms = command
             .issued_at_ms
             .saturating_add(i64::from(command.ttl_ms));
-        ledger.register(command.command_id, expires_at_ms, now_ms)?;
+        ledger.register(
+            command.command_id,
+            command.issued_at_ms,
+            expires_at_ms,
+            now_ms,
+        )?;
         self.validate_approval_policy(&command, &identity.min_policy_version)?;
 
         Ok(ValidatedCommand {
@@ -707,6 +980,8 @@ pub enum CommandValidationError {
     ClockSkewExceeded,
     #[error("replay detected")]
     ReplayDetected,
+    #[error("rollback protection triggered")]
+    RollbackProtectionTriggered,
     #[error("command replay ledger persistence failure")]
     PersistenceFailure,
     #[error("approval proof failed")]
@@ -892,6 +1167,7 @@ mod tests {
         CommandValidator, CommunicationRuntime, HeartbeatBuilder, TelemetryBatchBuilder,
         TransportDriver,
     };
+    use crate::config::SecurityConfig;
     use aegis_model::{
         AgentHealth, ApprovalPolicy, ApprovalProof, ApproverEntry, CommunicationChannelKind,
         DownlinkMessage, EventPayload, EventType, FileContext, NormalizedEvent, Priority,
@@ -1246,15 +1522,40 @@ mod tests {
         let command_id = Uuid::now_v7();
         let mut first = CommandReplayLedger::new_persistent(path.clone()).expect("create ledger");
         first
-            .register(command_id, 10_000, 1_000)
+            .register(command_id, 5_000, 10_000, 1_000)
             .expect("first register");
 
         let mut reopened =
             CommandReplayLedger::new_persistent(path).expect("reopen persistent ledger");
         let error = reopened
-            .register(command_id, 10_000, 1_100)
+            .register(command_id, 5_000, 10_000, 1_100)
             .expect_err("replay should be persisted");
         assert_eq!(error, CommandValidationError::ReplayDetected);
+    }
+
+    #[test]
+    fn command_replay_ledger_rejects_rollbacked_issued_at() {
+        let path = temp_path("command-replay-floor.db");
+        let security = SecurityConfig {
+            use_os_credential_store: false,
+            allow_file_fallback: true,
+            memory_lock_best_effort: false,
+        };
+        let mut first = CommandReplayLedger::new_persistent_with_security(path.clone(), &security)
+            .expect("create ledger");
+        first
+            .register(Uuid::now_v7(), 8_000, 20_000, 1_000)
+            .expect("first register");
+
+        let mut reopened = CommandReplayLedger::new_persistent_with_security(path, &security)
+            .expect("reopen persistent ledger");
+        let error = reopened
+            .register(Uuid::now_v7(), 7_000, 21_000, 1_100)
+            .expect_err("older issued_at should be rejected");
+
+        assert_eq!(error, CommandValidationError::RollbackProtectionTriggered);
+        assert_eq!(reopened.rollback_status().floor_issued_at_ms, Some(8_000));
+        assert!(reopened.rollback_status().cross_check_ok);
     }
 
     #[test]

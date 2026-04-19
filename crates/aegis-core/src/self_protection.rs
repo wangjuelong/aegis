@@ -1,9 +1,15 @@
+use crate::config::AgentConfig;
+use crate::error::CoreError;
 use aegis_model::Severity;
+use getrandom::fill as getrandom_fill;
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::{ErrorKind, Write};
+use std::path::{Path, PathBuf};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum TamperSignal {
@@ -82,22 +88,128 @@ impl DerivedKeyTier {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct DerivedKeyMaterial {
+    #[zeroize(skip)]
     pub tier: DerivedKeyTier,
+    #[zeroize(skip)]
     pub version: u32,
     pub key_bytes: [u8; 32],
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum KeyProtectionTier {
+    HardwareBound,
+    OsCredentialStore,
+    FileBackedFallback,
+    InMemoryTestOnly,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KeyProtectionStatus {
+    pub active_tier: KeyProtectionTier,
+    pub hardware_root_available: bool,
+    pub degraded: bool,
+    pub memory_lock_supported: bool,
+    pub memory_lock_enabled: bool,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct MemoryLockState {
+    supported: bool,
+    enabled: bool,
+    last_error: Option<String>,
+}
+
+struct SensitiveBytes {
+    bytes: Zeroizing<Vec<u8>>,
+    locked: bool,
+}
+
+impl SensitiveBytes {
+    fn new(bytes: Vec<u8>, best_effort_lock: bool) -> (Self, MemoryLockState) {
+        let mut state = MemoryLockState {
+            supported: cfg!(unix),
+            ..MemoryLockState::default()
+        };
+        let mut secret = Self {
+            bytes: Zeroizing::new(bytes),
+            locked: false,
+        };
+
+        #[cfg(unix)]
+        {
+            if best_effort_lock && !secret.bytes.is_empty() {
+                let rc = unsafe {
+                    libc::mlock(
+                        secret.bytes.as_ptr().cast::<libc::c_void>(),
+                        secret.bytes.len(),
+                    )
+                };
+                if rc == 0 {
+                    secret.locked = true;
+                    state.enabled = true;
+                } else {
+                    state.last_error =
+                        Some(format!("mlock failed: {}", std::io::Error::last_os_error()));
+                }
+            }
+        }
+
+        (secret, state)
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        self.bytes.as_slice()
+    }
+}
+
+impl Drop for SensitiveBytes {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            if self.locked && !self.bytes.is_empty() {
+                let _ = unsafe {
+                    libc::munlock(self.bytes.as_ptr().cast::<libc::c_void>(), self.bytes.len())
+                };
+            }
+        }
+    }
+}
+
 pub struct KeyDerivationService {
-    root_secret: Vec<u8>,
+    root_secret: SensitiveBytes,
+    protection_status: KeyProtectionStatus,
 }
 
 impl KeyDerivationService {
     pub fn new(root_secret: impl Into<Vec<u8>>) -> Self {
+        let (root_secret, memory_lock) = SensitiveBytes::new(root_secret.into(), false);
         Self {
-            root_secret: root_secret.into(),
+            root_secret,
+            protection_status: KeyProtectionStatus {
+                active_tier: KeyProtectionTier::InMemoryTestOnly,
+                hardware_root_available: false,
+                degraded: true,
+                memory_lock_supported: memory_lock.supported,
+                memory_lock_enabled: memory_lock.enabled,
+                last_error: memory_lock.last_error,
+            },
         }
+    }
+
+    pub fn from_config(config: &AgentConfig) -> Result<Self, CoreError> {
+        let (root_secret, mut protection_status) = load_master_key(config)?;
+        let (root_secret, memory_lock) =
+            SensitiveBytes::new(root_secret, config.security.memory_lock_best_effort);
+        protection_status.memory_lock_supported = memory_lock.supported;
+        protection_status.memory_lock_enabled = memory_lock.enabled;
+        merge_status_error(&mut protection_status.last_error, memory_lock.last_error);
+        Ok(Self {
+            root_secret,
+            protection_status,
+        })
     }
 
     pub fn derive(&self, context: &KeyContext) -> String {
@@ -105,7 +217,7 @@ impl KeyDerivationService {
     }
 
     pub fn derive_bytes(&self, context: &KeyContext, len: usize) -> Vec<u8> {
-        let hk = Hkdf::<Sha256>::new(None, &self.root_secret);
+        let hk = Hkdf::<Sha256>::new(None, self.root_secret.as_slice());
         let info = format!(
             "aegis:{}:{}:{}",
             context.tenant_id, context.agent_id, context.purpose
@@ -139,6 +251,175 @@ impl KeyDerivationService {
             key_bytes: material,
         }
     }
+
+    pub fn protection_status(&self) -> &KeyProtectionStatus {
+        &self.protection_status
+    }
+}
+
+fn load_master_key(config: &AgentConfig) -> Result<(Vec<u8>, KeyProtectionStatus), CoreError> {
+    let mut last_error = None;
+
+    if config.security.use_os_credential_store {
+        match load_master_key_from_keyring(config) {
+            Ok(key) => {
+                return Ok((
+                    key,
+                    KeyProtectionStatus {
+                        active_tier: KeyProtectionTier::OsCredentialStore,
+                        hardware_root_available: false,
+                        degraded: true,
+                        memory_lock_supported: false,
+                        memory_lock_enabled: false,
+                        last_error: None,
+                    },
+                ));
+            }
+            Err(error) => merge_status_error(
+                &mut last_error,
+                Some(format!("os credential store unavailable: {error}")),
+            ),
+        }
+    }
+
+    if config.security.allow_file_fallback {
+        match load_master_key_from_file(config) {
+            Ok(key) => {
+                return Ok((
+                    key,
+                    KeyProtectionStatus {
+                        active_tier: KeyProtectionTier::FileBackedFallback,
+                        hardware_root_available: false,
+                        degraded: true,
+                        memory_lock_supported: false,
+                        memory_lock_enabled: false,
+                        last_error,
+                    },
+                ));
+            }
+            Err(error) => merge_status_error(
+                &mut last_error,
+                Some(format!("file-backed master key unavailable: {error}")),
+            ),
+        }
+    }
+
+    Err(CoreError::Crypto(last_error.unwrap_or_else(|| {
+        "no master key provider available".to_string()
+    })))
+}
+
+fn load_master_key_from_keyring(config: &AgentConfig) -> Result<Vec<u8>, CoreError> {
+    let entry = keyring::Entry::new(
+        "aegis-sensor/master-key",
+        &keyring_account(config, "master-key"),
+    )
+    .map_err(|error| CoreError::Crypto(error.to_string()))?;
+    match entry.get_password() {
+        Ok(secret) => decode_secret_hex(&secret),
+        Err(_) => {
+            let secret = generate_secret_bytes(32)?;
+            entry
+                .set_password(&hex::encode(&secret))
+                .map_err(|error| CoreError::Crypto(error.to_string()))?;
+            Ok(secret)
+        }
+    }
+}
+
+fn load_master_key_from_file(config: &AgentConfig) -> Result<Vec<u8>, CoreError> {
+    let path = secure_root(&config.storage.state_root).join("master-key.bin");
+    if path.exists() {
+        let bytes = fs::read(&path)?;
+        if bytes.len() != 32 {
+            return Err(CoreError::Crypto(format!(
+                "unexpected master key length {}, expected 32",
+                bytes.len()
+            )));
+        }
+        return Ok(bytes);
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let secret = generate_secret_bytes(32)?;
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut file) => {
+            file.write_all(&secret)?;
+            restrict_owner_only(&path)?;
+            Ok(secret)
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            let bytes = fs::read(&path)?;
+            if bytes.len() != 32 {
+                return Err(CoreError::Crypto(format!(
+                    "unexpected master key length {}, expected 32",
+                    bytes.len()
+                )));
+            }
+            Ok(bytes)
+        }
+        Err(error) => Err(CoreError::from(error)),
+    }
+}
+
+fn secure_root(state_root: &Path) -> PathBuf {
+    state_root.join("secure")
+}
+
+fn keyring_account(config: &AgentConfig, namespace: &str) -> String {
+    let scope_hash = blake3::hash(config.storage.state_root.to_string_lossy().as_bytes())
+        .to_hex()
+        .to_string();
+    format!(
+        "{namespace}:{}:{}:{scope_hash}",
+        config.tenant_id, config.agent_id
+    )
+}
+
+fn decode_secret_hex(secret: &str) -> Result<Vec<u8>, CoreError> {
+    let decoded =
+        hex::decode(secret.trim()).map_err(|error| CoreError::Crypto(error.to_string()))?;
+    if decoded.len() != 32 {
+        return Err(CoreError::Crypto(format!(
+            "unexpected secret length {}, expected 32",
+            decoded.len()
+        )));
+    }
+    Ok(decoded)
+}
+
+fn generate_secret_bytes(len: usize) -> Result<Vec<u8>, CoreError> {
+    let mut secret = vec![0u8; len];
+    getrandom_fill(&mut secret).map_err(|error| CoreError::Crypto(error.to_string()))?;
+    Ok(secret)
+}
+
+fn merge_status_error(target: &mut Option<String>, next: Option<String>) {
+    let Some(next) = next else {
+        return;
+    };
+    match target {
+        Some(current) if !current.is_empty() => {
+            current.push_str("; ");
+            current.push_str(&next);
+        }
+        _ => *target = Some(next),
+    }
+}
+
+#[cfg(unix)]
+fn restrict_owner_only(path: &Path) -> Result<(), CoreError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_owner_only(_path: &Path) -> Result<(), CoreError> {
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -273,10 +554,12 @@ mod tests {
     use super::{
         CertificateLifecycleEvent, CertificateLifecycleHooks, CertificateRecord,
         CrashExploitAnalyzer, CrashSample, DerivedKeyTier, KeyContext, KeyDerivationService,
-        ProtectionPosture, SelfProtectionManager, TamperSignal,
+        KeyProtectionTier, ProtectionPosture, SelfProtectionManager, TamperSignal,
     };
+    use crate::config::AgentConfig;
     use aegis_model::Severity;
     use std::path::PathBuf;
+    use uuid::Uuid;
 
     #[test]
     fn self_protection_manager_enters_lockdown_on_repeated_tamper() {
@@ -333,6 +616,34 @@ mod tests {
         assert_eq!(telemetry_v1, telemetry_v1_again);
         assert_ne!(telemetry_v1.key_bytes, journal_v1.key_bytes);
         assert_ne!(telemetry_v1.key_bytes, telemetry_v2.key_bytes);
+    }
+
+    #[test]
+    fn config_backed_key_derivation_uses_file_fallback_when_requested() {
+        let mut config = AgentConfig::default();
+        config.storage.state_root =
+            std::env::temp_dir().join(format!("aegis-key-derivation-{}", Uuid::now_v7()));
+        config.security.use_os_credential_store = false;
+        config.security.allow_file_fallback = true;
+        config.security.memory_lock_best_effort = false;
+
+        let first = KeyDerivationService::from_config(&config).expect("load config-backed key");
+        let second = KeyDerivationService::from_config(&config).expect("reload config-backed key");
+        let first_key =
+            first.derive_material("tenant-a", "agent-1", DerivedKeyTier::TelemetryWal, 1);
+        let second_key =
+            second.derive_material("tenant-a", "agent-1", DerivedKeyTier::TelemetryWal, 1);
+
+        assert_eq!(first_key.key_bytes, second_key.key_bytes);
+        assert_eq!(
+            first.protection_status().active_tier,
+            KeyProtectionTier::FileBackedFallback
+        );
+        assert!(config
+            .storage
+            .state_root
+            .join("secure/master-key.bin")
+            .exists());
     }
 
     #[test]
