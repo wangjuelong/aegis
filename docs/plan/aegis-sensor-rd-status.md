@@ -57,7 +57,7 @@
 
 | 工作包 | 名称 | 状态 | 备注 |
 |--------|------|------|------|
-| C01 | 运行时检测/决策/响应闭环 | todo | 目标是把 core 原语接成主运行时闭环 |
+| C01 | 运行时检测/决策/响应闭环 | done | 已打通 `sensor-dispatch -> detection-pool -> decision-router -> alert/response/telemetry`，并通过 `cargo test --workspace` |
 | C02 | 下行命令、持久化重放防护与高危执行链 | todo | 目标是建立 `comms-rx -> validate -> execute -> ack` 闭环 |
 | C03 | 真实 `wasmtime` 插件宿主 | todo | 目标是替换当前仅校验 wasm 头/哈希的伪宿主 |
 | C04 | watchdog、updater 与诊断面运行态化 | todo | 目标是用真实状态快照替代 demo 程序与静态诊断输出 |

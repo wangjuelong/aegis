@@ -65,6 +65,10 @@ cargo run -p aegis-updater -- --once
 
 ### C01：运行时检测/决策/响应闭环
 
+**状态**
+
+- `done`（2026-04-19，代码提交：`61c22e4`）
+
 **目标**
 
 - 将 `IOC / Rule VM / Temporal / Script Decode / YARA / ML / Specialized Detection / Correlation / Storyline / Feedback / ResponseExecutor` 接入主运行时。
@@ -98,6 +102,33 @@ cargo run -p aegis-updater -- --once
   - 响应动作进入 `ResponseExecutor`
   - telemetry 中能看到从 `NormalizedEvent` 派生的记录
   - storyline / correlation 能生成聚合结果
+
+**本次实际落地**
+
+- 实际改动文件收敛为：
+  - `crates/aegis-core/src/orchestrator.rs`
+  - `crates/aegis-core/src/feedback.rs`
+  - `crates/aegis-core/src/response_executor.rs`
+- 将运行时任务拓扑扩展为 `sensor-dispatch -> detection-pool -> decision-router -> alert/response/telemetry`，并同步修正 `BootstrapSummary.task_topology` / `queue_capacities`。
+- 在主运行时内接入 `IOC / Rule VM / Temporal / Script Decode / YARA / ML / Specialized Detection / Correlation / Storyline / Threat Feedback`，不再停留在“模块存在但未接线”状态。
+- `response-executor` 任务已改为真实调用 `ResponseExecutor`，覆盖 `KillProcess`、`QuarantineFile`、`NetworkIsolate` 审计落盘，而不是仅输出日志。
+- `HealthReporter` 改为读取运行时计数与自适应白名单大小，状态页不再固定返回空白计数。
+- 新增闭环测试：
+  - `bootstrap_creates_runtime_topology`
+  - `runtime_executes_response_flow_for_malicious_script`
+
+**验证**
+
+```bash
+cargo fmt --all
+cargo test --workspace
+```
+
+**完成后仍保留的后续项**
+
+- `C02` 负责把 downlink 命令接收、验签、持久化 replay ledger、审批和高危执行链接入主运行时。
+- `C03` 负责把插件宿主升级为真实 `wasmtime` 沙箱。
+- `C04` 负责把 watchdog / updater / diagnose 改为读取真实状态快照。
 
 ### C02：下行命令、持久化重放防护与高危执行链
 
@@ -224,4 +255,3 @@ cargo run -p aegis-updater -- --once
 - 对应状态文档已更新
 - worktree 干净
 - 不污染根工作区 `/Users/lamba/github/aegis`
-
