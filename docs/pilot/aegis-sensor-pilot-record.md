@@ -23,10 +23,11 @@
 
 | 检查项 | 结果 | 说明 |
 |--------|------|------|
-| 工作区回归 | 通过 | 105 项单元测试与全部 doc tests 通过 |
+| 工作区回归 | 通过 | 110 项单元测试与全部 doc tests 通过 |
 | 诊断模式 | 通过 | 输出诊断包且 `runtime_bridge`、WAL 加密状态等关键字段正常 |
 | 容器 / Sidecar 契约 | 通过 | 容器元数据映射、sidecar/DaemonSet 契约、unix socket 本地控制面测试全部通过 |
 | Runtime SDK / Cloud API | 通过 | 编码器、connector runner、flush/cursor、bridge 示例运行通过 |
+| 平台执行基线 | 通过 | Windows/Linux/macOS 动作快照、TTL 阻断、隔离/取证落地与 core 联动测试全部通过 |
 | 主线合并准入 | 通过 | 满足进入 `main` 的本地回归门槛 |
 
 ## 4. 风险说明

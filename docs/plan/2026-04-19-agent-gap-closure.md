@@ -279,6 +279,13 @@
 
 - 测试覆盖文件隔离、取证工件、阻断 TTL、健康快照与响应执行链
 
+**完成记录（2026-04-19）**
+
+- 已在 `aegis-platform` 建立 `PlatformExecutionSnapshot`、`PlatformHealthSnapshot` 与 `BlockLease`，统一平台动作状态、阻断 TTL 与健康快照结构
+- 已将 Windows/Linux/macOS 平台从纯 no-op 提升为有状态执行基线，补齐隔离区、取证工件、隔离/释放与阻断状态落地
+- 已新增 `ResponseExecutor -> WindowsPlatform` 与 `RecoveryCoordinator -> LinuxPlatform` 的真实联动测试，验证 core 执行链已接入平台状态快照
+- 已通过 `cargo fmt --all`、`cargo test --workspace`、`cargo run -p aegis-agentd -- --diagnose`、`cargo run -p aegis-core --example runtime_sdk_connector`
+
 ## 3. 执行顺序
 
 1. G00：文档基线

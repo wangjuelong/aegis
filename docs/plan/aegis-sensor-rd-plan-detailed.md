@@ -667,3 +667,25 @@
   - 已将 `runtime-bridge` 纳入 `Orchestrator` 拓扑，并将 `RuntimeBridgeStatus` 接入 `DiagnoseBundle` 与 `aegis-agentd -- --diagnose`
   - 已更新 `runtime_sdk_connector` 示例，实跑展示 connector 二次写入 flush 与 batch 计数
   - 已通过 `cargo fmt --all`、`cargo test --workspace`、`cargo run -p aegis-core --example runtime_sdk_connector`、`cargo run -p aegis-agentd -- --diagnose`
+
+### G06：平台执行基线收口
+
+- 目标：将 Windows/Linux/macOS 平台从 no-op 响应提升为有状态、可审计、可回放的执行基线。
+- 交付：
+  - `crates/aegis-platform/src/traits.rs`
+  - `crates/aegis-platform/src/windows.rs`
+  - `crates/aegis-platform/src/linux.rs`
+  - `crates/aegis-platform/src/macos.rs`
+  - `crates/aegis-platform/src/lib.rs`
+  - `crates/aegis-core/src/response_executor.rs`
+  - `crates/aegis-core/src/recovery.rs`
+  - `docs/qe/aegis-sensor-qe-matrix.md`
+  - `docs/plan/aegis-sensor-rd-status.md`
+  - `docs/release/aegis-sensor-release-notes.md`
+- 依赖：G05
+- 完成记录（2026-04-19）：
+  - 已建立 `PlatformExecutionSnapshot`、`PlatformHealthSnapshot` 与 `BlockLease`，统一平台动作状态、阻断 TTL、隔离/释放与健康快照模型
+  - 已将 Windows/Linux/macOS 的 `quarantine_file`、`collect_forensics`、`block_*`、`network_isolate/release`、`protect_*` 等路径改为真实落地并写入平台状态
+  - 已补齐平台侧测试，覆盖文件隔离、取证工件、降级健康快照、阻断 TTL 与隔离释放
+  - 已补齐 `ResponseExecutor -> WindowsPlatform` 与 `RecoveryCoordinator -> LinuxPlatform` 的 core 侧真实联动测试
+  - 已通过 `cargo fmt --all`、`cargo test --workspace`、`cargo run -p aegis-agentd -- --diagnose`、`cargo run -p aegis-core --example runtime_sdk_connector`

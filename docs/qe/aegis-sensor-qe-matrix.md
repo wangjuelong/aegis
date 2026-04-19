@@ -3,14 +3,14 @@
 - 执行日期：2026-04-19
 - 执行分支：`feat/agent-gap-closure`
 - 环境基线：[`docs/env/开发环境.md`](../env/开发环境.md)
-- 当前轮次定位：G01-G05 收口回归与诊断链验证
+- 当前轮次定位：G01-G06 收口回归与诊断链验证
 
 ## 1. 执行结果
 
 | 类别 | 命令 / 依据 | 结果 | 备注 |
 |------|-------------|------|------|
-| 格式校验 | `cargo fmt --all` | 通过 | G05 代码收口后执行 |
-| 工作区回归 | `cargo test --workspace` | 通过 | `aegis_core` 89 项、`aegis_model` 4 项、`aegis_platform` 12 项，共 105 项单元测试；doc tests 全部通过 |
+| 格式校验 | `cargo fmt --all` | 通过 | G06 代码收口后执行 |
+| 工作区回归 | `cargo test --workspace` | 通过 | `aegis_core` 91 项、`aegis_model` 4 项、`aegis_platform` 15 项，共 110 项单元测试；doc tests 全部通过 |
 | 诊断模式 | `cargo run -p aegis-agentd -- --diagnose` | 通过 | 诊断包持续输出 `communication`、`runtime_signals`、`runtime_bridge`、`plugin_status`、WAL 加密状态、资源、自保护状态 |
 | Watchdog 运行时 | `cargo run -p aegis-watchdog` | 通过 | 已完成 agent/watchdog 心跳链路启动并输出 runtime ready 日志 |
 | Updater 运行时 | `cargo run -p aegis-updater` | 通过 | 已完成签名升级清单自校验并输出已验签 artifact 日志 |
@@ -20,10 +20,11 @@
 
 | 维度 | 覆盖方式 | 当前结果 |
 |------|----------|----------|
-| 平台兼容性 | `aegis_platform` Windows/Linux/macOS mock harness 测试 | 12/12 通过 |
+| 平台兼容性 | `aegis_platform` Windows/Linux/macOS 状态基线与 mock harness 测试 | 15/15 通过 |
 | 通信与安全链 | `comms`、`high_risk_ops`、`self_protection` 相关单元测试 | 命令验签、审批证明、重放保护、四级回退、恢复探测、证书生命周期、自保护全部通过 |
 | 容器与云原生 | `container_mode`、`runtime_sdk`、`orchestrator` 相关单元测试 | 容器元数据映射、unix socket sidecar 控制面、Runtime SDK 编码、connector flush/cursor、runtime-bridge 拓扑全部通过 |
 | 升级与诊断 | `upgrade` 模块单元测试 + `--diagnose` / `watchdog` / `updater` 实际运行 | 升级规划、灰度门控、清单验签、rollback 校验、watchdog 失联检测、`runtime_bridge` 诊断映射通过 |
+| 平台执行链 | `response_executor`、`recovery` 与实际平台实现联动测试 | `ResponseExecutor -> WindowsPlatform`、`RecoveryCoordinator -> LinuxPlatform` 真正写入平台状态快照并通过验证 |
 | 离线自治与取证 | `wal`、`recovery`、`response_executor` 单元测试 | 加密 WAL、损坏 segment 隔离、紧急审计环、快照恢复校验与取证链反篡改全部通过 |
 
 ## 3. 诊断模式快照
