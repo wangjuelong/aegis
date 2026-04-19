@@ -136,6 +136,13 @@
 
 - 测试覆盖失败 3 次后的自动降级、后台恢复升级、诊断字段输出
 
+**完成记录（2026-04-19）**
+
+- 已建立 `CommunicationRuntime`，覆盖 `gRPC -> WebSocket -> Long-Polling -> Domain Fronting` 四级回退顺序、失败阈值降级与恢复探测升级
+- 已将通信运行时接入 `orchestrator` 的 telemetry/heartbeat 链路，并新增 `comms-link-manager` 后台任务
+- 已扩展 `AgentHealth`、`HeartbeatRequest` 与 `DiagnoseBundle`，补齐 `communication_channel`、篡改信号与 `plugin_status` 字段
+- 已通过 `cargo fmt --all`、`cargo test --workspace` 与 `cargo run -p aegis-agentd -- --diagnose`
+
 ### G03：WAL 加密、恢复与证据链加固
 
 **目标**

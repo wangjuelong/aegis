@@ -582,3 +582,22 @@
   - 已建立 Remote Shell 会话管理器，实现单端点并发控制、工作时间窗、命令黑白名单、会话 TTL 与 asciicast 风格审计输出
   - 已为 Playbook 增加执行次数限制，为 Session Lock 增加锁定/释放状态管理与可撤销路径
   - 已新增对应单元测试，并通过 `cargo fmt --all` 与 `cargo test --workspace`
+
+### G02：通信回退运行时与诊断扩展
+
+- 目标：建立通信回退状态机，并将通信健康、篡改信号与插件状态暴露到诊断面。
+- 交付：
+  - `crates/aegis-core/src/comms.rs`
+  - `crates/aegis-core/src/health.rs`
+  - `crates/aegis-core/src/orchestrator.rs`
+  - `crates/aegis-core/src/upgrade.rs`
+  - `crates/aegis-agentd/src/main.rs`
+  - `crates/aegis-model/src/lib.rs`
+  - `docs/qe/aegis-sensor-qe-matrix.md`
+  - `docs/plan/aegis-sensor-rd-status.md`
+- 依赖：G01
+- 完成记录（2026-04-19）：
+  - 已建立 `CommunicationRuntime` 与 `TransportDriver` 抽象，实现四级回退、失败阈值降级与高优先级通道恢复探测
+  - 已将通信状态扩展到 `HeartbeatRequest`、`AgentHealth` 与 `DiagnoseBundle`，补齐 `communication_channel`、篡改信号与 `plugin_status`
+  - 已将 telemetry/heartbeat 接入 orchestrator 的通信运行时，并增加 `comms-link-manager` 后台任务
+  - 已新增通信降级/恢复测试，并通过 `cargo fmt --all`、`cargo test --workspace` 与 `cargo run -p aegis-agentd -- --diagnose`
