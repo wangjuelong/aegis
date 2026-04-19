@@ -1,8 +1,10 @@
 pub mod adaptive_whitelist;
 pub mod amsi;
 pub mod config;
+pub mod correlation;
 pub mod dispatch;
 pub mod error;
+pub mod feedback;
 pub mod hashing;
 pub mod health;
 pub mod ioc;
