@@ -17,5 +17,6 @@ pub mod rule_vm;
 pub mod script_decode;
 pub mod specialized_detection;
 pub mod spill;
+pub mod surface_monitor;
 pub mod temporal;
 pub mod yara;
