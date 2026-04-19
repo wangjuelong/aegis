@@ -61,3 +61,10 @@
 | C02 | 下行命令、持久化重放防护与高危执行链 | done | 已打通 `comms-rx -> validate -> execute -> ack`，并通过 `cargo test --workspace` |
 | C03 | 真实 `wasmtime` 插件宿主 | done | 已落地真实 `wasmtime` 宿主、fuel 预算和目录发现，并通过 `cargo test --workspace` |
 | C04 | watchdog、updater 与诊断面运行态化 | done | 已由 `88c6de2` 打通 agent/watchdog/update 三类状态快照与 `cargo run -p aegis-agentd -- --diagnose`、`cargo run -p aegis-watchdog -- --once`、`cargo run -p aegis-updater -- --once` |
+
+## 第三轮 Agent 完整性收口状态
+
+| 工作包 | 名称 | 状态 | 备注 |
+|--------|------|------|------|
+| C05 | 传输栈正式化 | done | 已由 `7961edd` 正式接入配置化通信运行时、四类真实驱动、统一 transport proto、批量遥测/告警上行、`BatchAck` 与流控落地，并通过 `cargo test --workspace` 与 `cargo run -p aegis-agentd -- --diagnose` |
+| C06 | 密钥保护、回滚保护与敏感内存强化 | doing | 下一步将主密钥 provider、rollback floor、敏感内存强化与诊断状态面真正落地 |

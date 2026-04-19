@@ -78,6 +78,28 @@
   - `probe_upgrade` 能将运行时提升回更优通道
   - agent 启动路径不再硬编码 loopback
 
+**完成记录（2026-04-19）**
+
+- 已通过提交 `7961edd` 完成代码收口：
+  - 新增 `transport_drivers.rs` 与 `build.rs`，正式生成并接入 transport proto
+  - `CommunicationRuntime::from_config(...)` 已在 orchestrator 与 `--diagnose` 路径接线
+  - 已补齐 gRPC / WebSocket / Long-Polling / Domain Fronting 四类真实驱动
+  - HTTP / WebSocket 路径不再使用 ad-hoc JSON frame，而是统一使用 protobuf transport bundle
+  - `telemetry-drain` 已恢复正常批量发送，而非单事件伪 batch
+  - 高优先级告警已具备独立上行链路，低/普通告警会归并进常规遥测批次
+  - `BatchAck` 与 `FlowControlHint` 已落到 runtime 行为，不再只停留在日志打印
+- 已通过以下验证：
+  - `cargo test --workspace`
+  - `cargo run -p aegis-agentd -- --diagnose`
+
+**本工作包完成后仍明确保留的差距**
+
+- 当前 `sequence_id` 仍在本地发送时推进，而不是在服务端 `BatchAck::Accepted` 后推进
+- `TelemetryWal` / `ForensicJournal` 仍未与传输 runtime 的 ACK / retry / replay 正式接线
+- `upload_artifact` / `pull_update` 目前已具备 proto 与测试服务，但尚未进入 agent 运行时闭环
+
+以上三项不再归入 C05，留待 C06 完成后重新审计，必要时拆出新工作包。
+
 ### C06：密钥保护、回滚保护与敏感内存强化
 
 **目标**
