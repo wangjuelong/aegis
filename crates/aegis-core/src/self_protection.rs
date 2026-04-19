@@ -84,6 +84,86 @@ impl KeyDerivationService {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CertificateLifecycleEvent {
+    Issued,
+    Rotated,
+    Revoked,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CertificateRecord {
+    pub thumbprint: String,
+    pub not_after_unix: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CertificateLifecycleAudit {
+    pub event: CertificateLifecycleEvent,
+    pub thumbprint: String,
+}
+
+#[derive(Default)]
+pub struct CertificateLifecycleHooks {
+    active: HashMap<String, CertificateRecord>,
+    retired: HashSet<String>,
+    audit: Vec<CertificateLifecycleAudit>,
+}
+
+impl CertificateLifecycleHooks {
+    pub fn issue(&mut self, record: CertificateRecord) {
+        self.audit.push(CertificateLifecycleAudit {
+            event: CertificateLifecycleEvent::Issued,
+            thumbprint: record.thumbprint.clone(),
+        });
+        self.active.insert(record.thumbprint.clone(), record);
+    }
+
+    pub fn rotate(
+        &mut self,
+        old_thumbprint: &str,
+        replacement: CertificateRecord,
+    ) -> Result<(), &'static str> {
+        if self.active.remove(old_thumbprint).is_none() {
+            return Err("missing active certificate");
+        }
+
+        self.retired.insert(old_thumbprint.to_string());
+        self.audit.push(CertificateLifecycleAudit {
+            event: CertificateLifecycleEvent::Rotated,
+            thumbprint: old_thumbprint.to_string(),
+        });
+        self.issue(replacement);
+        Ok(())
+    }
+
+    pub fn revoke(&mut self, thumbprint: &str) -> bool {
+        let existed = self.active.remove(thumbprint).is_some();
+        if existed {
+            self.retired.insert(thumbprint.to_string());
+            self.audit.push(CertificateLifecycleAudit {
+                event: CertificateLifecycleEvent::Revoked,
+                thumbprint: thumbprint.to_string(),
+            });
+        }
+        existed
+    }
+
+    pub fn active_thumbprints(&self) -> Vec<&str> {
+        let mut items = self.active.keys().map(String::as_str).collect::<Vec<_>>();
+        items.sort_unstable();
+        items
+    }
+
+    pub fn is_retired(&self, thumbprint: &str) -> bool {
+        self.retired.contains(thumbprint)
+    }
+
+    pub fn audit(&self) -> &[CertificateLifecycleAudit] {
+        &self.audit
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CrashSample {
     pub exception_code: String,
@@ -134,6 +214,7 @@ impl CrashExploitAnalyzer {
 #[cfg(test)]
 mod tests {
     use super::{
+        CertificateLifecycleEvent, CertificateLifecycleHooks, CertificateRecord,
         CrashExploitAnalyzer, CrashSample, KeyContext, KeyDerivationService, ProtectionPosture,
         SelfProtectionManager, TamperSignal,
     };
@@ -178,6 +259,42 @@ mod tests {
 
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn certificate_lifecycle_rotates_and_revokes_records() {
+        let mut hooks = CertificateLifecycleHooks::default();
+        hooks.issue(CertificateRecord {
+            thumbprint: "cert-a".to_string(),
+            not_after_unix: 1_800_000_000,
+        });
+        hooks
+            .rotate(
+                "cert-a",
+                CertificateRecord {
+                    thumbprint: "cert-b".to_string(),
+                    not_after_unix: 1_900_000_000,
+                },
+            )
+            .expect("rotation should succeed");
+
+        assert_eq!(hooks.active_thumbprints(), vec!["cert-b"]);
+        assert!(hooks.is_retired("cert-a"));
+        assert!(hooks.revoke("cert-b"));
+        assert!(hooks.active_thumbprints().is_empty());
+        assert_eq!(
+            hooks
+                .audit()
+                .iter()
+                .map(|entry| entry.event)
+                .collect::<Vec<_>>(),
+            vec![
+                CertificateLifecycleEvent::Issued,
+                CertificateLifecycleEvent::Rotated,
+                CertificateLifecycleEvent::Issued,
+                CertificateLifecycleEvent::Revoked,
+            ]
+        );
     }
 
     #[test]
