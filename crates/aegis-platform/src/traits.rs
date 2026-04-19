@@ -4,6 +4,7 @@ use aegis_model::{
     SensorConfig, SuspiciousProcess,
 };
 use anyhow::Result;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -31,6 +32,35 @@ pub struct PlatformDescriptor {
     pub supports_etw_integrity: bool,
     pub supports_bpf_integrity: bool,
     pub supports_container_sensor: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockLease {
+    pub kind: String,
+    pub target: String,
+    pub ttl_secs: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PlatformExecutionSnapshot {
+    pub running: bool,
+    pub suspended_pids: Vec<u32>,
+    pub terminated_pids: Vec<u32>,
+    pub terminated_protected_pids: Vec<u32>,
+    pub protected_pids: Vec<u32>,
+    pub protected_paths: Vec<PathBuf>,
+    pub quarantined_files: Vec<QuarantineReceipt>,
+    pub forensic_artifacts: Vec<ArtifactBundle>,
+    pub rollback_targets: Vec<RollbackTarget>,
+    pub active_blocks: Vec<BlockLease>,
+    pub network_isolation_active: bool,
+    pub last_isolation_rules: Option<IsolationRulesV2>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PlatformHealthSnapshot {
+    pub provider_health: BTreeMap<String, bool>,
+    pub integrity_reports: BTreeMap<String, IntegrityReport>,
 }
 
 pub trait PlatformSensor: Send + Sync {

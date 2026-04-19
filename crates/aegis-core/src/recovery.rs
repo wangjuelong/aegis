@@ -233,7 +233,7 @@ mod tests {
         EvidenceChain, FilesystemRollbackPlanner, RecoveryCoordinator, RegistryRollbackPlanner,
     };
     use aegis_model::{ArtifactBundle, ForensicSpec};
-    use aegis_platform::{MockAction, MockPlatform};
+    use aegis_platform::{LinuxPlatform, MockAction, MockPlatform};
     use std::fs;
     use std::path::PathBuf;
     use uuid::Uuid;
@@ -259,6 +259,34 @@ mod tests {
                 "HKCU\\Software\\Aegis".to_string()
             )]
         );
+    }
+
+    #[test]
+    fn recovery_coordinator_updates_linux_platform_snapshot() {
+        let platform = LinuxPlatform::default();
+        let coordinator = RecoveryCoordinator::new(&platform);
+        let plan = RegistryRollbackPlanner::plan("iptables", "{\"policy\":\"drop\"}");
+        let mut chain = EvidenceChain::default();
+
+        coordinator
+            .execute_registry_rollback(&plan)
+            .expect("registry rollback should be recorded");
+        coordinator
+            .collect_forensics(
+                &ForensicSpec {
+                    include_memory: true,
+                    include_registry: false,
+                    include_network: true,
+                },
+                &mut chain,
+            )
+            .expect("forensics should be collected");
+
+        let snapshot = platform.execution_snapshot();
+        assert_eq!(snapshot.rollback_targets[0].selector, "iptables");
+        assert_eq!(snapshot.forensic_artifacts.len(), 1);
+        assert!(snapshot.forensic_artifacts[0].location.exists());
+        assert_eq!(chain.entries.len(), 1);
     }
 
     #[test]

@@ -179,9 +179,9 @@ fn now_unix_ns() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{ResponseActionKind, ResponseAuditLog, ResponseExecutor, TerminationRequest};
-    use aegis_platform::{MockAction, MockPlatform};
+    use aegis_platform::{MockAction, MockPlatform, WindowsPlatform};
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use uuid::Uuid;
 
     fn audit_path(name: &str) -> PathBuf {
@@ -231,5 +231,29 @@ mod tests {
         assert_eq!(report.records[0].vault_path.as_ref(), Some(&target));
         let audit_contents = fs::read_to_string(audit.path()).expect("read audit");
         assert!(audit_contents.contains("payload.exe"));
+    }
+
+    #[test]
+    fn response_executor_updates_windows_platform_snapshot() {
+        let platform = WindowsPlatform::default();
+        let audit = ResponseAuditLog::new(audit_path("windows-platform"));
+        let executor = ResponseExecutor::new(&platform, audit);
+
+        executor
+            .terminate_process(TerminationRequest {
+                pid: 7331,
+                protected_process: true,
+                kill_required: true,
+            })
+            .expect("terminate protected process");
+        executor
+            .quarantine_file(Path::new("C:/temp/runtime.dll"))
+            .expect("quarantine runtime artifact");
+
+        let snapshot = platform.execution_snapshot();
+        assert_eq!(snapshot.suspended_pids, vec![7331]);
+        assert_eq!(snapshot.terminated_protected_pids, vec![7331]);
+        assert_eq!(snapshot.quarantined_files.len(), 1);
+        assert!(snapshot.quarantined_files[0].vault_path.exists());
     }
 }
