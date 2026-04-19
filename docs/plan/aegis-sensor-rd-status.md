@@ -26,8 +26,8 @@
 | P13 | ML / OOD / Behavioral Models | done | 已建立模型注册、特征抽取、OOD 评分与失败回退测试 |
 | P14 | Correlation / Storyline / Threat Feedback | done | 已建立分片关联缓存、storyline 合并与 feedback 回灌测试 |
 | P15 | 专项检测能力 | done | 已建立勒索、ASR、身份与诱捕检测引擎及统一 finding 输出 |
-| P16 | Vuln Scan / Passive Discovery / AI Monitor | doing | 当前进入软件清单、资产发现与 AI 监控基线实现 |
-| P17 | Response Executor / Quarantine / Kill | todo | 依赖 P04/P07 |
+| P16 | Vuln Scan / Passive Discovery / AI Monitor | done | 已建立软件清单匹配、被动发现缓存与 AI 风险监控测试 |
+| P17 | Response Executor / Quarantine / Kill | doing | 当前进入响应执行、隔离与终止动作基线实现 |
 | P18 | Block Decision / Network Isolate / Firewall | todo | 依赖 P17 |
 | P19 | Registry / Filesystem Rollback / Forensics | todo | 依赖 P17 |
 | P20 | Remote Shell / Session Lock / Approval Queue | todo | 依赖 P17-P19 |

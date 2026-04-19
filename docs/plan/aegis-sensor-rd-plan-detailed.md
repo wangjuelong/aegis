@@ -302,6 +302,11 @@
   - 建立 AI 应用风险监控、模型完整性与敏感数据外泄规则
 - 验收：
   - 测试覆盖清单匹配、资产发现聚合与 AI 监控判定
+- 完成记录（2026-04-19）：
+  - 已建立 `VulnerabilityMatcher`，支持软件清单与 CVE 版本门槛匹配
+  - 已建立 `PassiveDiscoveryCache`，支持网络资产的被动聚合与去重
+  - 已建立 `AiMonitor`，覆盖 AI 工具使用、模型完整性与 DLP 外泄规则
+  - 已通过清单匹配、资产发现聚合和 AI 监控判定测试
 
 ### P17：Response Executor / Quarantine / Kill
 
