@@ -3,8 +3,8 @@ use crate::migrations::{CURRENT_SCHEMA_VERSION, MIN_READER_SCHEMA_VERSION};
 use crate::self_protection::ProtectionPosture;
 use aegis_model::{
     AgentHealth, AgentSupervisorHeartbeat, CommunicationRuntimeStatus, HotUpdateManifest,
-    PluginHealthStatus, RuntimeHealthSignals, TelemetryIntegrity, WatchdogAlert, WatchdogAlertKind,
-    WatchdogHeartbeat,
+    PluginHealthStatus, RuntimeBridgeStatus, RuntimeHealthSignals, TelemetryIntegrity,
+    WatchdogAlert, WatchdogAlertKind, WatchdogHeartbeat,
 };
 use anyhow::{bail, Result};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -315,6 +315,7 @@ pub struct DiagnoseBundle {
     pub wal: DiagnoseWalStatus,
     pub resources: AgentHealth,
     pub runtime_signals: RuntimeHealthSignals,
+    pub runtime_bridge: Option<RuntimeBridgeStatus>,
     pub plugin_status: Vec<PluginHealthStatus>,
     pub self_protection_posture: ProtectionPosture,
     pub redacted_fields: Vec<String>,
@@ -334,6 +335,7 @@ impl DiagnoseCollector {
         ring_buffer_utilization_ratio: f32,
         wal: DiagnoseWalStatus,
         resources: AgentHealth,
+        runtime_bridge: Option<RuntimeBridgeStatus>,
         plugin_status: Vec<PluginHealthStatus>,
         self_protection_posture: ProtectionPosture,
     ) -> DiagnoseBundle {
@@ -350,6 +352,7 @@ impl DiagnoseCollector {
             wal,
             runtime_signals: resources.runtime_signals.clone(),
             resources,
+            runtime_bridge,
             plugin_status,
             self_protection_posture,
             redacted_fields: vec![
@@ -376,9 +379,10 @@ mod tests {
     use crate::health::HealthReporter;
     use crate::self_protection::ProtectionPosture;
     use aegis_model::{
-        AgentSupervisorHeartbeat, CommunicationChannelKind, CommunicationRuntimeStatus,
-        HotUpdateManifest, LineageCounters, PluginHealthStatus, RuntimeHealthSignals,
-        TelemetryIntegrity, WatchdogAlertKind, WatchdogHeartbeat,
+        AgentSupervisorHeartbeat, CloudConnectorCursor, CloudLogSourceKind,
+        CommunicationChannelKind, CommunicationRuntimeStatus, HotUpdateManifest, LineageCounters,
+        PluginHealthStatus, RuntimeBridgeStatus, RuntimeHealthSignals, TelemetryIntegrity,
+        WatchdogAlertKind, WatchdogHeartbeat,
     };
     use ed25519_dalek::{Signer, SigningKey};
     use std::collections::BTreeMap;
@@ -576,6 +580,19 @@ mod tests {
                 quarantined_segments: 1,
             },
             health(),
+            Some(RuntimeBridgeStatus {
+                control_socket_path: Some(
+                    "/var/lib/aegis/runtime-bridge-local-agent.sock".to_string(),
+                ),
+                buffered_events: 2,
+                emitted_batches: 1,
+                last_runtime_heartbeat_ms: Some(1_713_000_120_000),
+                last_connector_cursor: Some(CloudConnectorCursor {
+                    source: CloudLogSourceKind::AwsCloudTrail,
+                    shard: "us-east-1".to_string(),
+                    checkpoint: "evt-9".to_string(),
+                }),
+            }),
             vec![PluginHealthStatus {
                 plugin_id: "runtime-audit".to_string(),
                 healthy: true,
@@ -589,10 +606,18 @@ mod tests {
         assert!(json.contains("\"telemetry_segments\": 3"));
         assert!(json.contains("\"encrypted\": true"));
         assert!(json.contains("\"active_channel\": \"WebSocket\""));
+        assert!(json.contains("\"runtime_bridge\""));
         assert!(json.contains("\"redacted_fields\""));
         assert_eq!(
             bundle.runtime_signals.communication_channel,
             CommunicationChannelKind::Grpc
+        );
+        assert_eq!(
+            bundle
+                .runtime_bridge
+                .as_ref()
+                .map(|value| value.emitted_batches),
+            Some(1)
         );
         assert_eq!(bundle.plugin_status.len(), 1);
         assert!(bundle

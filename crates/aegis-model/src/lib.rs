@@ -865,6 +865,15 @@ pub struct WatchdogAlert {
     pub observed_at_ms: i64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SidecarControlMessage {
+    pub tenant_id: String,
+    pub agent_id: String,
+    pub operation: String,
+    pub metadata: BTreeMap<String, String>,
+    pub sent_at_ms: i64,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RuntimeProviderKind {
     AwsLambda,
@@ -925,6 +934,15 @@ pub struct RuntimeHeartbeat {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeBridgeStatus {
+    pub control_socket_path: Option<String>,
+    pub buffered_events: usize,
+    pub emitted_batches: u64,
+    pub last_runtime_heartbeat_ms: Option<i64>,
+    pub last_connector_cursor: Option<CloudConnectorCursor>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimePolicyContract {
     pub contract_version: String,
     pub policy_version: String,
@@ -982,10 +1000,10 @@ mod tests {
         AgentSupervisorHeartbeat, CloudApiConnectorContract, CloudApiRecord, CloudConnectorCursor,
         CloudLogSourceKind, CommunicationChannelKind, CommunicationRuntimeStatus, EventBatch,
         EventPayload, EventType, FileContext, HotUpdateManifest, NormalizedEvent,
-        PluginHealthStatus, Priority, ProcessContext, RuntimeHealthSignals, RuntimeHeartbeat,
-        RuntimeMetadata, RuntimePolicyContract, RuntimeProviderKind, RuntimeSdkEvent,
-        RuntimeSignalKind, Severity, TelemetryEvent, TelemetryIntegrity, UplinkMessage,
-        WatchdogAlert, WatchdogAlertKind, WatchdogHeartbeat,
+        PluginHealthStatus, Priority, ProcessContext, RuntimeBridgeStatus, RuntimeHealthSignals,
+        RuntimeHeartbeat, RuntimeMetadata, RuntimePolicyContract, RuntimeProviderKind,
+        RuntimeSdkEvent, RuntimeSignalKind, Severity, SidecarControlMessage, TelemetryEvent,
+        TelemetryIntegrity, UplinkMessage, WatchdogAlert, WatchdogAlertKind, WatchdogHeartbeat,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -1188,6 +1206,20 @@ mod tests {
             last_seen_ms: Some(1_713_000_199_000),
             observed_at_ms: 1_713_000_205_000,
         };
+        let sidecar_message = SidecarControlMessage {
+            tenant_id: "tenant-a".to_string(),
+            agent_id: "agent-a".to_string(),
+            operation: "flush-telemetry".to_string(),
+            metadata: BTreeMap::from([("socket".to_string(), "/var/run/aegis.sock".to_string())]),
+            sent_at_ms: 1_713_000_206_000,
+        };
+        let bridge_status = RuntimeBridgeStatus {
+            control_socket_path: Some("/var/run/aegis.sock".to_string()),
+            buffered_events: 3,
+            emitted_batches: 2,
+            last_runtime_heartbeat_ms: Some(1_713_000_207_000),
+            last_connector_cursor: connector.cursor.clone(),
+        };
 
         assert_eq!(event.contract_version, heartbeat.contract_version);
         assert_eq!(heartbeat.policy_version, policy.policy_version);
@@ -1206,5 +1238,7 @@ mod tests {
         assert_eq!(agent_supervisor.plugin_count, 1);
         assert_eq!(watchdog.observed_agent_restart_epoch, 3);
         assert_eq!(alert.kind, WatchdogAlertKind::WatchdogMissedHeartbeat);
+        assert_eq!(sidecar_message.operation, "flush-telemetry");
+        assert_eq!(bridge_status.emitted_batches, 2);
     }
 }

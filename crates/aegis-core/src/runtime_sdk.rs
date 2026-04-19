@@ -1,8 +1,9 @@
 use aegis_model::{
     CloudApiConnectorContract, CloudApiRecord, CloudConnectorCursor, CloudLogSourceKind,
     ContainerContext, EventPayload, EventType, FileContext, HostContext, NetworkContext,
-    NormalizedEvent, OperatingSystemKind, Priority, ProcessContext, RuntimeHeartbeat,
-    RuntimePolicyContract, RuntimeSdkEvent, RuntimeSignalKind, Severity, TelemetryEvent,
+    NormalizedEvent, OperatingSystemKind, Priority, ProcessContext, RuntimeBridgeStatus,
+    RuntimeHeartbeat, RuntimePolicyContract, RuntimeSdkEvent, RuntimeSignalKind, Severity,
+    TelemetryEvent,
 };
 use anyhow::{bail, Result};
 use std::collections::{BTreeMap, VecDeque};
@@ -206,6 +207,133 @@ impl CloudConnectorBuffer {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct CloudConnectorEmission {
+    pub telemetry_events: Vec<TelemetryEvent>,
+    pub cursor: Option<CloudConnectorCursor>,
+}
+
+pub struct CloudConnectorRunner {
+    connector: CloudApiConnector,
+    buffer: CloudConnectorBuffer,
+    pending_events: VecDeque<TelemetryEvent>,
+    emitted_batches: u64,
+    last_cursor: Option<CloudConnectorCursor>,
+}
+
+impl CloudConnectorRunner {
+    pub fn new(contract: CloudApiConnectorContract) -> Result<Self> {
+        let max_records = contract.max_batch_records;
+        Ok(Self {
+            connector: CloudApiConnector::new(contract)?,
+            buffer: CloudConnectorBuffer::new(max_records)?,
+            pending_events: VecDeque::new(),
+            emitted_batches: 0,
+            last_cursor: None,
+        })
+    }
+
+    pub fn ingest(
+        &mut self,
+        record: CloudApiRecord,
+        cursor: Option<CloudConnectorCursor>,
+    ) -> Result<Option<CloudConnectorEmission>> {
+        let telemetry = self.connector.map_record(&record)?;
+        self.pending_events.push_back(telemetry);
+        Ok(self
+            .buffer
+            .push(record, cursor)?
+            .map(|batch| self.flush_batch(batch)))
+    }
+
+    pub fn flush(&mut self) -> Option<CloudConnectorEmission> {
+        self.buffer.flush().map(|batch| self.flush_batch(batch))
+    }
+
+    pub fn emitted_batches(&self) -> u64 {
+        self.emitted_batches
+    }
+
+    pub fn last_cursor(&self) -> Option<CloudConnectorCursor> {
+        self.last_cursor.clone()
+    }
+
+    pub fn buffered_events(&self) -> usize {
+        self.pending_events.len()
+    }
+
+    fn flush_batch(&mut self, batch: BufferedCloudBatch) -> CloudConnectorEmission {
+        let event_count = batch.records.len();
+        let telemetry_events = self.pending_events.drain(..event_count).collect::<Vec<_>>();
+        self.emitted_batches = self.emitted_batches.saturating_add(1);
+        self.last_cursor = batch.cursor.clone();
+        CloudConnectorEmission {
+            telemetry_events,
+            cursor: batch.cursor,
+        }
+    }
+}
+
+pub struct RuntimeEventEmitter {
+    encoder: RuntimeSdkEncoder,
+    max_buffered_events: usize,
+    buffered_events: VecDeque<TelemetryEvent>,
+    last_runtime_heartbeat_ms: Option<i64>,
+}
+
+impl RuntimeEventEmitter {
+    pub fn new(
+        max_buffered_events: usize,
+        max_labels: usize,
+        max_attributes: usize,
+    ) -> Result<Self> {
+        if max_buffered_events == 0 {
+            bail!("runtime event emitter must allow at least one buffered event");
+        }
+        Ok(Self {
+            encoder: RuntimeSdkEncoder::new(max_labels, max_attributes),
+            max_buffered_events,
+            buffered_events: VecDeque::new(),
+            last_runtime_heartbeat_ms: None,
+        })
+    }
+
+    pub fn ingest_event(&mut self, event: &RuntimeSdkEvent) -> Result<TelemetryEvent> {
+        let telemetry = self.encoder.encode_event(event)?;
+        if self.buffered_events.len() == self.max_buffered_events {
+            self.buffered_events.pop_front();
+        }
+        self.buffered_events.push_back(telemetry.clone());
+        Ok(telemetry)
+    }
+
+    pub fn accept_heartbeat(
+        &mut self,
+        heartbeat: &RuntimeHeartbeat,
+        policy: &RuntimePolicyContract,
+        observed_at_ms: i64,
+    ) -> Result<()> {
+        self.encoder.validate_policy_binding(heartbeat, policy)?;
+        self.last_runtime_heartbeat_ms = Some(observed_at_ms);
+        Ok(())
+    }
+
+    pub fn snapshot(
+        &self,
+        control_socket_path: Option<&PathBuf>,
+        emitted_batches: u64,
+        last_connector_cursor: Option<CloudConnectorCursor>,
+    ) -> RuntimeBridgeStatus {
+        RuntimeBridgeStatus {
+            control_socket_path: control_socket_path.map(|path| path.display().to_string()),
+            buffered_events: self.buffered_events.len(),
+            emitted_batches,
+            last_runtime_heartbeat_ms: self.last_runtime_heartbeat_ms,
+            last_connector_cursor,
+        }
+    }
+}
+
 fn validate_contract_version(contract_version: &str) -> Result<()> {
     if contract_version != SERVERLESS_CONTRACT_VERSION {
         bail!("unsupported serverless contract version");
@@ -389,7 +517,8 @@ fn cloud_record_attributes(record: &CloudApiRecord) -> BTreeMap<String, String> 
 #[cfg(test)]
 mod tests {
     use super::{
-        CloudApiConnector, CloudConnectorBuffer, RuntimeSdkEncoder, SERVERLESS_CONTRACT_VERSION,
+        CloudApiConnector, CloudConnectorBuffer, CloudConnectorRunner, RuntimeEventEmitter,
+        RuntimeSdkEncoder, SERVERLESS_CONTRACT_VERSION,
     };
     use aegis_model::{
         CloudApiConnectorContract, CloudApiRecord, CloudConnectorCursor, CloudLogSourceKind,
@@ -397,6 +526,7 @@ mod tests {
         RuntimePolicyContract, RuntimeProviderKind, RuntimeSdkEvent, RuntimeSignalKind,
     };
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
 
     fn runtime_metadata() -> RuntimeMetadata {
         RuntimeMetadata {
@@ -541,6 +671,159 @@ mod tests {
                 .as_ref()
                 .map(|cursor| cursor.checkpoint.as_str()),
             Some("evt-2")
+        );
+    }
+
+    #[test]
+    fn cloud_connector_runner_flushes_cursor_and_tracks_batches() {
+        let contract = CloudApiConnectorContract {
+            contract_version: SERVERLESS_CONTRACT_VERSION.to_string(),
+            connector_id: "aws-cloudtrail".to_string(),
+            source: CloudLogSourceKind::AwsCloudTrail,
+            poll_interval_secs: 60,
+            max_batch_records: 2,
+            cursor: None,
+        };
+        let record = CloudApiRecord {
+            contract_version: SERVERLESS_CONTRACT_VERSION.to_string(),
+            tenant_id: "tenant-a".to_string(),
+            connector_id: "aws-cloudtrail".to_string(),
+            source: CloudLogSourceKind::AwsCloudTrail,
+            account_id: "123456789012".to_string(),
+            region: Some("us-east-1".to_string()),
+            service: "iam.amazonaws.com".to_string(),
+            action: "AssumeRole".to_string(),
+            principal: Some("svc-orders".to_string()),
+            resource_id: Some("arn:aws:iam::123456789012:role/orders".to_string()),
+            request_id: "req-1".to_string(),
+            observed_at_ms: 1_713_000_010_000,
+            attributes: BTreeMap::from([("sourceIp".to_string(), "10.0.0.8".to_string())]),
+        };
+        let mut runner = CloudConnectorRunner::new(contract).expect("runner should initialize");
+
+        assert!(runner
+            .ingest(
+                record.clone(),
+                Some(CloudConnectorCursor {
+                    source: CloudLogSourceKind::AwsCloudTrail,
+                    shard: "us-east-1".to_string(),
+                    checkpoint: "evt-1".to_string(),
+                }),
+            )
+            .expect("first ingest should succeed")
+            .is_none());
+        assert_eq!(runner.buffered_events(), 1);
+
+        let emission = runner
+            .ingest(
+                CloudApiRecord {
+                    request_id: "req-2".to_string(),
+                    ..record
+                },
+                Some(CloudConnectorCursor {
+                    source: CloudLogSourceKind::AwsCloudTrail,
+                    shard: "us-east-1".to_string(),
+                    checkpoint: "evt-2".to_string(),
+                }),
+            )
+            .expect("second ingest should succeed")
+            .expect("runner should flush at batch boundary");
+
+        assert_eq!(emission.telemetry_events.len(), 2);
+        assert_eq!(
+            emission
+                .cursor
+                .as_ref()
+                .map(|cursor| cursor.checkpoint.as_str()),
+            Some("evt-2")
+        );
+        assert_eq!(runner.emitted_batches(), 1);
+        assert_eq!(
+            runner
+                .last_cursor()
+                .as_ref()
+                .map(|cursor| cursor.checkpoint.as_str()),
+            Some("evt-2")
+        );
+        assert_eq!(runner.buffered_events(), 0);
+        assert!(runner.flush().is_none());
+    }
+
+    #[test]
+    fn runtime_event_emitter_tracks_heartbeat_and_snapshot() {
+        let mut emitter =
+            RuntimeEventEmitter::new(2, 8, 16).expect("runtime event emitter should initialize");
+        let socket_path = PathBuf::from("/var/run/aegis/runtime.sock");
+        let policy = RuntimePolicyContract {
+            contract_version: SERVERLESS_CONTRACT_VERSION.to_string(),
+            policy_version: "policy-7".to_string(),
+            blocked_env_keys: vec!["AWS_SECRET_ACCESS_KEY".to_string()],
+            blocked_destinations: vec!["169.254.169.254".to_string()],
+            max_request_body_bytes: 8192,
+            require_response_sampling: true,
+        };
+
+        for sequence_hint in 0..3 {
+            emitter
+                .ingest_event(&RuntimeSdkEvent {
+                    contract_version: SERVERLESS_CONTRACT_VERSION.to_string(),
+                    tenant_id: "tenant-a".to_string(),
+                    agent_id: "runtime-sdk".to_string(),
+                    sequence_hint,
+                    signal_kind: RuntimeSignalKind::HttpRequest,
+                    metadata: runtime_metadata(),
+                    process: ProcessContext {
+                        pid: 7,
+                        name: "python".to_string(),
+                        ..ProcessContext::default()
+                    },
+                    labels: BTreeMap::from([("route".to_string(), "/orders".to_string())]),
+                    attributes: BTreeMap::from([("method".to_string(), "POST".to_string())]),
+                    occurred_at_ms: 1_713_000_000_000 + sequence_hint as i64,
+                })
+                .expect("runtime sdk event should encode");
+        }
+
+        emitter
+            .accept_heartbeat(
+                &RuntimeHeartbeat {
+                    contract_version: SERVERLESS_CONTRACT_VERSION.to_string(),
+                    tenant_id: "tenant-a".to_string(),
+                    agent_id: "runtime-sdk".to_string(),
+                    metadata: runtime_metadata(),
+                    policy_version: "policy-7".to_string(),
+                    active_invocations: 2,
+                    buffered_events: 8,
+                    dropped_events_total: 0,
+                },
+                &policy,
+                1_713_000_200_000,
+            )
+            .expect("heartbeat binding should succeed");
+
+        let snapshot = emitter.snapshot(
+            Some(&socket_path),
+            3,
+            Some(CloudConnectorCursor {
+                source: CloudLogSourceKind::AwsCloudTrail,
+                shard: "us-east-1".to_string(),
+                checkpoint: "evt-9".to_string(),
+            }),
+        );
+
+        assert_eq!(
+            snapshot.control_socket_path.as_deref(),
+            Some("/var/run/aegis/runtime.sock")
+        );
+        assert_eq!(snapshot.buffered_events, 2);
+        assert_eq!(snapshot.emitted_batches, 3);
+        assert_eq!(snapshot.last_runtime_heartbeat_ms, Some(1_713_000_200_000));
+        assert_eq!(
+            snapshot
+                .last_connector_cursor
+                .as_ref()
+                .map(|cursor| cursor.checkpoint.as_str()),
+            Some("evt-9")
         );
     }
 

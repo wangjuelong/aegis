@@ -19,6 +19,10 @@ use tracing::info;
 async fn main() -> Result<()> {
     if std::env::args().any(|arg| arg == "--diagnose") {
         let config = AppConfig::default();
+        let runtime_bridge = Orchestrator::new(config.clone())
+            .bootstrap()?
+            .summary
+            .runtime_bridge;
         let communication = CommunicationRuntime::with_loopback_drivers(3).snapshot();
         let plugin_status = PluginHost::default().statuses();
         let health = HealthReporter::build_snapshot(
@@ -78,6 +82,7 @@ async fn main() -> Result<()> {
                 quarantined_segments: 0,
             },
             health,
+            Some(runtime_bridge),
             plugin_status,
             ProtectionPosture::Normal,
         );

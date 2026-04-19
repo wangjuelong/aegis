@@ -1,9 +1,16 @@
 use aegis_model::{
     ContainerContext, EventPayload, NetworkContext, NormalizedEvent, Priority, Severity,
+    SidecarControlMessage,
 };
 use anyhow::{bail, Result};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+#[cfg(unix)]
+use std::{
+    fs::remove_file,
+    io::{Read, Write},
+    os::unix::net::{UnixListener, UnixStream},
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KubernetesMetadata {
@@ -144,6 +151,79 @@ impl SidecarLiteContract {
     }
 }
 
+#[cfg(unix)]
+pub struct SidecarLocalControlPlane {
+    socket_path: PathBuf,
+    listener: UnixListener,
+}
+
+#[cfg(unix)]
+impl SidecarLocalControlPlane {
+    pub fn bind(contract: &SidecarLiteContract) -> Result<Self> {
+        contract.validate()?;
+        if contract.control_socket_path.exists() {
+            let _ = remove_file(&contract.control_socket_path);
+        }
+        let listener = UnixListener::bind(&contract.control_socket_path)?;
+        Ok(Self {
+            socket_path: contract.control_socket_path.clone(),
+            listener,
+        })
+    }
+
+    pub fn recv_once(&self) -> Result<SidecarControlMessage> {
+        let (mut stream, _) = self.listener.accept()?;
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes)?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    pub fn send_message(
+        socket_path: impl AsRef<std::path::Path>,
+        message: &SidecarControlMessage,
+    ) -> Result<()> {
+        let mut stream = UnixStream::connect(socket_path)?;
+        stream.write_all(&serde_json::to_vec(message)?)?;
+        Ok(())
+    }
+
+    pub fn socket_path(&self) -> &PathBuf {
+        &self.socket_path
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SidecarLocalControlPlane {
+    fn drop(&mut self) {
+        let _ = remove_file(&self.socket_path);
+    }
+}
+
+#[cfg(not(unix))]
+pub struct SidecarLocalControlPlane;
+
+#[cfg(not(unix))]
+impl SidecarLocalControlPlane {
+    pub fn bind(_contract: &SidecarLiteContract) -> Result<Self> {
+        bail!("sidecar local control plane currently requires unix sockets")
+    }
+
+    pub fn recv_once(&self) -> Result<SidecarControlMessage> {
+        bail!("sidecar local control plane currently requires unix sockets")
+    }
+
+    pub fn send_message(
+        _socket_path: impl AsRef<std::path::Path>,
+        _message: &SidecarControlMessage,
+    ) -> Result<()> {
+        bail!("sidecar local control plane currently requires unix sockets")
+    }
+
+    pub fn socket_path(&self) -> &PathBuf {
+        unreachable!("non-unix control plane does not expose a socket path")
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContainerDetectionKind {
     EscapeAttempt,
@@ -218,13 +298,16 @@ mod tests {
     use super::{
         ContainerDetectionEngine, ContainerDetectionKind, ContainerMetadataMapper,
         DaemonSetHostAgentConfig, KubernetesMetadata, SidecarLiteContract,
+        SidecarLocalControlPlane,
     };
     use aegis_model::{
         EventPayload, EventType, NetworkContext, NormalizedEvent, Priority, ProcessContext,
-        Severity,
+        Severity, SidecarControlMessage,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    #[cfg(unix)]
+    use std::thread;
 
     #[test]
     fn container_metadata_mapper_merges_kubernetes_and_namespace_data() {
@@ -322,5 +405,37 @@ mod tests {
 
         assert_eq!(escape[0].kind, ContainerDetectionKind::EscapeAttempt);
         assert_eq!(lateral[0].kind, ContainerDetectionKind::LateralMovement);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_local_control_plane_forwards_unix_socket_messages() {
+        let contract = SidecarLiteContract {
+            control_socket_path: PathBuf::from(format!(
+                "/tmp/aegis-{}.sock",
+                uuid::Uuid::now_v7().simple()
+            )),
+            shared_cache_path: PathBuf::from("/var/lib/aegis-sidecar/cache"),
+            host_pid: false,
+            privileged: false,
+            max_memory_mb: 128,
+            dropped_capabilities: vec!["ALL".to_string()],
+        };
+        let plane = SidecarLocalControlPlane::bind(&contract).expect("bind control plane");
+        let socket_path = plane.socket_path().clone();
+        let receiver = thread::spawn(move || plane.recv_once().expect("receive sidecar message"));
+        let message = SidecarControlMessage {
+            tenant_id: "tenant-a".to_string(),
+            agent_id: "agent-a".to_string(),
+            operation: "flush-telemetry".to_string(),
+            metadata: BTreeMap::from([("scope".to_string(), "runtime".to_string())]),
+            sent_at_ms: 1_713_000_300_000,
+        };
+
+        SidecarLocalControlPlane::send_message(&socket_path, &message)
+            .expect("send sidecar message");
+        let received = receiver.join().expect("join receiver thread");
+
+        assert_eq!(received, message);
     }
 }

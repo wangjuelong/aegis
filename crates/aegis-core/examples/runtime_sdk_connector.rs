@@ -1,5 +1,5 @@
 use aegis_core::runtime_sdk::{
-    CloudApiConnector, CloudConnectorBuffer, RuntimeSdkEncoder, SERVERLESS_CONTRACT_VERSION,
+    CloudConnectorRunner, RuntimeEventEmitter, SERVERLESS_CONTRACT_VERSION,
 };
 use aegis_model::{
     CloudApiConnectorContract, CloudApiRecord, CloudConnectorCursor, CloudLogSourceKind,
@@ -8,6 +8,7 @@ use aegis_model::{
 };
 use anyhow::Result;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 fn main() -> Result<()> {
     let metadata = RuntimeMetadata {
@@ -21,8 +22,16 @@ fn main() -> Result<()> {
         function_name: Some("orders-handler".to_string()),
         container_id: None,
     };
-    let encoder = RuntimeSdkEncoder::new(8, 16);
-    let telemetry = encoder.encode_event(&RuntimeSdkEvent {
+    let policy = RuntimePolicyContract {
+        contract_version: SERVERLESS_CONTRACT_VERSION.to_string(),
+        policy_version: "policy-7".to_string(),
+        blocked_env_keys: vec!["AWS_SECRET_ACCESS_KEY".to_string()],
+        blocked_destinations: vec!["169.254.169.254".to_string()],
+        max_request_body_bytes: 8192,
+        require_response_sampling: true,
+    };
+    let mut emitter = RuntimeEventEmitter::new(8, 8, 16)?;
+    let telemetry = emitter.ingest_event(&RuntimeSdkEvent {
         contract_version: SERVERLESS_CONTRACT_VERSION.to_string(),
         tenant_id: "tenant-a".to_string(),
         agent_id: "runtime-sdk".to_string(),
@@ -38,7 +47,7 @@ fn main() -> Result<()> {
         attributes: BTreeMap::from([("method".to_string(), "POST".to_string())]),
         occurred_at_ms: 1_713_000_000_000,
     })?;
-    encoder.validate_policy_binding(
+    emitter.accept_heartbeat(
         &RuntimeHeartbeat {
             contract_version: SERVERLESS_CONTRACT_VERSION.to_string(),
             tenant_id: "tenant-a".to_string(),
@@ -49,17 +58,11 @@ fn main() -> Result<()> {
             buffered_events: 1,
             dropped_events_total: 0,
         },
-        &RuntimePolicyContract {
-            contract_version: SERVERLESS_CONTRACT_VERSION.to_string(),
-            policy_version: "policy-7".to_string(),
-            blocked_env_keys: vec!["AWS_SECRET_ACCESS_KEY".to_string()],
-            blocked_destinations: vec!["169.254.169.254".to_string()],
-            max_request_body_bytes: 8192,
-            require_response_sampling: true,
-        },
+        &policy,
+        1_713_000_000_500,
     )?;
 
-    let connector = CloudApiConnector::new(CloudApiConnectorContract {
+    let mut runner = CloudConnectorRunner::new(CloudApiConnectorContract {
         contract_version: SERVERLESS_CONTRACT_VERSION.to_string(),
         connector_id: "aws-cloudtrail".to_string(),
         source: CloudLogSourceKind::AwsCloudTrail,
@@ -82,22 +85,38 @@ fn main() -> Result<()> {
         observed_at_ms: 1_713_000_100_000,
         attributes: BTreeMap::new(),
     };
-    let mapped = connector.map_record(&record)?;
-    let mut buffer = CloudConnectorBuffer::new(2)?;
-    let flushed = buffer.push(
-        record,
+    let flushed_first = runner.ingest(
+        record.clone(),
         Some(CloudConnectorCursor {
             source: CloudLogSourceKind::AwsCloudTrail,
             shard: "us-east-1".to_string(),
             checkpoint: "evt-1".to_string(),
         }),
     )?;
+    let flushed_second = runner.ingest(
+        CloudApiRecord {
+            request_id: "req-2".to_string(),
+            ..record
+        },
+        Some(CloudConnectorCursor {
+            source: CloudLogSourceKind::AwsCloudTrail,
+            shard: "us-east-1".to_string(),
+            checkpoint: "evt-2".to_string(),
+        }),
+    )?;
+    let bridge_status = emitter.snapshot(
+        Some(&PathBuf::from("/var/run/aegis/runtime.sock")),
+        runner.emitted_batches(),
+        runner.last_cursor(),
+    );
 
     println!(
-        "runtime_event={} connector_event={} flushed={}",
+        "runtime_event={} first_flush={} second_flush={} buffered_events={} emitted_batches={}",
         telemetry.event_id,
-        mapped.event_id,
-        flushed.is_some()
+        flushed_first.is_some(),
+        flushed_second.is_some(),
+        bridge_status.buffered_events,
+        bridge_status.emitted_batches
     );
     Ok(())
 }

@@ -1,12 +1,15 @@
 use crate::comms::{CommunicationRuntime, HeartbeatBuilder, TelemetryBatchBuilder};
 use crate::config::AppConfig;
 use crate::health::HealthReporter;
+use crate::runtime_sdk::{CloudConnectorRunner, RuntimeEventEmitter, SERVERLESS_CONTRACT_VERSION};
 use aegis_model::{
-    Alert, CommunicationChannelKind, LineageCounters, NormalizedEvent, ResponseAction,
-    RuntimeHealthSignals, TelemetryEvent,
+    Alert, CloudApiConnectorContract, CloudLogSourceKind, CommunicationChannelKind,
+    LineageCounters, NormalizedEvent, ResponseAction, RuntimeBridgeStatus, RuntimeHealthSignals,
+    RuntimeHeartbeat, RuntimeMetadata, RuntimePolicyContract, RuntimeProviderKind, TelemetryEvent,
 };
 use anyhow::{anyhow, Result};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
@@ -50,6 +53,7 @@ pub struct BootstrapSummary {
     pub control_plane_url: String,
     pub communication_channel: CommunicationChannelKind,
     pub lineage_counters: LineageCounters,
+    pub runtime_bridge: RuntimeBridgeStatus,
     pub queue_capacities: BTreeMap<String, usize>,
     pub task_topology: Vec<String>,
 }
@@ -112,12 +116,20 @@ impl Orchestrator {
             telemetry_rx,
         };
 
+        let runtime_bridge_socket = runtime_bridge_socket_path(&self.config);
         let summary = BootstrapSummary {
             agent_id: self.config.agent_id.clone(),
             tenant_id: self.config.tenant_id.clone(),
             control_plane_url: self.config.control_plane_url.clone(),
             communication_channel: CommunicationChannelKind::Grpc,
             lineage_counters: LineageCounters::default(),
+            runtime_bridge: RuntimeBridgeStatus {
+                control_socket_path: Some(runtime_bridge_socket.display().to_string()),
+                buffered_events: 0,
+                emitted_batches: 0,
+                last_runtime_heartbeat_ms: None,
+                last_connector_cursor: None,
+            },
             queue_capacities: BTreeMap::from([
                 ("event".to_string(), EVENT_QUEUE_CAPACITY),
                 ("alert_hi".to_string(), ALERT_HI_QUEUE_CAPACITY),
@@ -132,6 +144,7 @@ impl Orchestrator {
                 "comms-link-manager".to_string(),
                 "response-executor".to_string(),
                 "telemetry-drain".to_string(),
+                "runtime-bridge".to_string(),
                 "health-reporter".to_string(),
                 "config-watcher".to_string(),
             ],
@@ -147,6 +160,7 @@ impl Orchestrator {
     pub fn start(&self, artifacts: BootstrapArtifacts) -> RuntimeHandle {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let comms_runtime = Arc::new(Mutex::new(CommunicationRuntime::with_loopback_drivers(3)));
+        let runtime_bridge_socket = runtime_bridge_socket_path(&self.config);
 
         let mut tasks = Vec::new();
         tasks.push(RuntimeTask {
@@ -194,6 +208,15 @@ impl Orchestrator {
                 self.config.agent_id.clone(),
                 artifacts.receivers.telemetry_rx,
                 Arc::clone(&comms_runtime),
+                shutdown_rx.clone(),
+            )),
+        });
+        tasks.push(RuntimeTask {
+            name: "runtime-bridge",
+            handle: tokio::spawn(runtime_bridge_task(
+                self.config.tenant_id.clone(),
+                self.config.agent_id.clone(),
+                runtime_bridge_socket,
                 shutdown_rx.clone(),
             )),
         });
@@ -439,6 +462,90 @@ async fn config_watcher_task(mut shutdown_rx: watch::Receiver<bool>) {
     }
 }
 
+async fn runtime_bridge_task(
+    tenant_id: String,
+    agent_id: String,
+    control_socket_path: PathBuf,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let mut ticker = interval(Duration::from_secs(30));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    let policy = RuntimePolicyContract {
+        contract_version: SERVERLESS_CONTRACT_VERSION.to_string(),
+        policy_version: "runtime-bridge-policy.v1".to_string(),
+        blocked_env_keys: vec!["AWS_SECRET_ACCESS_KEY".to_string()],
+        blocked_destinations: vec!["169.254.169.254".to_string()],
+        max_request_body_bytes: 8_192,
+        require_response_sampling: true,
+    };
+    let heartbeat = RuntimeHeartbeat {
+        contract_version: SERVERLESS_CONTRACT_VERSION.to_string(),
+        tenant_id: tenant_id.clone(),
+        agent_id: agent_id.clone(),
+        metadata: RuntimeMetadata {
+            provider: RuntimeProviderKind::AwsLambda,
+            service: "runtime-bridge".to_string(),
+            runtime: "rust".to_string(),
+            region: None,
+            account_id: None,
+            invocation_id: format!("{agent_id}-bootstrap"),
+            cold_start: false,
+            function_name: Some(agent_id.clone()),
+            container_id: None,
+        },
+        policy_version: policy.policy_version.clone(),
+        active_invocations: 0,
+        buffered_events: 0,
+        dropped_events_total: 0,
+    };
+    let mut emitter = RuntimeEventEmitter::new(64, 16, 32).expect("runtime bridge emitter");
+    let runner = CloudConnectorRunner::new(CloudApiConnectorContract {
+        contract_version: SERVERLESS_CONTRACT_VERSION.to_string(),
+        connector_id: format!("{agent_id}-runtime-bridge"),
+        source: CloudLogSourceKind::AwsCloudWatch,
+        poll_interval_secs: 60,
+        max_batch_records: 64,
+        cursor: None,
+    })
+    .expect("runtime bridge connector");
+    emitter
+        .accept_heartbeat(&heartbeat, &policy, now_unix_ms())
+        .expect("runtime bridge heartbeat should bind");
+
+    loop {
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_ok() && *shutdown_rx.borrow() {
+                    debug!("runtime-bridge received shutdown");
+                    break;
+                }
+            }
+            _ = ticker.tick() => {
+                let status = emitter.snapshot(
+                    Some(&control_socket_path),
+                    runner.emitted_batches(),
+                    runner.last_cursor(),
+                );
+                debug!(
+                    control_socket = %status.control_socket_path.as_deref().unwrap_or("-"),
+                    buffered_events = status.buffered_events,
+                    emitted_batches = status.emitted_batches,
+                    last_runtime_heartbeat_ms = status.last_runtime_heartbeat_ms.unwrap_or_default(),
+                    "runtime-bridge status"
+                );
+            }
+        }
+    }
+}
+
+fn runtime_bridge_socket_path(config: &AppConfig) -> PathBuf {
+    config
+        .storage
+        .state_root
+        .join(format!("runtime-bridge-{}.sock", config.agent_id))
+}
+
 fn now_unix_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -462,6 +569,14 @@ mod tests {
             CommunicationChannelKind::Grpc
         );
         assert_eq!(artifacts.summary.queue_capacities["event"], 65_536);
+        assert_eq!(
+            artifacts
+                .summary
+                .runtime_bridge
+                .control_socket_path
+                .as_deref(),
+            Some("/var/lib/aegis/runtime-bridge-local-agent.sock")
+        );
         assert!(artifacts
             .summary
             .task_topology
@@ -470,6 +585,10 @@ mod tests {
             .summary
             .task_topology
             .contains(&"comms-link-manager".to_string()));
+        assert!(artifacts
+            .summary
+            .task_topology
+            .contains(&"runtime-bridge".to_string()));
     }
 
     #[tokio::test]
@@ -486,6 +605,7 @@ mod tests {
         assert!(stopped.contains(&"sensor-dispatch".to_string()));
         assert!(stopped.contains(&"health-reporter".to_string()));
         assert!(stopped.contains(&"comms-link-manager".to_string()));
+        assert!(stopped.contains(&"runtime-bridge".to_string()));
         assert!(stopped.contains(&"config-watcher".to_string()));
     }
 }
