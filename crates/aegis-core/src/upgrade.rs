@@ -151,6 +151,9 @@ pub struct DiagnoseWalStatus {
     pub telemetry_segments: usize,
     pub forensic_root: PathBuf,
     pub completeness: TelemetryIntegrity,
+    pub encrypted: bool,
+    pub key_version: u32,
+    pub quarantined_segments: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -335,6 +338,9 @@ mod tests {
                 telemetry_segments: 3,
                 forensic_root: PathBuf::from("/var/lib/aegis/forensics"),
                 completeness: TelemetryIntegrity::Partial,
+                encrypted: true,
+                key_version: 1,
+                quarantined_segments: 1,
             },
             health(),
             vec![PluginHealthStatus {
@@ -348,6 +354,7 @@ mod tests {
         let json = DiagnoseCollector::to_json(&bundle).expect("serialize bundle");
 
         assert!(json.contains("\"telemetry_segments\": 3"));
+        assert!(json.contains("\"encrypted\": true"));
         assert!(json.contains("\"active_channel\": \"WebSocket\""));
         assert!(json.contains("\"redacted_fields\""));
         assert_eq!(
