@@ -363,6 +363,11 @@
   - 建立取证采集规范到归档对象的转换
 - 验收：
   - 测试覆盖回滚计划生成、artifact bundle 完整性、证据链串联
+- 完成记录（2026-04-19）：
+  - 已建立 `RegistryRollbackPlanner`、`FilesystemRollbackPlanner` 与 `RecoveryCoordinator`
+  - 已建立 `EvidenceChain`，支持 artifact hash、前序 hash 与链式校验
+  - 已建立取证采集到 artifact/evidence entry 的转换
+  - 已通过回滚计划生成、文件恢复、artifact bundle 完整性和证据链串联测试
 
 ### P20：Remote Shell / Session Lock / Approval Queue
 
