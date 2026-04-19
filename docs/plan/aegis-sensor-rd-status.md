@@ -28,8 +28,8 @@
 | P15 | 专项检测能力 | done | 已建立勒索、ASR、身份与诱捕检测引擎及统一 finding 输出 |
 | P16 | Vuln Scan / Passive Discovery / AI Monitor | done | 已建立软件清单匹配、被动发现缓存与 AI 风险监控测试 |
 | P17 | Response Executor / Quarantine / Kill | done | 已建立两阶段终止、文件隔离、审计落盘与 MockPlatform 测试 |
-| P18 | Block Decision / Network Isolate / Firewall | doing | 当前进入阻断决策、网络隔离与防火墙策略基线实现 |
-| P19 | Registry / Filesystem Rollback / Forensics | todo | 依赖 P17 |
+| P18 | Block Decision / Network Isolate / Firewall | done | 已建立 TTL 阻断映射、隔离策略与 break-glass 审计测试 |
+| P19 | Registry / Filesystem Rollback / Forensics | doing | 当前进入注册表/文件回滚与证据链基线实现 |
 | P20 | Remote Shell / Session Lock / Approval Queue | todo | 依赖 P17-P19 |
 | P21 | Self-Protection / Keys / Crash Exploit Analysis | todo | 依赖 P07/P17 |
 | P22 | Comms / SignedCommand / ApprovalProof | todo | 依赖 P03-P04 |

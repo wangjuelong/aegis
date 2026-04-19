@@ -343,6 +343,11 @@
   - 建立防火墙策略编排器
 - 验收：
   - 测试覆盖阻断命中、隔离释放和 break-glass 审计
+- 完成记录（2026-04-19）：
+  - 已建立 `BlockDecisionMap`，支持 hash/pid/path/network 多目标与 TTL 语义
+  - 已建立 `IsolationPolicy` 与 `FirewallPolicyOrchestrator`，覆盖 Full / ManagementOnly / BreakGlass
+  - 已建立 containment 审计记录模型
+  - 已通过阻断命中、隔离应用与 break-glass 审计测试
 
 ### P19：Registry / Filesystem Rollback / Forensics
 
