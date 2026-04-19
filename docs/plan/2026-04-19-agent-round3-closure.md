@@ -194,6 +194,32 @@
   - 未确认或拒绝的批次会保留在重放队列
   - 诊断面能展示待确认窗口与 replay 状态
 
+**完成记录（2026-04-19）**
+
+- 已通过提交 `3e34dcc` 完成代码收口：
+  - 新增 `PendingBatchStore` 与 `UplinkReplayRuntime`，把正常遥测、告警与重试队列统一收敛到 ACK-gated replay 窗口
+  - `sequence_id` 改为仅在 `BatchAck::Accepted` 后前推；拒绝或未确认批次保留在待重放窗口，并沿用原 `sequence_id` 重试
+  - `alert_uplink_high_task`、`telemetry_drain_task` 不再直接发送上行批次，而是统一写入 replay runtime，再由 `uplink_replay_task` 按窗口状态与流控提示发送
+  - `response_executor_task` 已把高危响应审计同步写入 `ForensicJournal`，使响应动作与 replay 状态进入同一条本地取证链
+  - `--diagnose` / runtime snapshot 已新增 `replay` 输出，真实展示 `last_acked_sequence_id`、待确认批次数、in-flight 序号、重试计数与最近错误
+  - 修复 `telemetry_drain_task` 首次 tick 立即触发导致的批量切分时序缺陷，确保 `max_batch_events` 与 ACK 前沿语义一致
+- 已通过以下验证：
+  - `cargo fmt --all`
+  - `cargo test --workspace`
+  - `AEGIS_STATE_ROOT=$(mktemp -d) cargo run -p aegis-agentd -- --diagnose`
+- 本轮诊断快照已能显示以下真实字段：
+  - `wal.telemetry_segments`
+  - `wal.completeness`
+  - `key_protection.rollback_anchor`
+  - `replay.last_acked_sequence_id`
+  - `replay.pending_batches`
+  - `replay.in_flight_sequence_id`
+
+**本工作包完成后仍明确保留的差距**
+
+- `upload_artifact` / `pull_update` 虽已有 proto/driver/test service，但尚未纳入 agent / updater 主运行时闭环
+- TPM / Secure Enclave / 正式硬件绑定仍属于外部工程，本轮仅完成仓库内受控降级与状态诚实化
+
 ### C08：升级产物传输与运行时更新闭环
 
 **目标**
