@@ -27,6 +27,10 @@ use crate::specialized_detection::{
 };
 use crate::temporal::{TemporalSnapshot, TemporalStateBuffer};
 use crate::transport_drivers::TransportAgentContext;
+use crate::upgrade::{
+    default_update_manifest_verifier, stage_pulled_update, upgrade_artifact_from_manifest,
+    RuntimeStateStore, UpdatePhase, UpdateVerificationSnapshot, UpgradePlanner,
+};
 use crate::wal::{
     ActionLogRecord, EmergencyAuditRing, ForensicJournal, ForensicPersistenceCoordinator,
     JournalActionKind, PendingBatchRecord, PendingBatchStore, ReplayLane, TelemetryWal,
@@ -34,12 +38,12 @@ use crate::wal::{
 };
 use crate::yara::{EnqueueDisposition, YaraMatch, YaraResult, YaraScanTarget, YaraScheduler};
 use aegis_model::{
-    Alert, ClientAck, ClientAckStatus, CloudApiConnectorContract, CloudLogSourceKind,
-    CommandEnvelope, CommunicationChannelKind, DownlinkMessage, EventPayload, IsolationRulesV2,
-    LineageCheckpoint, LineageCounters, NormalizedEvent, ResponseAction, RuntimeBridgeStatus,
-    RuntimeHealthSignals, RuntimeHeartbeat, RuntimeMetadata, RuntimePolicyContract,
-    RuntimeProviderKind, Severity, Storyline, StorylineContext, TelemetryEvent, ThreatIntelHit,
-    UplinkMessage,
+    Alert, ArtifactChunk, ClientAck, ClientAckStatus, CloudApiConnectorContract,
+    CloudLogSourceKind, CommandEnvelope, CommunicationChannelKind, DownlinkMessage, EventPayload,
+    IsolationRulesV2, LineageCheckpoint, LineageCounters, NormalizedEvent, ResponseAction,
+    RuntimeBridgeStatus, RuntimeHealthSignals, RuntimeHeartbeat, RuntimeMetadata,
+    RuntimePolicyContract, RuntimeProviderKind, Severity, Storyline, StorylineContext,
+    TelemetryEvent, ThreatIntelHit, UpdateRequest, UplinkMessage,
 };
 use aegis_platform::{MacosPlatform, PlatformRuntime};
 use anyhow::{anyhow, Result};
@@ -73,6 +77,10 @@ const TELEMETRY_WAL_SEGMENT_BYTES: u64 = 256 * 1024;
 const FORENSIC_EVIDENCE_CAPACITY_BYTES: u64 = 4 * 1024 * 1024;
 const FORENSIC_ACTION_CAPACITY_BYTES: u64 = 4 * 1024 * 1024;
 const NETWORK_ISOLATION_TTL_SECS: u64 = 5 * 60;
+const UPDATE_MANAGER_POLL_INTERVAL_MS: u64 = 500;
+const UPDATE_RETRY_BACKOFF_MS: i64 = 5_000;
+const UPDATE_REQUEST_CHANNEL: &str = "stable";
+const UPDATE_STATUS_ARTIFACT_KIND: &str = "update-status";
 const LOOPBACK_SERVER_SIGNING_KEY_ID: &str = "server-k1";
 const LOOPBACK_ADMIN_SIGNING_KEY_ID: &str = "approver-admin-k1";
 const LOOPBACK_ANALYST_SIGNING_KEY_ID: &str = "approver-analyst-k1";
@@ -222,6 +230,7 @@ impl Orchestrator {
                 "telemetry-drain".to_string(),
                 "runtime-bridge".to_string(),
                 "health-reporter".to_string(),
+                "update-manager".to_string(),
                 "config-watcher".to_string(),
             ],
         };
@@ -247,6 +256,7 @@ impl Orchestrator {
         let metrics = Arc::new(Mutex::new(RuntimeMetrics::default()));
         let uplink_control = Arc::new(Mutex::new(UplinkControlState::default()));
         let replay_runtime = Arc::new(Mutex::new(UplinkReplayRuntime::new(&self.config)?));
+        let update_state = Arc::new(Mutex::new(load_update_runtime_state(&self.config)?));
         let platform = build_runtime_platform();
         let command_runtime = Arc::new(Mutex::new(CommandExecutionRuntime::new(
             &self.config,
@@ -393,11 +403,20 @@ impl Orchestrator {
         tasks.push(RuntimeTask {
             name: "health-reporter",
             handle: tokio::spawn(health_reporter_task(
-                self.config.tenant_id.clone(),
-                self.config.agent_id.clone(),
+                self.config.clone(),
                 self.config.heartbeat_interval(),
                 Arc::clone(&comms_runtime),
                 metrics,
+                Arc::clone(&update_state),
+                shutdown_rx.clone(),
+            )),
+        });
+        tasks.push(RuntimeTask {
+            name: "update-manager",
+            handle: tokio::spawn(update_manager_task(
+                self.config.clone(),
+                Arc::clone(&comms_runtime),
+                Arc::clone(&update_state),
                 shutdown_rx.clone(),
             )),
         });
@@ -1794,12 +1813,176 @@ fn flush_normal_telemetry_buffer(
     }
 }
 
+fn current_agent_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+fn load_update_runtime_state(config: &AppConfig) -> Result<UpdateVerificationSnapshot> {
+    let mut snapshot = RuntimeStateStore::load_update_snapshot(config).unwrap_or_else(|_| {
+        UpdateVerificationSnapshot::new(current_agent_version(), now_unix_ms())
+    });
+    if snapshot.current_version.is_empty() {
+        snapshot.current_version = current_agent_version().to_string();
+    }
+    if snapshot.updated_at_ms == 0 {
+        snapshot.updated_at_ms = now_unix_ms();
+    }
+    RuntimeStateStore::persist_update_snapshot(config, &snapshot)?;
+    Ok(snapshot)
+}
+
+fn clear_staged_update_files(config: &AppConfig) {
+    for path in [
+        RuntimeStateStore::staged_update_manifest_path(config),
+        RuntimeStateStore::staged_update_artifact_path(config),
+        RuntimeStateStore::staged_update_rollback_path(config),
+    ] {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn refresh_staged_update_paths(config: &AppConfig, snapshot: &mut UpdateVerificationSnapshot) {
+    let manifest_path = RuntimeStateStore::staged_update_manifest_path(config);
+    snapshot.manifest_path = manifest_path.exists().then_some(manifest_path);
+
+    let artifact_path = RuntimeStateStore::staged_update_artifact_path(config);
+    snapshot.artifact_path = artifact_path.exists().then_some(artifact_path);
+
+    let rollback_path = RuntimeStateStore::staged_update_rollback_path(config);
+    snapshot.rollback_path = rollback_path.exists().then_some(rollback_path);
+}
+
+fn apply_heartbeat_update_feedback(
+    config: &AppConfig,
+    update_state: &Arc<Mutex<UpdateVerificationSnapshot>>,
+    channel: CommunicationChannelKind,
+    response: &aegis_model::HeartbeatResponse,
+    observed_at_ms: i64,
+) -> Result<()> {
+    let mut snapshot = update_state.lock().expect("update state poisoned");
+    let previous_pending = snapshot.pending_update_ids.first().cloned();
+    let next_pending = response.pending_update_ids.first().cloned();
+
+    snapshot.updated_at_ms = observed_at_ms;
+    snapshot.current_version = current_agent_version().to_string();
+    snapshot.transport_channel = Some(channel);
+    snapshot.pending_update_ids = response.pending_update_ids.clone();
+    snapshot.config_changed = response.config_changed;
+
+    if next_pending.is_some() && next_pending != previous_pending {
+        clear_staged_update_files(config);
+        snapshot.phase = UpdatePhase::Announced;
+        snapshot.retry_count = 0;
+        snapshot.manifest = None;
+        snapshot.manifest_path = None;
+        snapshot.artifact_path = None;
+        snapshot.rollback_path = None;
+        snapshot.last_attempt_at_ms = None;
+        snapshot.last_success_at_ms = None;
+        snapshot.last_error = None;
+    } else if snapshot.pending_update_ids.is_empty()
+        && snapshot.manifest.is_none()
+        && matches!(snapshot.phase, UpdatePhase::Announced)
+    {
+        snapshot.phase = UpdatePhase::Idle;
+    }
+
+    RuntimeStateStore::persist_update_snapshot(config, &snapshot)
+}
+
+fn should_attempt_update(snapshot: &UpdateVerificationSnapshot, now_ms: i64) -> bool {
+    let Some(target) = snapshot.pending_update_ids.first() else {
+        return false;
+    };
+
+    if matches!(
+        snapshot.phase,
+        UpdatePhase::Downloading | UpdatePhase::Verifying
+    ) {
+        return false;
+    }
+
+    if snapshot.phase == UpdatePhase::Ready
+        && snapshot.active_update_id().as_deref() == Some(target.as_str())
+    {
+        return false;
+    }
+
+    !snapshot
+        .last_attempt_at_ms
+        .map(|last_attempt_at_ms| {
+            now_ms.saturating_sub(last_attempt_at_ms) < UPDATE_RETRY_BACKOFF_MS
+        })
+        .unwrap_or(false)
+}
+
+fn update_status_artifact_chunks(
+    snapshot: &UpdateVerificationSnapshot,
+) -> Result<Vec<ArtifactChunk>> {
+    let upload_id = Uuid::now_v7();
+    let bytes = serde_json::to_vec(snapshot)?;
+    Ok(vec![ArtifactChunk {
+        upload_id,
+        artifact_kind: UPDATE_STATUS_ARTIFACT_KIND.to_string(),
+        chunk_index: 0,
+        bytes,
+        eof: true,
+    }])
+}
+
+fn publish_update_status_receipt(
+    comms_runtime: &Arc<Mutex<CommunicationRuntime>>,
+    snapshot: &UpdateVerificationSnapshot,
+    now_ms: i64,
+) -> Result<()> {
+    let chunks = update_status_artifact_chunks(snapshot)?;
+    let target_artifact_id = snapshot
+        .active_update_id()
+        .or_else(|| snapshot.pending_update_ids.first().cloned())
+        .unwrap_or_else(|| "update-state".to_string());
+    let (channel, result) = comms_runtime
+        .lock()
+        .expect("comms runtime poisoned")
+        .upload_artifact(&chunks, now_ms)?;
+    info!(
+        ?channel,
+        upload_id = %result.upload_id,
+        accepted_bytes = result.accepted_bytes,
+        artifact_id = %target_artifact_id,
+        "update-manager uploaded status receipt"
+    );
+    Ok(())
+}
+
+fn record_update_failure(
+    config: &AppConfig,
+    update_state: &Arc<Mutex<UpdateVerificationSnapshot>>,
+    phase: UpdatePhase,
+    channel: Option<CommunicationChannelKind>,
+    observed_at_ms: i64,
+    error: impl Into<String>,
+) -> Result<UpdateVerificationSnapshot> {
+    let mut snapshot = update_state.lock().expect("update state poisoned");
+    snapshot.updated_at_ms = observed_at_ms;
+    snapshot.current_version = current_agent_version().to_string();
+    snapshot.phase = phase;
+    if let Some(channel) = channel {
+        snapshot.transport_channel = Some(channel);
+    }
+    snapshot.retry_count = snapshot.retry_count.saturating_add(1);
+    snapshot.last_attempt_at_ms = Some(observed_at_ms);
+    snapshot.last_error = Some(error.into());
+    refresh_staged_update_paths(config, &mut snapshot);
+    RuntimeStateStore::persist_update_snapshot(config, &snapshot)?;
+    Ok(snapshot.clone())
+}
+
 async fn health_reporter_task(
-    tenant_id: String,
-    agent_id: String,
+    config: AppConfig,
     heartbeat_interval: Duration,
     comms_runtime: Arc<Mutex<CommunicationRuntime>>,
     metrics: Arc<Mutex<RuntimeMetrics>>,
+    update_state: Arc<Mutex<UpdateVerificationSnapshot>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let mut ticker = interval(heartbeat_interval);
@@ -1822,7 +2005,7 @@ async fn health_reporter_task(
                     .lock()
                     .expect("runtime metrics poisoned");
                 let health = HealthReporter::build_snapshot(
-                    "0.1.0",
+                    current_agent_version(),
                     "policy-1",
                     "ruleset-1",
                     "model-1",
@@ -1839,8 +2022,8 @@ async fn health_reporter_task(
                     },
                 );
                 let heartbeat = HeartbeatBuilder::build(
-                    tenant_id.clone(),
-                    agent_id.clone(),
+                    config.tenant_id.clone(),
+                    config.agent_id.clone(),
                     health,
                     communication,
                     0.0,
@@ -1851,9 +2034,220 @@ async fn health_reporter_task(
                     .expect("comms runtime poisoned")
                     .send_heartbeat(&heartbeat, now_unix_ms());
                 match send_result {
-                    Ok(channel) => info!(?channel, "health-reporter tick"),
+                    Ok((channel, response)) => {
+                        if let Err(error) = apply_heartbeat_update_feedback(
+                            &config,
+                            &update_state,
+                            channel,
+                            &response,
+                            now_unix_ms(),
+                        ) {
+                            debug!(%error, "health-reporter failed to persist update feedback");
+                        }
+                        info!(
+                            ?channel,
+                            pending_updates = response.pending_update_ids.len(),
+                            config_changed = response.config_changed,
+                            "health-reporter tick"
+                        );
+                    }
                     Err(error) => debug!(%error, "health-reporter failed to send heartbeat"),
                 }
+            }
+        }
+    }
+}
+
+async fn update_manager_task(
+    config: AppConfig,
+    comms_runtime: Arc<Mutex<CommunicationRuntime>>,
+    update_state: Arc<Mutex<UpdateVerificationSnapshot>>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let mut ticker = interval(Duration::from_millis(UPDATE_MANAGER_POLL_INTERVAL_MS));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_ok() && *shutdown_rx.borrow() {
+                    debug!("update-manager received shutdown");
+                    break;
+                }
+            }
+            _ = ticker.tick() => {
+                let now_ms = now_unix_ms();
+                let request = {
+                    let mut snapshot = update_state.lock().expect("update state poisoned");
+                    if !should_attempt_update(&snapshot, now_ms) {
+                        continue;
+                    }
+
+                    snapshot.updated_at_ms = now_ms;
+                    snapshot.current_version = current_agent_version().to_string();
+                    snapshot.phase = UpdatePhase::Downloading;
+                    snapshot.last_attempt_at_ms = Some(now_ms);
+                    snapshot.last_error = None;
+                    if let Err(error) = RuntimeStateStore::persist_update_snapshot(&config, &snapshot) {
+                        debug!(%error, "update-manager failed to persist downloading state");
+                    }
+
+                    UpdateRequest {
+                        tenant_id: config.tenant_id.clone(),
+                        agent_id: config.agent_id.clone(),
+                        channel: UPDATE_REQUEST_CHANNEL.to_string(),
+                        current_version: snapshot.current_version.clone(),
+                    }
+                };
+
+                let pull_result = comms_runtime
+                    .lock()
+                    .expect("comms runtime poisoned")
+                    .pull_update(&request, now_ms);
+
+                let (channel, chunks) = match pull_result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        match record_update_failure(
+                            &config,
+                            &update_state,
+                            UpdatePhase::Failed,
+                            None,
+                            now_ms,
+                            error.to_string(),
+                        ) {
+                            Ok(snapshot) => {
+                                publish_update_status_receipt(&comms_runtime, &snapshot, now_ms).ok();
+                            }
+                            Err(record_error) => {
+                                debug!(%record_error, "update-manager failed to persist pull failure");
+                            }
+                        }
+                        continue;
+                    }
+                };
+
+                let staged = match stage_pulled_update(&config, chunks) {
+                    Ok(staged) => staged,
+                    Err(error) => {
+                        match record_update_failure(
+                            &config,
+                            &update_state,
+                            UpdatePhase::Failed,
+                            Some(channel),
+                            now_ms,
+                            error.to_string(),
+                        ) {
+                            Ok(snapshot) => {
+                                publish_update_status_receipt(&comms_runtime, &snapshot, now_ms).ok();
+                            }
+                            Err(record_error) => {
+                                debug!(%record_error, "update-manager failed to persist staging failure");
+                            }
+                        }
+                        continue;
+                    }
+                };
+
+                {
+                    let mut snapshot = update_state.lock().expect("update state poisoned");
+                    snapshot.updated_at_ms = now_ms;
+                    snapshot.current_version = current_agent_version().to_string();
+                    snapshot.phase = UpdatePhase::Verifying;
+                    snapshot.transport_channel = Some(channel);
+                    snapshot.manifest = Some(staged.manifest.clone());
+                    snapshot.manifest_path = Some(staged.manifest_path.clone());
+                    snapshot.artifact_path = Some(staged.artifact_path.clone());
+                    snapshot.rollback_path = staged.rollback_path.clone();
+                    snapshot.last_error = None;
+                    if let Err(error) = RuntimeStateStore::persist_update_snapshot(&config, &snapshot) {
+                        debug!(%error, "update-manager failed to persist verifying state");
+                    }
+                }
+
+                let verification = default_update_manifest_verifier().and_then(|verifier| {
+                    verifier.verify_manifest(
+                        &staged.manifest,
+                        &staged.artifact_bytes,
+                        staged.rollback_bytes.as_deref(),
+                    )
+                });
+
+                if let Err(error) = verification {
+                    match record_update_failure(
+                        &config,
+                        &update_state,
+                        UpdatePhase::Rejected,
+                        Some(channel),
+                        now_ms,
+                        error.to_string(),
+                    ) {
+                        Ok(snapshot) => {
+                            publish_update_status_receipt(&comms_runtime, &snapshot, now_ms).ok();
+                        }
+                        Err(record_error) => {
+                            debug!(%record_error, "update-manager failed to persist verification rejection");
+                        }
+                    }
+                    continue;
+                }
+
+                let plan = UpgradePlanner::build_plan(
+                    &config,
+                    upgrade_artifact_from_manifest(&staged.manifest),
+                );
+
+                let plan = match plan {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        match record_update_failure(
+                            &config,
+                            &update_state,
+                            UpdatePhase::Rejected,
+                            Some(channel),
+                            now_ms,
+                            error.to_string(),
+                        ) {
+                            Ok(snapshot) => {
+                                publish_update_status_receipt(&comms_runtime, &snapshot, now_ms).ok();
+                            }
+                            Err(record_error) => {
+                                debug!(%record_error, "update-manager failed to persist planner rejection");
+                            }
+                        }
+                        continue;
+                    }
+                };
+
+                let ready_snapshot = {
+                    let mut snapshot = update_state.lock().expect("update state poisoned");
+                    snapshot.updated_at_ms = now_ms;
+                    snapshot.current_version = current_agent_version().to_string();
+                    snapshot.phase = UpdatePhase::Ready;
+                    snapshot.transport_channel = Some(channel);
+                    snapshot.manifest = Some(staged.manifest.clone());
+                    snapshot.manifest_path = Some(staged.manifest_path.clone());
+                    snapshot.artifact_path = Some(staged.artifact_path.clone());
+                    snapshot.rollback_path = staged.rollback_path.clone();
+                    snapshot.last_success_at_ms = Some(now_ms);
+                    snapshot.last_error = None;
+                    if let Err(error) = RuntimeStateStore::persist_update_snapshot(&config, &snapshot) {
+                        debug!(%error, "update-manager failed to persist ready state");
+                    }
+                    snapshot.clone()
+                };
+
+                if let Err(error) = publish_update_status_receipt(&comms_runtime, &ready_snapshot, now_ms) {
+                    debug!(%error, "update-manager failed to upload ready receipt");
+                }
+
+                info!(
+                    ?channel,
+                    artifact_id = %plan.artifact.artifact_id,
+                    target_version = %plan.artifact.target_version,
+                    rollback_required = plan.rollback_required,
+                    "update-manager staged verified update"
+                );
             }
         }
     }
@@ -2395,13 +2789,20 @@ fn now_unix_secs() -> u64 {
 mod tests {
     use super::*;
     use crate::comms::canonical_command_hash;
+    use crate::upgrade::{
+        HotUpdateManifestVerifier, RuntimeStateStore, UpdatePhase,
+        DEVELOPMENT_UPDATE_SIGNING_KEY_BYTES, DEVELOPMENT_UPDATE_SIGNING_KEY_ID,
+        UPDATE_ARTIFACT_KIND, UPDATE_MANIFEST_KIND, UPDATE_ROLLBACK_KIND,
+    };
     use aegis_model::{
         Alert, ApprovalPolicy, ApprovalProof, ApproverEntry, BatchAck, BatchAckStatus, ClientAck,
-        DecisionKind, DownlinkMessage, EventPayload, EventType, FlowControlHint, Priority,
-        ProcessContext, ScriptContext, ServerCommand, SignedServerCommand, TargetScope,
-        TargetScopeKind, TelemetryEvent, UplinkMessage,
+        DecisionKind, DownlinkMessage, EventPayload, EventType, FlowControlHint, HeartbeatResponse,
+        HotUpdateManifest, Priority, ProcessContext, ScriptContext, ServerCommand,
+        SignedServerCommand, TargetScope, TargetScopeKind, TelemetryEvent, UpdateChunk,
+        UplinkMessage,
     };
     use ed25519_dalek::{Signer, SigningKey};
+    use sha2::Digest;
 
     fn temp_state_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("aegis-{name}-{}", Uuid::now_v7()))
@@ -2512,6 +2913,65 @@ mod tests {
             .collect()
     }
 
+    fn signed_hot_update_manifest(
+        artifact_bytes: &[u8],
+        rollback_bytes: Option<&[u8]>,
+    ) -> HotUpdateManifest {
+        let signing_key = SigningKey::from_bytes(&DEVELOPMENT_UPDATE_SIGNING_KEY_BYTES);
+        let mut manifest = HotUpdateManifest {
+            artifact_id: "artifact-42".to_string(),
+            target_version: "1.2.3".to_string(),
+            rollout_channel: "canary".to_string(),
+            target_conf_version: 1,
+            target_schema_version: 1,
+            artifact_sha256: hex::encode(sha2::Sha256::digest(artifact_bytes)),
+            rollback_artifact_id: rollback_bytes.map(|_| "artifact-41".to_string()),
+            rollback_artifact_sha256: rollback_bytes
+                .map(|bytes| hex::encode(sha2::Sha256::digest(bytes))),
+            signature: Vec::new(),
+            signing_key_id: DEVELOPMENT_UPDATE_SIGNING_KEY_ID.to_string(),
+        };
+        manifest.signature = signing_key
+            .sign(&HotUpdateManifestVerifier::canonical_payload(&manifest))
+            .to_bytes()
+            .to_vec();
+        manifest
+    }
+
+    fn update_stream(
+        manifest: &HotUpdateManifest,
+        artifact_bytes: &[u8],
+        rollback_bytes: Option<&[u8]>,
+    ) -> Vec<UpdateChunk> {
+        let mut chunks = vec![UpdateChunk {
+            artifact_id: manifest.artifact_id.clone(),
+            chunk_index: 0,
+            bytes: serde_json::to_vec(manifest).expect("serialize manifest"),
+            eof: true,
+            artifact_kind: UPDATE_MANIFEST_KIND.to_string(),
+        }];
+        chunks.push(UpdateChunk {
+            artifact_id: manifest.artifact_id.clone(),
+            chunk_index: 0,
+            bytes: artifact_bytes.to_vec(),
+            eof: true,
+            artifact_kind: UPDATE_ARTIFACT_KIND.to_string(),
+        });
+        if let Some(rollback_bytes) = rollback_bytes {
+            chunks.push(UpdateChunk {
+                artifact_id: manifest
+                    .rollback_artifact_id
+                    .clone()
+                    .expect("rollback artifact id"),
+                chunk_index: 0,
+                bytes: rollback_bytes.to_vec(),
+                eof: true,
+                artifact_kind: UPDATE_ROLLBACK_KIND.to_string(),
+            });
+        }
+        chunks
+    }
+
     fn sample_alert(severity: Severity, summary: &str) -> Alert {
         Alert {
             alert_id: Uuid::now_v7(),
@@ -2602,6 +3062,10 @@ mod tests {
             .summary
             .task_topology
             .contains(&"comms-rx".to_string()));
+        assert!(artifacts
+            .summary
+            .task_topology
+            .contains(&"update-manager".to_string()));
     }
 
     #[tokio::test]
@@ -2806,6 +3270,122 @@ mod tests {
         assert!(heartbeats
             .iter()
             .any(|heartbeat| heartbeat.health.lineage_counters.grpc_acked >= 3));
+
+        runtime
+            .graceful_shutdown(Duration::from_secs(1))
+            .await
+            .expect("runtime shutdown should work");
+        fs::remove_dir_all(state_root).ok();
+    }
+
+    #[tokio::test]
+    async fn runtime_stages_verified_update_and_uploads_status_receipt() {
+        let mut config = loopback_test_config("update-ready");
+        config.runtime.heartbeat_interval_secs = 1;
+        let state_root = config.storage.state_root.clone();
+        let orchestrator = Orchestrator::new(config.clone());
+        let artifacts = orchestrator.bootstrap().expect("bootstrap should work");
+        let runtime = orchestrator.start(artifacts).expect("runtime should start");
+        let handle = runtime
+            .loopback_handle(CommunicationChannelKind::Grpc)
+            .expect("grpc loopback handle");
+
+        let artifact_bytes = b"agent-binary-v2";
+        let rollback_bytes = b"agent-binary-v1";
+        let manifest = signed_hot_update_manifest(artifact_bytes, Some(rollback_bytes));
+        handle.push_heartbeat_response(HeartbeatResponse {
+            server_time_ms: now_unix_ms(),
+            pending_update_ids: vec![manifest.artifact_id.clone()],
+            config_changed: false,
+        });
+        handle.push_update_stream(update_stream(
+            &manifest,
+            artifact_bytes,
+            Some(rollback_bytes),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(2_200)).await;
+
+        let update_requests = handle.take_update_requests();
+        assert_eq!(update_requests.len(), 1);
+        assert_eq!(update_requests[0].current_version, current_agent_version());
+
+        let uploaded = handle.take_uploaded_artifacts();
+        assert!(!uploaded.is_empty());
+        assert_eq!(uploaded[0][0].artifact_kind, UPDATE_STATUS_ARTIFACT_KIND);
+
+        let snapshot =
+            RuntimeStateStore::load_update_snapshot(&config).expect("load update snapshot");
+        assert_eq!(snapshot.phase, UpdatePhase::Ready);
+        assert_eq!(snapshot.active_update_id().as_deref(), Some("artifact-42"));
+        assert_eq!(
+            snapshot.transport_channel,
+            Some(CommunicationChannelKind::Grpc)
+        );
+        assert!(snapshot
+            .manifest_path
+            .as_ref()
+            .expect("manifest path")
+            .exists());
+        assert!(snapshot
+            .artifact_path
+            .as_ref()
+            .expect("artifact path")
+            .exists());
+        assert!(snapshot
+            .rollback_path
+            .as_ref()
+            .expect("rollback path")
+            .exists());
+        assert!(snapshot.last_error.is_none());
+
+        runtime
+            .graceful_shutdown(Duration::from_secs(1))
+            .await
+            .expect("runtime shutdown should work");
+        fs::remove_dir_all(state_root).ok();
+    }
+
+    #[tokio::test]
+    async fn runtime_blocks_update_when_rollback_payload_is_missing() {
+        let mut config = loopback_test_config("update-missing-rollback");
+        config.runtime.heartbeat_interval_secs = 1;
+        let state_root = config.storage.state_root.clone();
+        let orchestrator = Orchestrator::new(config.clone());
+        let artifacts = orchestrator.bootstrap().expect("bootstrap should work");
+        let runtime = orchestrator.start(artifacts).expect("runtime should start");
+        let handle = runtime
+            .loopback_handle(CommunicationChannelKind::Grpc)
+            .expect("grpc loopback handle");
+
+        let artifact_bytes = b"agent-binary-v2";
+        let rollback_bytes = b"agent-binary-v1";
+        let manifest = signed_hot_update_manifest(artifact_bytes, Some(rollback_bytes));
+        handle.push_heartbeat_response(HeartbeatResponse {
+            server_time_ms: now_unix_ms(),
+            pending_update_ids: vec![manifest.artifact_id.clone()],
+            config_changed: false,
+        });
+        handle.push_update_stream(update_stream(&manifest, artifact_bytes, None));
+
+        tokio::time::sleep(Duration::from_millis(2_200)).await;
+
+        let uploaded = handle.take_uploaded_artifacts();
+        assert!(!uploaded.is_empty());
+        assert_eq!(uploaded[0][0].artifact_kind, UPDATE_STATUS_ARTIFACT_KIND);
+
+        let snapshot =
+            RuntimeStateStore::load_update_snapshot(&config).expect("load update snapshot");
+        assert_eq!(snapshot.phase, UpdatePhase::Failed);
+        assert_eq!(
+            snapshot.transport_channel,
+            Some(CommunicationChannelKind::Grpc)
+        );
+        assert!(snapshot
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("missing rollback"));
 
         runtime
             .graceful_shutdown(Duration::from_secs(1))

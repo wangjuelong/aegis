@@ -1,18 +1,13 @@
 use aegis_core::config::AppConfig;
 use aegis_core::upgrade::{
-    HotUpdateManifestVerifier, RuntimeStateStore, UpdateVerificationSnapshot,
+    default_update_manifest_verifier, RuntimeStateStore, UpdatePhase, UpdateVerificationSnapshot,
 };
 use aegis_model::HotUpdateManifest;
 use anyhow::{bail, Context, Result};
-use ed25519_dalek::{Signer, SigningKey};
-use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
-
-const DEV_UPDATE_SIGNING_KEY: [u8; 32] = [21u8; 32];
-const DEV_UPDATE_SIGNING_KEY_ID: &str = "server-k1";
 
 #[derive(Default)]
 struct CliArgs {
@@ -23,57 +18,65 @@ struct CliArgs {
 }
 
 struct StagedUpdateFiles {
+    manifest: HotUpdateManifest,
     manifest_path: PathBuf,
     artifact_path: PathBuf,
+    artifact_bytes: Vec<u8>,
     rollback_path: Option<PathBuf>,
+    rollback_bytes: Option<Vec<u8>>,
 }
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
 
     let args = parse_args()?;
-    let config = load_runtime_config(args.state_root)?;
-    let staged = ensure_staged_update(&config)?;
+    let config = load_runtime_config(args.state_root.clone())?;
+    let now_ms = now_unix_ms();
+    let base_snapshot = load_update_snapshot(&config, now_ms);
+    let staged = resolve_staged_update(&config, &args, &base_snapshot)?;
 
-    let manifest_path = args.manifest.unwrap_or(staged.manifest_path);
-    let manifest = load_manifest(&manifest_path)?;
-    let artifact_path = args.artifact.unwrap_or(staged.artifact_path);
-    let artifact_bytes = fs::read(&artifact_path)
-        .with_context(|| format!("read update artifact {}", artifact_path.display()))?;
-    let rollback_path = args.rollback.or_else(|| {
-        manifest
-            .rollback_artifact_id
-            .as_ref()
-            .and(staged.rollback_path.clone())
-    });
-    let rollback_bytes = rollback_path
-        .as_ref()
-        .map(|path| {
-            fs::read(path).with_context(|| format!("read rollback artifact {}", path.display()))
-        })
-        .transpose()?;
+    let mut verifying_snapshot = base_snapshot.clone();
+    verifying_snapshot.updated_at_ms = now_ms;
+    verifying_snapshot.current_version = current_agent_version().to_string();
+    verifying_snapshot.phase = UpdatePhase::Verifying;
+    verifying_snapshot.manifest = Some(staged.manifest.clone());
+    verifying_snapshot.manifest_path = Some(staged.manifest_path.clone());
+    verifying_snapshot.artifact_path = Some(staged.artifact_path.clone());
+    verifying_snapshot.rollback_path = staged.rollback_path.clone();
+    verifying_snapshot.last_attempt_at_ms = Some(now_ms);
+    verifying_snapshot.last_error = None;
+    RuntimeStateStore::persist_update_snapshot(&config, &verifying_snapshot)?;
 
-    let signing_key = SigningKey::from_bytes(&DEV_UPDATE_SIGNING_KEY);
-    let mut verifier = HotUpdateManifestVerifier::new();
-    verifier.register_signing_key(
-        DEV_UPDATE_SIGNING_KEY_ID,
-        signing_key.verifying_key().to_bytes(),
-    )?;
-    verifier.verify_manifest(&manifest, &artifact_bytes, rollback_bytes.as_deref())?;
+    let verifier = default_update_manifest_verifier()?;
+    if let Err(error) = verifier.verify_manifest(
+        &staged.manifest,
+        &staged.artifact_bytes,
+        staged.rollback_bytes.as_deref(),
+    ) {
+        let mut rejected_snapshot = verifying_snapshot;
+        rejected_snapshot.updated_at_ms = now_unix_ms();
+        rejected_snapshot.phase = UpdatePhase::Rejected;
+        rejected_snapshot.retry_count = rejected_snapshot.retry_count.saturating_add(1);
+        rejected_snapshot.last_error = Some(error.to_string());
+        RuntimeStateStore::persist_update_snapshot(&config, &rejected_snapshot).ok();
+        return Err(error);
+    }
 
-    let snapshot = UpdateVerificationSnapshot {
-        verified_at_ms: now_unix_ms(),
-        manifest,
-        artifact_path,
-        rollback_path,
-    };
-    RuntimeStateStore::persist_update_snapshot(&config, &snapshot)?;
-    println!("{}", serde_json::to_string_pretty(&snapshot)?);
+    let mut ready_snapshot = verifying_snapshot;
+    ready_snapshot.updated_at_ms = now_unix_ms();
+    ready_snapshot.phase = UpdatePhase::Ready;
+    ready_snapshot.last_success_at_ms = Some(ready_snapshot.updated_at_ms);
+    RuntimeStateStore::persist_update_snapshot(&config, &ready_snapshot)?;
+    println!("{}", serde_json::to_string_pretty(&ready_snapshot)?);
     info!(
-        artifact_id = %snapshot.manifest.artifact_id,
-        target_version = %snapshot.manifest.target_version,
+        artifact_id = %ready_snapshot.active_update_id().unwrap_or_else(|| "<none>".to_string()),
+        target_version = %ready_snapshot
+            .manifest
+            .as_ref()
+            .map(|manifest| manifest.target_version.as_str())
+            .unwrap_or("<unknown>"),
         state_root = %config.storage.state_root.display(),
-        "aegis-updater verified signed manifest"
+        "aegis-updater verified staged update"
     );
     Ok(())
 }
@@ -129,55 +132,8 @@ fn state_root_writable(path: &Path) -> bool {
     }
 }
 
-fn ensure_staged_update(config: &AppConfig) -> Result<StagedUpdateFiles> {
-    let manifest_path = RuntimeStateStore::staged_update_manifest_path(config);
-    let artifact_path = RuntimeStateStore::staged_update_artifact_path(config);
-    let rollback_path = RuntimeStateStore::staged_update_rollback_path(config);
-    if manifest_path.exists() && artifact_path.exists() {
-        let rollback = if rollback_path.exists() {
-            Some(rollback_path)
-        } else {
-            None
-        };
-        return Ok(StagedUpdateFiles {
-            manifest_path,
-            artifact_path,
-            rollback_path: rollback,
-        });
-    }
-
-    let artifact = b"aegis-agent-binary";
-    let rollback = b"aegis-agent-binary-prev";
-    if let Some(parent) = artifact_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&artifact_path, artifact)?;
-    fs::write(&rollback_path, rollback)?;
-
-    let signing_key = SigningKey::from_bytes(&DEV_UPDATE_SIGNING_KEY);
-    let mut manifest = HotUpdateManifest {
-        artifact_id: "artifact-42".to_string(),
-        target_version: "1.2.3".to_string(),
-        rollout_channel: "canary".to_string(),
-        target_conf_version: 1,
-        target_schema_version: 1,
-        artifact_sha256: sha256_hex(artifact),
-        rollback_artifact_id: Some("artifact-41".to_string()),
-        rollback_artifact_sha256: Some(sha256_hex(rollback)),
-        signature: Vec::new(),
-        signing_key_id: DEV_UPDATE_SIGNING_KEY_ID.to_string(),
-    };
-    manifest.signature = signing_key
-        .sign(&HotUpdateManifestVerifier::canonical_payload(&manifest))
-        .to_bytes()
-        .to_vec();
-    fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
-
-    Ok(StagedUpdateFiles {
-        manifest_path,
-        artifact_path,
-        rollback_path: Some(rollback_path),
-    })
+fn current_agent_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
 }
 
 fn load_manifest(path: &Path) -> Result<HotUpdateManifest> {
@@ -185,13 +141,80 @@ fn load_manifest(path: &Path) -> Result<HotUpdateManifest> {
     Ok(serde_json::from_slice(&raw)?)
 }
 
+fn load_update_snapshot(config: &AppConfig, now_ms: i64) -> UpdateVerificationSnapshot {
+    let mut snapshot = RuntimeStateStore::load_update_snapshot(config)
+        .unwrap_or_else(|_| UpdateVerificationSnapshot::new(current_agent_version(), now_ms));
+    if snapshot.current_version.is_empty() {
+        snapshot.current_version = current_agent_version().to_string();
+    }
+    snapshot
+}
+
+fn resolve_staged_update(
+    config: &AppConfig,
+    args: &CliArgs,
+    snapshot: &UpdateVerificationSnapshot,
+) -> Result<StagedUpdateFiles> {
+    let manifest_path = args
+        .manifest
+        .clone()
+        .or_else(|| snapshot.manifest_path.clone())
+        .unwrap_or_else(|| RuntimeStateStore::staged_update_manifest_path(config));
+    let manifest = if args.manifest.is_some() || manifest_path.exists() {
+        load_manifest(&manifest_path)?
+    } else {
+        snapshot
+            .manifest
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("no staged update manifest is available"))?
+    };
+
+    if args.manifest.is_none()
+        && !matches!(snapshot.phase, UpdatePhase::Ready | UpdatePhase::Verifying)
+    {
+        bail!(
+            "update state is not ready for verification: phase={:?} error={}",
+            snapshot.phase,
+            snapshot.last_error.as_deref().unwrap_or("<none>")
+        );
+    }
+
+    let artifact_path = args
+        .artifact
+        .clone()
+        .or_else(|| snapshot.artifact_path.clone())
+        .unwrap_or_else(|| RuntimeStateStore::staged_update_artifact_path(config));
+    let artifact_bytes = fs::read(&artifact_path)
+        .with_context(|| format!("read update artifact {}", artifact_path.display()))?;
+
+    let rollback_path = args
+        .rollback
+        .clone()
+        .or_else(|| snapshot.rollback_path.clone());
+    let rollback_bytes = rollback_path
+        .as_ref()
+        .map(|path| {
+            fs::read(path).with_context(|| format!("read rollback artifact {}", path.display()))
+        })
+        .transpose()?;
+
+    if manifest.rollback_artifact_id.is_some() && rollback_bytes.is_none() {
+        bail!("missing rollback artifact payload for staged update");
+    }
+
+    Ok(StagedUpdateFiles {
+        manifest,
+        manifest_path,
+        artifact_path,
+        artifact_bytes,
+        rollback_path,
+        rollback_bytes,
+    })
+}
+
 fn now_unix_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time before unix epoch")
         .as_millis() as i64
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
 }

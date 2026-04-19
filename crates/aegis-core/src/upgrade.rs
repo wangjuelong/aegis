@@ -3,9 +3,9 @@ use crate::config::{AgentConfig, CURRENT_CONF_VERSION};
 use crate::migrations::{CURRENT_SCHEMA_VERSION, MIN_READER_SCHEMA_VERSION};
 use crate::self_protection::{KeyProtectionStatus, KeyProtectionTier, ProtectionPosture};
 use aegis_model::{
-    AgentHealth, AgentSupervisorHeartbeat, CommunicationRuntimeStatus, HotUpdateManifest,
-    PluginHealthStatus, RuntimeBridgeStatus, RuntimeHealthSignals, TelemetryIntegrity,
-    WatchdogAlert, WatchdogAlertKind, WatchdogHeartbeat,
+    AgentHealth, AgentSupervisorHeartbeat, CommunicationChannelKind, CommunicationRuntimeStatus,
+    HotUpdateManifest, PluginHealthStatus, RuntimeBridgeStatus, RuntimeHealthSignals,
+    TelemetryIntegrity, UpdateChunk, WatchdogAlert, WatchdogAlertKind, WatchdogHeartbeat,
 };
 use anyhow::{bail, Result};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -15,6 +15,12 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+
+pub const UPDATE_MANIFEST_KIND: &str = "manifest";
+pub const UPDATE_ARTIFACT_KIND: &str = "artifact";
+pub const UPDATE_ROLLBACK_KIND: &str = "rollback";
+pub const DEVELOPMENT_UPDATE_SIGNING_KEY_ID: &str = "update-k1";
+pub const DEVELOPMENT_UPDATE_SIGNING_KEY_BYTES: [u8; 32] = [21u8; 32];
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpgradeArtifact {
@@ -33,6 +39,37 @@ pub struct UpgradePlan {
     pub requires_config_sync: bool,
     pub rollback_required: bool,
     pub steps: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum UpdatePhase {
+    #[default]
+    Idle,
+    Announced,
+    Downloading,
+    Verifying,
+    Ready,
+    Rejected,
+    Failed,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiagnoseUpdateStatus {
+    pub phase: UpdatePhase,
+    pub current_version: String,
+    pub pending_update_ids: Vec<String>,
+    pub config_changed: bool,
+    pub transport_channel: Option<CommunicationChannelKind>,
+    pub target_artifact_id: Option<String>,
+    pub target_version: Option<String>,
+    pub rollback_required: bool,
+    pub staged_manifest_path: Option<PathBuf>,
+    pub staged_artifact_path: Option<PathBuf>,
+    pub staged_rollback_path: Option<PathBuf>,
+    pub retry_count: u32,
+    pub last_attempt_at_ms: Option<i64>,
+    pub last_success_at_ms: Option<i64>,
+    pub last_error: Option<String>,
 }
 
 pub struct UpgradePlanner;
@@ -227,6 +264,126 @@ impl Default for HotUpdateManifestVerifier {
     }
 }
 
+pub fn default_update_manifest_verifier() -> Result<HotUpdateManifestVerifier> {
+    let mut verifier = HotUpdateManifestVerifier::new();
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&DEVELOPMENT_UPDATE_SIGNING_KEY_BYTES);
+    verifier.register_signing_key(
+        DEVELOPMENT_UPDATE_SIGNING_KEY_ID,
+        signing_key.verifying_key().to_bytes(),
+    )?;
+    Ok(verifier)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagedPulledUpdate {
+    pub manifest: HotUpdateManifest,
+    pub manifest_path: PathBuf,
+    pub artifact_path: PathBuf,
+    pub rollback_path: Option<PathBuf>,
+    pub artifact_bytes: Vec<u8>,
+    pub rollback_bytes: Option<Vec<u8>>,
+}
+
+pub fn stage_pulled_update(
+    config: &AgentConfig,
+    chunks: Vec<UpdateChunk>,
+) -> Result<StagedPulledUpdate> {
+    let manifest_bytes = assemble_update_payload(&chunks, UPDATE_MANIFEST_KIND)?;
+    let manifest_path = RuntimeStateStore::staged_update_manifest_path(config);
+    if let Some(parent) = manifest_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&manifest_path, &manifest_bytes)?;
+
+    let manifest: HotUpdateManifest = serde_json::from_slice(&manifest_bytes)?;
+    let artifact_bytes =
+        assemble_named_payload(&chunks, UPDATE_ARTIFACT_KIND, &manifest.artifact_id)?;
+    let artifact_path = RuntimeStateStore::staged_update_artifact_path(config);
+    fs::write(&artifact_path, &artifact_bytes)?;
+
+    let rollback = match manifest.rollback_artifact_id.as_deref() {
+        Some(artifact_id) => {
+            let rollback_bytes =
+                assemble_named_payload(&chunks, UPDATE_ROLLBACK_KIND, artifact_id)?;
+            let rollback_path = RuntimeStateStore::staged_update_rollback_path(config);
+            fs::write(&rollback_path, &rollback_bytes)?;
+            Some((rollback_path, rollback_bytes))
+        }
+        None => {
+            let rollback_path = RuntimeStateStore::staged_update_rollback_path(config);
+            let _ = fs::remove_file(rollback_path);
+            None
+        }
+    };
+
+    Ok(StagedPulledUpdate {
+        manifest,
+        manifest_path,
+        artifact_path,
+        rollback_path: rollback.as_ref().map(|(path, _)| path.clone()),
+        artifact_bytes,
+        rollback_bytes: rollback.map(|(_, bytes)| bytes),
+    })
+}
+
+fn assemble_update_payload(chunks: &[UpdateChunk], expected_kind: &str) -> Result<Vec<u8>> {
+    let selected = chunks
+        .iter()
+        .filter(|chunk| chunk.artifact_kind == expected_kind)
+        .cloned()
+        .collect::<Vec<_>>();
+    assemble_ordered_chunks(selected, expected_kind)
+}
+
+fn assemble_named_payload(
+    chunks: &[UpdateChunk],
+    expected_kind: &str,
+    expected_artifact_id: &str,
+) -> Result<Vec<u8>> {
+    let selected = chunks
+        .iter()
+        .filter(|chunk| {
+            chunk.artifact_kind == expected_kind && chunk.artifact_id == expected_artifact_id
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assemble_ordered_chunks(selected, &format!("{expected_kind}:{expected_artifact_id}"))
+}
+
+fn assemble_ordered_chunks(mut chunks: Vec<UpdateChunk>, label: &str) -> Result<Vec<u8>> {
+    if chunks.is_empty() {
+        bail!("missing {label} payload");
+    }
+    chunks.sort_by_key(|chunk| chunk.chunk_index);
+    let mut bytes = Vec::new();
+    let mut saw_eof = false;
+    for (expected_index, chunk) in chunks.into_iter().enumerate() {
+        if chunk.chunk_index != expected_index as u32 {
+            bail!("non-contiguous {label} chunk index {}", chunk.chunk_index);
+        }
+        if saw_eof {
+            bail!("unexpected trailing {label} chunk after eof");
+        }
+        bytes.extend_from_slice(&chunk.bytes);
+        saw_eof = chunk.eof;
+    }
+    if !saw_eof {
+        bail!("incomplete {label} stream without eof");
+    }
+    Ok(bytes)
+}
+
+pub fn upgrade_artifact_from_manifest(manifest: &HotUpdateManifest) -> UpgradeArtifact {
+    UpgradeArtifact {
+        artifact_id: manifest.artifact_id.clone(),
+        target_version: manifest.target_version.clone(),
+        rollout_channel: manifest.rollout_channel.clone(),
+        target_conf_version: manifest.target_conf_version,
+        target_schema_version: manifest.target_schema_version,
+        rollback_artifact_id: manifest.rollback_artifact_id.clone(),
+    }
+}
+
 pub struct WatchdogLinkMonitor {
     grace_period_ms: i64,
     last_agent: Option<AgentSupervisorHeartbeat>,
@@ -388,6 +545,8 @@ pub struct DiagnoseBundle {
     pub key_protection: DiagnoseKeyProtectionStatus,
     #[serde(default)]
     pub replay: DiagnoseReplayStatus,
+    #[serde(default)]
+    pub update: DiagnoseUpdateStatus,
     pub resources: AgentHealth,
     pub runtime_signals: RuntimeHealthSignals,
     pub runtime_bridge: Option<RuntimeBridgeStatus>,
@@ -412,6 +571,8 @@ pub struct AgentRuntimeSnapshot {
     pub key_protection: DiagnoseKeyProtectionStatus,
     #[serde(default)]
     pub replay: DiagnoseReplayStatus,
+    #[serde(default)]
+    pub update: DiagnoseUpdateStatus,
     pub resources: AgentHealth,
     pub runtime_bridge: Option<RuntimeBridgeStatus>,
     pub plugin_status: Vec<PluginHealthStatus>,
@@ -428,10 +589,101 @@ pub struct WatchdogRuntimeSnapshot {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpdateVerificationSnapshot {
-    pub verified_at_ms: i64,
-    pub manifest: HotUpdateManifest,
-    pub artifact_path: PathBuf,
+    #[serde(alias = "verified_at_ms")]
+    pub updated_at_ms: i64,
+    #[serde(default)]
+    pub current_version: String,
+    #[serde(default)]
+    pub phase: UpdatePhase,
+    #[serde(default)]
+    pub pending_update_ids: Vec<String>,
+    #[serde(default)]
+    pub config_changed: bool,
+    #[serde(default)]
+    pub transport_channel: Option<CommunicationChannelKind>,
+    #[serde(default)]
+    pub retry_count: u32,
+    #[serde(default)]
+    pub manifest: Option<HotUpdateManifest>,
+    #[serde(default)]
+    pub manifest_path: Option<PathBuf>,
+    #[serde(default)]
+    pub artifact_path: Option<PathBuf>,
+    #[serde(default)]
     pub rollback_path: Option<PathBuf>,
+    #[serde(default)]
+    pub last_attempt_at_ms: Option<i64>,
+    #[serde(default)]
+    pub last_success_at_ms: Option<i64>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+impl Default for UpdateVerificationSnapshot {
+    fn default() -> Self {
+        Self {
+            updated_at_ms: 0,
+            current_version: String::new(),
+            phase: UpdatePhase::Idle,
+            pending_update_ids: Vec::new(),
+            config_changed: false,
+            transport_channel: None,
+            retry_count: 0,
+            manifest: None,
+            manifest_path: None,
+            artifact_path: None,
+            rollback_path: None,
+            last_attempt_at_ms: None,
+            last_success_at_ms: None,
+            last_error: None,
+        }
+    }
+}
+
+impl UpdateVerificationSnapshot {
+    pub fn new(current_version: impl Into<String>, now_ms: i64) -> Self {
+        Self {
+            updated_at_ms: now_ms,
+            current_version: current_version.into(),
+            ..Self::default()
+        }
+    }
+
+    pub fn active_update_id(&self) -> Option<String> {
+        self.manifest
+            .as_ref()
+            .map(|manifest| manifest.artifact_id.clone())
+    }
+
+    pub fn to_diagnose_status(&self) -> DiagnoseUpdateStatus {
+        DiagnoseUpdateStatus {
+            phase: self.phase,
+            current_version: self.current_version.clone(),
+            pending_update_ids: self.pending_update_ids.clone(),
+            config_changed: self.config_changed,
+            transport_channel: self.transport_channel,
+            target_artifact_id: self
+                .manifest
+                .as_ref()
+                .map(|manifest| manifest.artifact_id.clone()),
+            target_version: self
+                .manifest
+                .as_ref()
+                .map(|manifest| manifest.target_version.clone()),
+            rollback_required: self
+                .manifest
+                .as_ref()
+                .and_then(|manifest| manifest.rollback_artifact_id.as_ref())
+                .is_some(),
+            staged_manifest_path: self.manifest_path.clone(),
+            staged_artifact_path: self.artifact_path.clone(),
+            staged_rollback_path: self.rollback_path.clone(),
+            retry_count: self.retry_count,
+            last_attempt_at_ms: self.last_attempt_at_ms,
+            last_success_at_ms: self.last_success_at_ms,
+            last_error: self.last_error.clone(),
+        }
+    }
 }
 
 pub struct RuntimeStateStore;
@@ -510,6 +762,7 @@ impl DiagnoseCollector {
         wal: DiagnoseWalStatus,
         key_protection: DiagnoseKeyProtectionStatus,
         replay: DiagnoseReplayStatus,
+        update: DiagnoseUpdateStatus,
         resources: AgentHealth,
         runtime_bridge: Option<RuntimeBridgeStatus>,
         plugin_status: Vec<PluginHealthStatus>,
@@ -528,6 +781,7 @@ impl DiagnoseCollector {
             wal,
             key_protection,
             replay,
+            update,
             runtime_signals: resources.runtime_signals.clone(),
             resources,
             runtime_bridge,
@@ -560,6 +814,7 @@ impl AgentRuntimeSnapshot {
             self.wal.clone(),
             self.key_protection.clone(),
             self.replay.clone(),
+            self.update.clone(),
             self.resources.clone(),
             self.runtime_bridge.clone(),
             self.plugin_status.clone(),
@@ -574,9 +829,10 @@ mod tests {
         AgentRuntimeSnapshot, CanaryGateDecision, CanaryGateThresholds, CanaryObservation,
         DiagnoseCertificateStatus, DiagnoseCollector, DiagnoseConnectionStatus,
         DiagnoseKeyProtectionStatus, DiagnoseReplayStatus, DiagnoseSensorStatus, DiagnoseWalStatus,
-        HotUpdateManifestVerifier, RolloutGateEvaluator, RuntimeStateStore,
+        HotUpdateManifestVerifier, RolloutGateEvaluator, RuntimeStateStore, UpdatePhase,
         UpdateVerificationSnapshot, UpgradeArtifact, UpgradePlanner, WatchdogLinkMonitor,
-        WatchdogRuntimeSnapshot,
+        WatchdogRuntimeSnapshot, DEVELOPMENT_UPDATE_SIGNING_KEY_BYTES,
+        DEVELOPMENT_UPDATE_SIGNING_KEY_ID,
     };
     use crate::config::AgentConfig;
     use crate::health::HealthReporter;
@@ -677,7 +933,7 @@ mod tests {
             rollback_artifact_id: rollback_bytes.map(|_| "artifact-41".to_string()),
             rollback_artifact_sha256: rollback_bytes.map(super::sha256_hex),
             signature: Vec::new(),
-            signing_key_id: "server-k1".to_string(),
+            signing_key_id: DEVELOPMENT_UPDATE_SIGNING_KEY_ID.to_string(),
         };
         manifest.signature = signing_key
             .sign(&HotUpdateManifestVerifier::canonical_payload(&manifest))
@@ -695,7 +951,10 @@ mod tests {
         let manifest = signed_manifest(&wrong_signing_key, artifact, Some(rollback));
         let mut verifier = HotUpdateManifestVerifier::new();
         verifier
-            .register_signing_key("server-k1", server_signing_key.verifying_key().to_bytes())
+            .register_signing_key(
+                DEVELOPMENT_UPDATE_SIGNING_KEY_ID,
+                server_signing_key.verifying_key().to_bytes(),
+            )
             .expect("register signing key");
 
         let result = verifier.verify_manifest(&manifest, artifact, Some(rollback));
@@ -711,7 +970,10 @@ mod tests {
         let manifest = signed_manifest(&signing_key, artifact, Some(rollback));
         let mut verifier = HotUpdateManifestVerifier::new();
         verifier
-            .register_signing_key("server-k1", signing_key.verifying_key().to_bytes())
+            .register_signing_key(
+                DEVELOPMENT_UPDATE_SIGNING_KEY_ID,
+                signing_key.verifying_key().to_bytes(),
+            )
             .expect("register signing key");
 
         let result = verifier.verify_manifest(&manifest, artifact, Some(b"rollback-other"));
@@ -785,6 +1047,7 @@ mod tests {
             },
             DiagnoseKeyProtectionStatus::default(),
             DiagnoseReplayStatus::default(),
+            UpdateVerificationSnapshot::new("0.1.0", 1_713_000_120_000).to_diagnose_status(),
             health(),
             Some(RuntimeBridgeStatus {
                 control_socket_path: Some(
@@ -882,6 +1145,8 @@ mod tests {
             },
             key_protection: DiagnoseKeyProtectionStatus::default(),
             replay: DiagnoseReplayStatus::default(),
+            update: UpdateVerificationSnapshot::new("0.1.0", 1_713_000_300_000)
+                .to_diagnose_status(),
             resources: health(),
             runtime_bridge: None,
             plugin_status: vec![PluginHealthStatus {
@@ -918,10 +1183,24 @@ mod tests {
         assert_eq!(restored_watchdog, watchdog_snapshot);
 
         let update_snapshot = UpdateVerificationSnapshot {
-            verified_at_ms: 1_713_000_302_000,
-            manifest: signed_manifest(&SigningKey::from_bytes(&[13u8; 32]), b"artifact", None),
-            artifact_path: state_root.join("updates/artifact.bin"),
+            updated_at_ms: 1_713_000_302_000,
+            current_version: "0.1.0".to_string(),
+            phase: UpdatePhase::Ready,
+            pending_update_ids: vec!["artifact-42".to_string()],
+            config_changed: false,
+            transport_channel: Some(CommunicationChannelKind::Grpc),
+            retry_count: 1,
+            manifest: Some(signed_manifest(
+                &SigningKey::from_bytes(&DEVELOPMENT_UPDATE_SIGNING_KEY_BYTES),
+                b"artifact",
+                None,
+            )),
+            manifest_path: Some(state_root.join("updates/manifest.json")),
+            artifact_path: Some(state_root.join("updates/artifact.bin")),
             rollback_path: None,
+            last_attempt_at_ms: Some(1_713_000_301_500),
+            last_success_at_ms: Some(1_713_000_302_000),
+            last_error: None,
         };
         RuntimeStateStore::persist_update_snapshot(&config, &update_snapshot)
             .expect("persist update snapshot");

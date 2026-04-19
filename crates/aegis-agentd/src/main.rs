@@ -8,7 +8,7 @@ use aegis_core::transport_drivers::TransportAgentContext;
 use aegis_core::upgrade::{
     AgentRuntimeSnapshot, DiagnoseCertificateStatus, DiagnoseCollector, DiagnoseConnectionStatus,
     DiagnoseKeyProtectionStatus, DiagnoseReplayStatus, DiagnoseSensorStatus, DiagnoseWalStatus,
-    RuntimeStateStore,
+    RuntimeStateStore, UpdateVerificationSnapshot,
 };
 use aegis_core::wal::{PendingBatchStore, ReplayLane};
 use aegis_model::{
@@ -162,12 +162,11 @@ fn build_agent_runtime_snapshot(
     let rollback_status = load_rollback_status(config);
     let (wal, key_protection) = diagnose_storage_security(config, &rollback_status);
     let replay = load_replay_status(config);
+    let update = load_update_status(config);
     let plugin_status = collect_plugin_status(config);
-    let active_update_id = RuntimeStateStore::load_update_snapshot(config)
-        .ok()
-        .map(|snapshot| snapshot.manifest.artifact_id);
+    let active_update_id = update.active_update_id();
     let health = HealthReporter::build_snapshot(
-        "0.1.0",
+        current_agent_version(),
         &format!("bundle-{}", config.policy_version.policy_bundle),
         &format!("ruleset-{}", config.policy_version.ruleset_revision),
         &format!("model-{}", config.policy_version.model_revision),
@@ -232,11 +231,26 @@ fn build_agent_runtime_snapshot(
         wal,
         key_protection: key_protection.clone(),
         replay,
+        update: update.to_diagnose_status(),
         resources: health,
         runtime_bridge,
         plugin_status,
         self_protection_posture: protection_posture_from_key_status(&key_protection),
     }
+}
+
+fn current_agent_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+fn load_update_status(config: &AppConfig) -> UpdateVerificationSnapshot {
+    let mut snapshot = RuntimeStateStore::load_update_snapshot(config).unwrap_or_else(|_| {
+        UpdateVerificationSnapshot::new(current_agent_version(), now_unix_ms())
+    });
+    if snapshot.current_version.is_empty() {
+        snapshot.current_version = current_agent_version().to_string();
+    }
+    snapshot
 }
 
 fn diagnose_storage_security(

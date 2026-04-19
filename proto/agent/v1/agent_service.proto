@@ -212,4 +212,5 @@ message UpdateChunk {
   uint32 chunk_index = 2;
   bytes bytes = 3;
   bool eof = 4;
+  string artifact_kind = 5;
 }

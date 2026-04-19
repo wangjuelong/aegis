@@ -837,7 +837,7 @@ pub struct HeartbeatRequest {
     pub restart_epoch: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HeartbeatResponse {
     pub server_time_ms: i64,
     pub pending_update_ids: Vec<String>,
@@ -875,6 +875,7 @@ pub struct UpdateChunk {
     pub chunk_index: u32,
     pub bytes: Vec<u8>,
     pub eof: bool,
+    pub artifact_kind: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]

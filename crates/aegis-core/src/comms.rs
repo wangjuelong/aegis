@@ -1,9 +1,10 @@
 use crate::config::{CommunicationConfig, SecurityConfig};
 use crate::transport_drivers::{build_transport_drivers, TransportAgentContext};
 use aegis_model::{
-    AgentHealth, ApproverEntry, CommunicationChannelHealth, CommunicationChannelKind,
-    CommunicationRuntimeStatus, DownlinkMessage, EventBatch, HeartbeatRequest, ServerCommand,
-    SignedServerCommand, TargetScopeKind, TelemetryEvent, UplinkMessage,
+    AgentHealth, ApproverEntry, ArtifactChunk, CommunicationChannelHealth,
+    CommunicationChannelKind, CommunicationRuntimeStatus, DownlinkMessage, EventBatch,
+    HeartbeatRequest, HeartbeatResponse, ServerCommand, SignedServerCommand, TargetScopeKind,
+    TelemetryEvent, UpdateChunk, UpdateRequest, UplinkMessage, UploadResult,
 };
 use anyhow::{anyhow, bail, Result};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -84,9 +85,27 @@ impl HeartbeatBuilder {
 pub trait TransportDriver: Send + Sync {
     fn channel(&self) -> CommunicationChannelKind;
     fn send_uplink(&self, message: &UplinkMessage) -> Result<()>;
-    fn send_heartbeat(&self, heartbeat: &HeartbeatRequest) -> Result<()>;
+    fn send_heartbeat(&self, heartbeat: &HeartbeatRequest) -> Result<HeartbeatResponse>;
     fn recv_downlink(&self) -> Result<Option<DownlinkMessage>>;
     fn probe(&self) -> bool;
+    fn supports_update_stream(&self) -> bool {
+        false
+    }
+    fn supports_artifact_upload(&self) -> bool {
+        false
+    }
+    fn pull_update(&self, _request: &UpdateRequest) -> Result<Vec<UpdateChunk>> {
+        bail!(
+            "update pull is not supported for channel {:?}",
+            self.channel()
+        )
+    }
+    fn upload_artifact(&self, _chunks: &[ArtifactChunk]) -> Result<UploadResult> {
+        bail!(
+            "artifact upload is not supported for channel {:?}",
+            self.channel()
+        )
+    }
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -95,6 +114,11 @@ pub struct LoopbackTransportHandle {
     uplinks: Arc<Mutex<Vec<UplinkMessage>>>,
     heartbeats: Arc<Mutex<Vec<HeartbeatRequest>>>,
     downlinks: Arc<Mutex<VecDeque<DownlinkMessage>>>,
+    heartbeat_responses: Arc<Mutex<VecDeque<HeartbeatResponse>>>,
+    update_requests: Arc<Mutex<Vec<UpdateRequest>>>,
+    update_streams: Arc<Mutex<VecDeque<Vec<UpdateChunk>>>>,
+    uploaded_artifacts: Arc<Mutex<Vec<Vec<ArtifactChunk>>>>,
+    upload_results: Arc<Mutex<VecDeque<UploadResult>>>,
 }
 
 impl LoopbackTransportHandle {
@@ -116,6 +140,43 @@ impl LoopbackTransportHandle {
             .lock()
             .expect("loopback heartbeat queue poisoned");
         std::mem::take(&mut *heartbeats)
+    }
+
+    pub fn push_heartbeat_response(&self, response: HeartbeatResponse) {
+        self.heartbeat_responses
+            .lock()
+            .expect("loopback heartbeat response queue poisoned")
+            .push_back(response);
+    }
+
+    pub fn push_update_stream(&self, chunks: Vec<UpdateChunk>) {
+        self.update_streams
+            .lock()
+            .expect("loopback update stream queue poisoned")
+            .push_back(chunks);
+    }
+
+    pub fn take_update_requests(&self) -> Vec<UpdateRequest> {
+        let mut requests = self
+            .update_requests
+            .lock()
+            .expect("loopback update request queue poisoned");
+        std::mem::take(&mut *requests)
+    }
+
+    pub fn take_uploaded_artifacts(&self) -> Vec<Vec<ArtifactChunk>> {
+        let mut uploads = self
+            .uploaded_artifacts
+            .lock()
+            .expect("loopback uploaded artifact queue poisoned");
+        std::mem::take(&mut *uploads)
+    }
+
+    pub fn push_upload_result(&self, result: UploadResult) {
+        self.upload_results
+            .lock()
+            .expect("loopback upload result queue poisoned")
+            .push_back(result);
     }
 }
 
@@ -151,13 +212,19 @@ impl TransportDriver for LoopbackTransportDriver {
         Ok(())
     }
 
-    fn send_heartbeat(&self, heartbeat: &HeartbeatRequest) -> Result<()> {
+    fn send_heartbeat(&self, heartbeat: &HeartbeatRequest) -> Result<HeartbeatResponse> {
         self.handle
             .heartbeats
             .lock()
             .expect("loopback heartbeat queue poisoned")
             .push(heartbeat.clone());
-        Ok(())
+        Ok(self
+            .handle
+            .heartbeat_responses
+            .lock()
+            .expect("loopback heartbeat response queue poisoned")
+            .pop_front()
+            .unwrap_or_default())
     }
 
     fn recv_downlink(&self) -> Result<Option<DownlinkMessage>> {
@@ -171,6 +238,49 @@ impl TransportDriver for LoopbackTransportDriver {
 
     fn probe(&self) -> bool {
         true
+    }
+
+    fn supports_update_stream(&self) -> bool {
+        true
+    }
+
+    fn supports_artifact_upload(&self) -> bool {
+        true
+    }
+
+    fn pull_update(&self, request: &UpdateRequest) -> Result<Vec<UpdateChunk>> {
+        self.handle
+            .update_requests
+            .lock()
+            .expect("loopback update request queue poisoned")
+            .push(request.clone());
+        Ok(self
+            .handle
+            .update_streams
+            .lock()
+            .expect("loopback update stream queue poisoned")
+            .pop_front()
+            .unwrap_or_default())
+    }
+
+    fn upload_artifact(&self, chunks: &[ArtifactChunk]) -> Result<UploadResult> {
+        self.handle
+            .uploaded_artifacts
+            .lock()
+            .expect("loopback uploaded artifact queue poisoned")
+            .push(chunks.to_vec());
+        Ok(self
+            .handle
+            .upload_results
+            .lock()
+            .expect("loopback upload result queue poisoned")
+            .pop_front()
+            .unwrap_or(UploadResult {
+                upload_id: Uuid::now_v7(),
+                accepted_chunks: chunks.len() as u32,
+                accepted_bytes: chunks.iter().map(|chunk| chunk.bytes.len() as u64).sum(),
+                digest_hex: "loopback-upload".to_string(),
+            }))
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -268,14 +378,53 @@ impl CommunicationRuntime {
         now_ms: i64,
     ) -> Result<CommunicationChannelKind> {
         self.send_with_active_channel(now_ms, |driver| driver.send_uplink(message))
+            .map(|(channel, _)| channel)
     }
 
     pub fn send_heartbeat(
         &mut self,
         heartbeat: &HeartbeatRequest,
         now_ms: i64,
-    ) -> Result<CommunicationChannelKind> {
+    ) -> Result<(CommunicationChannelKind, HeartbeatResponse)> {
         self.send_with_active_channel(now_ms, |driver| driver.send_heartbeat(heartbeat))
+    }
+
+    pub fn pull_update(
+        &mut self,
+        request: &UpdateRequest,
+        now_ms: i64,
+    ) -> Result<(CommunicationChannelKind, Vec<UpdateChunk>)> {
+        let channel = self
+            .fallback_order
+            .iter()
+            .copied()
+            .find(|channel| {
+                self.drivers
+                    .get(channel)
+                    .map(|driver| driver.supports_update_stream())
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| anyhow!("no update-capable transport driver is registered"))?;
+        self.call_with_channel(channel, now_ms, |driver| driver.pull_update(request))
+    }
+
+    pub fn upload_artifact(
+        &mut self,
+        chunks: &[ArtifactChunk],
+        now_ms: i64,
+    ) -> Result<(CommunicationChannelKind, UploadResult)> {
+        let channel = self
+            .fallback_order
+            .iter()
+            .copied()
+            .find(|channel| {
+                self.drivers
+                    .get(channel)
+                    .map(|driver| driver.supports_artifact_upload())
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| anyhow!("no artifact-upload-capable transport driver is registered"))?;
+        self.call_with_channel(channel, now_ms, |driver| driver.upload_artifact(chunks))
     }
 
     pub fn poll_downlink(
@@ -397,33 +546,44 @@ impl CommunicationRuntime {
         ]
     }
 
-    fn send_with_active_channel<F>(
+    fn send_with_active_channel<F, T>(
         &mut self,
         now_ms: i64,
         send: F,
-    ) -> Result<CommunicationChannelKind>
+    ) -> Result<(CommunicationChannelKind, T)>
     where
-        F: FnOnce(&dyn TransportDriver) -> Result<()>,
+        F: FnOnce(&dyn TransportDriver) -> Result<T>,
     {
-        let channel = self.active_channel();
+        self.call_with_channel(self.active_channel(), now_ms, send)
+    }
+
+    fn call_with_channel<F, T>(
+        &mut self,
+        channel: CommunicationChannelKind,
+        now_ms: i64,
+        send: F,
+    ) -> Result<(CommunicationChannelKind, T)>
+    where
+        F: FnOnce(&dyn TransportDriver) -> Result<T>,
+    {
         self.channel_state
             .entry(channel)
             .or_default()
             .last_attempt_ms = Some(now_ms);
 
-        let result: Result<()> = match self.drivers.get(&channel) {
+        let result = match self.drivers.get(&channel) {
             Some(driver) => send(driver.as_ref()),
             None => Err(anyhow!("no transport driver registered for {:?}", channel)),
         };
 
         match result {
-            Ok(()) => {
+            Ok(value) => {
                 let state = self.channel_state.entry(channel).or_default();
                 state.healthy = true;
                 state.consecutive_failures = 0;
                 state.last_success_ms = Some(now_ms);
                 state.last_error = None;
-                Ok(channel)
+                Ok((channel, value))
             }
             Err(error) => {
                 let state = self.channel_state.entry(channel).or_default();
@@ -1170,9 +1330,9 @@ mod tests {
     use crate::config::SecurityConfig;
     use aegis_model::{
         AgentHealth, ApprovalPolicy, ApprovalProof, ApproverEntry, CommunicationChannelKind,
-        DownlinkMessage, EventPayload, EventType, FileContext, NormalizedEvent, Priority,
-        ProcessContext, RuntimeHealthSignals, ServerCommand, Severity, SignedServerCommand,
-        TargetScope, TargetScopeKind, TelemetryEvent, UplinkMessage,
+        DownlinkMessage, EventPayload, EventType, FileContext, HeartbeatResponse, NormalizedEvent,
+        Priority, ProcessContext, RuntimeHealthSignals, ServerCommand, Severity,
+        SignedServerCommand, TargetScope, TargetScopeKind, TelemetryEvent, UplinkMessage,
     };
     use ed25519_dalek::{Signer, SigningKey};
     use std::any::Any;
@@ -1314,8 +1474,12 @@ mod tests {
             self.next_send_result()
         }
 
-        fn send_heartbeat(&self, _heartbeat: &aegis_model::HeartbeatRequest) -> anyhow::Result<()> {
-            self.next_send_result()
+        fn send_heartbeat(
+            &self,
+            _heartbeat: &aegis_model::HeartbeatRequest,
+        ) -> anyhow::Result<HeartbeatResponse> {
+            self.next_send_result()?;
+            Ok(HeartbeatResponse::default())
         }
 
         fn recv_downlink(&self) -> anyhow::Result<Option<DownlinkMessage>> {

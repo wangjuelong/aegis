@@ -3,9 +3,10 @@ use crate::config::{
     CommunicationConfig, DomainFrontingCommunicationConfig, HttpPollingCommunicationConfig,
 };
 use aegis_model::{
-    BatchAck, BatchAckStatus, ClientAckStatus, CommunicationChannelKind, DownlinkMessage,
-    EventType, FlowControlHint, HeartbeatRequest, Priority, Severity, SignedServerCommand,
-    TelemetryEvent, TelemetryIntegrity, UplinkMessage,
+    ArtifactChunk, BatchAck, BatchAckStatus, ClientAckStatus, CommunicationChannelKind,
+    DownlinkMessage, EventType, FlowControlHint, HeartbeatRequest, HeartbeatResponse, Priority,
+    Severity, SignedServerCommand, TelemetryEvent, TelemetryIntegrity, UpdateChunk, UpdateRequest,
+    UplinkMessage, UploadResult,
 };
 use anyhow::{anyhow, Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -446,6 +447,55 @@ fn grpc_probe_request(agent: &TransportAgentContext) -> transport_rpc::Heartbeat
     }
 }
 
+fn decode_heartbeat_response_from_grpc(
+    response: transport_rpc::HeartbeatResponse,
+) -> HeartbeatResponse {
+    HeartbeatResponse {
+        server_time_ms: response.server_time_ms,
+        pending_update_ids: response.pending_update_ids,
+        config_changed: response.config_changed,
+    }
+}
+
+fn encode_artifact_chunk_for_grpc(chunk: &ArtifactChunk) -> transport_rpc::ArtifactChunk {
+    transport_rpc::ArtifactChunk {
+        upload_id: chunk.upload_id.to_string(),
+        artifact_kind: chunk.artifact_kind.clone(),
+        chunk_index: chunk.chunk_index,
+        bytes: chunk.bytes.clone(),
+        eof: chunk.eof,
+    }
+}
+
+fn decode_upload_result_from_grpc(result: transport_rpc::UploadResult) -> Result<UploadResult> {
+    Ok(UploadResult {
+        upload_id: Uuid::parse_str(&result.upload_id)
+            .with_context(|| format!("invalid upload id {}", result.upload_id))?,
+        accepted_chunks: result.accepted_chunks,
+        accepted_bytes: result.accepted_bytes,
+        digest_hex: result.digest_hex,
+    })
+}
+
+fn encode_update_request_for_grpc(request: &UpdateRequest) -> transport_rpc::UpdateRequest {
+    transport_rpc::UpdateRequest {
+        tenant_id: request.tenant_id.clone(),
+        agent_id: request.agent_id.clone(),
+        channel: request.channel.clone(),
+        current_version: request.current_version.clone(),
+    }
+}
+
+fn decode_update_chunk_from_grpc(chunk: transport_rpc::UpdateChunk) -> UpdateChunk {
+    UpdateChunk {
+        artifact_id: chunk.artifact_id,
+        artifact_kind: chunk.artifact_kind,
+        chunk_index: chunk.chunk_index,
+        bytes: chunk.bytes,
+        eof: chunk.eof,
+    }
+}
+
 fn encode_client_transport_bundle(frame: &ClientTransportFrame) -> Result<Vec<u8>> {
     let kind = match frame {
         ClientTransportFrame::Uplink(message) => {
@@ -596,7 +646,7 @@ impl GrpcTransportDriver {
             .map_err(|_| anyhow!("grpc transport is disconnected"))
     }
 
-    fn send_heartbeat_rpc(&self, heartbeat: &HeartbeatRequest) -> Result<()> {
+    fn heartbeat_request(&self, heartbeat: &HeartbeatRequest) -> Result<HeartbeatResponse> {
         let request = encode_heartbeat_for_grpc(heartbeat)?;
         let endpoint = self.endpoint.clone();
         std::thread::spawn(move || {
@@ -613,13 +663,15 @@ impl GrpcTransportDriver {
                     .await
                     .with_context(|| format!("failed to connect grpc endpoint {endpoint}"))?;
                 let mut client = AgentServiceClient::new(channel);
-                time::timeout(
+                let response = time::timeout(
                     GRPC_CONNECT_TIMEOUT,
                     client.heartbeat(Request::new(request)),
                 )
                 .await
                 .context("grpc heartbeat request timed out")??;
-                Ok::<(), anyhow::Error>(())
+                Ok::<HeartbeatResponse, anyhow::Error>(decode_heartbeat_response_from_grpc(
+                    response.into_inner(),
+                ))
             })
         })
         .join()
@@ -636,8 +688,8 @@ impl TransportDriver for GrpcTransportDriver {
         self.send_frame(ClientTransportFrame::Uplink(message.clone()))
     }
 
-    fn send_heartbeat(&self, heartbeat: &HeartbeatRequest) -> Result<()> {
-        self.send_heartbeat_rpc(heartbeat)
+    fn send_heartbeat(&self, heartbeat: &HeartbeatRequest) -> Result<HeartbeatResponse> {
+        self.heartbeat_request(heartbeat)
     }
 
     fn recv_downlink(&self) -> Result<Option<DownlinkMessage>> {
@@ -654,6 +706,82 @@ impl TransportDriver for GrpcTransportDriver {
             return true;
         }
         self.heartbeat_probe()
+    }
+
+    fn supports_update_stream(&self) -> bool {
+        true
+    }
+
+    fn supports_artifact_upload(&self) -> bool {
+        true
+    }
+
+    fn pull_update(&self, request: &UpdateRequest) -> Result<Vec<UpdateChunk>> {
+        let request = encode_update_request_for_grpc(request);
+        let endpoint = self.endpoint.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("build grpc update runtime")?;
+            runtime.block_on(async move {
+                let channel = Endpoint::from_shared(endpoint.clone())
+                    .context("invalid grpc endpoint")?
+                    .connect_timeout(GRPC_CONNECT_TIMEOUT)
+                    .timeout(GRPC_CONNECT_TIMEOUT)
+                    .connect()
+                    .await
+                    .with_context(|| format!("failed to connect grpc endpoint {endpoint}"))?;
+                let mut client = AgentServiceClient::new(channel);
+                let response = time::timeout(
+                    GRPC_CONNECT_TIMEOUT,
+                    client.pull_update(Request::new(request)),
+                )
+                .await
+                .context("grpc pull_update request timed out")??;
+                let mut stream = response.into_inner();
+                let mut chunks = Vec::new();
+                while let Some(chunk) = stream.next().await {
+                    chunks.push(decode_update_chunk_from_grpc(chunk?));
+                }
+                Ok::<Vec<UpdateChunk>, anyhow::Error>(chunks)
+            })
+        })
+        .join()
+        .map_err(|_| anyhow!("grpc pull_update thread panicked"))?
+    }
+
+    fn upload_artifact(&self, chunks: &[ArtifactChunk]) -> Result<UploadResult> {
+        let request_chunks = chunks
+            .iter()
+            .map(encode_artifact_chunk_for_grpc)
+            .collect::<Vec<_>>();
+        let endpoint = self.endpoint.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("build grpc upload runtime")?;
+            runtime.block_on(async move {
+                let channel = Endpoint::from_shared(endpoint.clone())
+                    .context("invalid grpc endpoint")?
+                    .connect_timeout(GRPC_CONNECT_TIMEOUT)
+                    .timeout(GRPC_CONNECT_TIMEOUT)
+                    .connect()
+                    .await
+                    .with_context(|| format!("failed to connect grpc endpoint {endpoint}"))?;
+                let mut client = AgentServiceClient::new(channel);
+                let response = time::timeout(
+                    GRPC_CONNECT_TIMEOUT,
+                    client.upload_artifact(Request::new(tokio_stream::iter(request_chunks))),
+                )
+                .await
+                .context("grpc upload_artifact request timed out")??;
+                decode_upload_result_from_grpc(response.into_inner())
+            })
+        })
+        .join()
+        .map_err(|_| anyhow!("grpc upload_artifact thread panicked"))?
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -791,8 +919,9 @@ impl TransportDriver for WebSocketTransportDriver {
         self.send_frame(ClientTransportFrame::Uplink(message.clone()))
     }
 
-    fn send_heartbeat(&self, heartbeat: &HeartbeatRequest) -> Result<()> {
-        self.send_frame(ClientTransportFrame::Heartbeat(heartbeat.clone()))
+    fn send_heartbeat(&self, heartbeat: &HeartbeatRequest) -> Result<HeartbeatResponse> {
+        self.send_frame(ClientTransportFrame::Heartbeat(heartbeat.clone()))?;
+        Ok(HeartbeatResponse::default())
     }
 
     fn recv_downlink(&self) -> Result<Option<DownlinkMessage>> {
@@ -938,11 +1067,12 @@ impl TransportDriver for HttpTransportDriver {
         )
     }
 
-    fn send_heartbeat(&self, heartbeat: &HeartbeatRequest) -> Result<()> {
+    fn send_heartbeat(&self, heartbeat: &HeartbeatRequest) -> Result<HeartbeatResponse> {
         self.post_frame(
             &self.endpoints.heartbeat_url,
             &ClientTransportFrame::Heartbeat(heartbeat.clone()),
-        )
+        )?;
+        Ok(HeartbeatResponse::default())
     }
 
     fn recv_downlink(&self) -> Result<Option<DownlinkMessage>> {
@@ -1130,9 +1260,9 @@ mod tests {
         HttpPollingCommunicationConfig, WebSocketCommunicationConfig,
     };
     use aegis_model::{
-        BatchAck, BatchAckStatus, CommunicationChannelKind, DownlinkMessage, EventPayload,
-        EventType, HeartbeatRequest, NormalizedEvent, Priority, ProcessContext, Severity,
-        TelemetryEvent, UplinkMessage,
+        ArtifactChunk, BatchAck, BatchAckStatus, CommunicationChannelKind, DownlinkMessage,
+        EventPayload, EventType, HeartbeatRequest, NormalizedEvent, Priority, ProcessContext,
+        Severity, TelemetryEvent, UpdateChunk, UpdateRequest, UplinkMessage,
     };
     use axum::body::Bytes;
     use axum::extract::State;
@@ -1154,13 +1284,20 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
     use tonic::{Request, Response, Status};
     use transport_rpc::agent_service_server::{AgentService, AgentServiceServer};
-    use transport_rpc::{DownlinkMessage as ProtoDownlinkMessage, HeartbeatResponse};
+    use transport_rpc::{
+        DownlinkMessage as ProtoDownlinkMessage, HeartbeatResponse as ProtoHeartbeatResponse,
+    };
+    use uuid::Uuid;
 
     #[derive(Clone, Default)]
     struct TestTransportState {
         uplinks: Arc<AsyncMutex<Vec<UplinkMessage>>>,
         heartbeats: Arc<AsyncMutex<Vec<HeartbeatRequest>>>,
         downlinks: Arc<AsyncMutex<VecDeque<DownlinkMessage>>>,
+        heartbeat_responses: Arc<AsyncMutex<VecDeque<ProtoHeartbeatResponse>>>,
+        update_requests: Arc<AsyncMutex<Vec<UpdateRequest>>>,
+        update_chunks: Arc<AsyncMutex<VecDeque<Vec<UpdateChunk>>>>,
+        uploaded_artifacts: Arc<AsyncMutex<Vec<Vec<ArtifactChunk>>>>,
     }
 
     #[derive(Clone, Default)]
@@ -1204,7 +1341,7 @@ mod tests {
         async fn heartbeat(
             &self,
             request: Request<transport_rpc::HeartbeatRequest>,
-        ) -> Result<Response<HeartbeatResponse>, Status> {
+        ) -> Result<Response<ProtoHeartbeatResponse>, Status> {
             let state = self.state.clone();
             let heartbeat = request.into_inner();
             state.heartbeats.lock().await.push(HeartbeatRequest {
@@ -1235,21 +1372,45 @@ mod tests {
                 wal_utilization_ratio: heartbeat.wal_utilization_ratio,
                 restart_epoch: heartbeat.restart_epoch,
             });
-            Ok(Response::new(HeartbeatResponse {
-                server_time_ms: 1,
-                pending_update_ids: Vec::new(),
-                config_changed: false,
-            }))
+            let response = state
+                .heartbeat_responses
+                .lock()
+                .await
+                .pop_front()
+                .unwrap_or_else(|| ProtoHeartbeatResponse {
+                    server_time_ms: 1,
+                    pending_update_ids: Vec::new(),
+                    config_changed: false,
+                });
+            Ok(Response::new(response))
         }
 
         async fn upload_artifact(
             &self,
-            _request: Request<tonic::Streaming<transport_rpc::ArtifactChunk>>,
+            request: Request<tonic::Streaming<transport_rpc::ArtifactChunk>>,
         ) -> Result<Response<transport_rpc::UploadResult>, Status> {
+            let mut inbound = request.into_inner();
+            let mut chunks = Vec::new();
+            while let Some(chunk) = inbound.next().await {
+                let chunk = chunk?;
+                chunks.push(ArtifactChunk {
+                    upload_id: Uuid::parse_str(&chunk.upload_id)
+                        .map_err(|error| Status::invalid_argument(error.to_string()))?,
+                    artifact_kind: chunk.artifact_kind,
+                    chunk_index: chunk.chunk_index,
+                    bytes: chunk.bytes,
+                    eof: chunk.eof,
+                });
+            }
+            self.state
+                .uploaded_artifacts
+                .lock()
+                .await
+                .push(chunks.clone());
             Ok(Response::new(transport_rpc::UploadResult {
                 upload_id: "upload-test".to_string(),
-                accepted_chunks: 1,
-                accepted_bytes: 16,
+                accepted_chunks: chunks.len() as u32,
+                accepted_bytes: chunks.iter().map(|chunk| chunk.bytes.len() as u64).sum(),
                 digest_hex: "digest".to_string(),
             }))
         }
@@ -1258,9 +1419,37 @@ mod tests {
 
         async fn pull_update(
             &self,
-            _request: Request<transport_rpc::UpdateRequest>,
+            request: Request<transport_rpc::UpdateRequest>,
         ) -> Result<Response<Self::PullUpdateStream>, Status> {
-            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            let request = request.into_inner();
+            self.state.update_requests.lock().await.push(UpdateRequest {
+                tenant_id: request.tenant_id,
+                agent_id: request.agent_id,
+                channel: request.channel,
+                current_version: request.current_version,
+            });
+
+            let chunks = self
+                .state
+                .update_chunks
+                .lock()
+                .await
+                .pop_front()
+                .unwrap_or_default();
+            let (tx, rx) = tokio::sync::mpsc::channel(chunks.len().max(1));
+            tokio::spawn(async move {
+                for chunk in chunks {
+                    let _ = tx
+                        .send(Ok(transport_rpc::UpdateChunk {
+                            artifact_id: chunk.artifact_id,
+                            chunk_index: chunk.chunk_index,
+                            bytes: chunk.bytes,
+                            eof: chunk.eof,
+                            artifact_kind: chunk.artifact_kind,
+                        }))
+                        .await;
+                }
+            });
             Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
         }
     }
