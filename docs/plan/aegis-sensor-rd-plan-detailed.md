@@ -142,6 +142,11 @@
 - 验收：
   - 单元测试覆盖 provider 注册、能力矩阵、关键事件转换
   - 不依赖目标主机即可在本地通过 cargo test；集成环境参考 `docs/env/开发环境.md`
+- 完成记录（2026-04-19）：
+  - 已建立 `WindowsPlatform`、12 类 provider 注册与 Windows descriptor
+  - 已建立事件注入与 `EventBuffer` 轮询能力
+  - 已覆盖 ETW/注册表/IPC/DLL/VSS/设备控制 等基线 provider 存在性测试
+  - 已通过 Windows 平台事件轮询与能力矩阵测试
 
 ### P09：Linux 平台采集基线
 
