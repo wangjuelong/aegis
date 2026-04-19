@@ -38,6 +38,10 @@ impl ThreatFeedbackApplier {
         self.whitelist
             .contains(rule_id, process_hash, target_path, now_unix)
     }
+
+    pub fn len(&self) -> usize {
+        self.whitelist.len()
+    }
 }
 
 #[cfg(test)]
