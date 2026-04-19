@@ -201,6 +201,11 @@
   - 建立 temporal 窗口状态缓存与多事件匹配
 - 验收：
   - 测试覆盖 IOC 命中、规则执行、时间窗口命中与误报旁路
+- 完成记录（2026-04-19）：
+  - 已建立 `TieredIndicatorIndex`，支持 Bloom 预筛与精确确认后的风险分层命中
+  - 已建立栈式 `RuleVm`，覆盖字段读取、布尔组合、存在性与阈值比较
+  - 已建立 `TemporalStateBuffer`，支持按 key 时间窗保留、超时淘汰与序列检测
+  - 已通过 IOC 命中、Rule VM 求值和 temporal 序列/淘汰测试
 
 ### P12：YARA / Script Decode / AMSI Interlock
 
