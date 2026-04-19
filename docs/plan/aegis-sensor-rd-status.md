@@ -24,8 +24,8 @@
 | P11 | IOC / Rule VM / Temporal | done | 已建立分层 IOC 索引、栈式 Rule VM、时间窗口缓冲与核心测试 |
 | P12 | YARA / Script Decode / AMSI Interlock | done | 已建立 YARA 调度缓存、脚本解码流水线、AMSI 快速分流与测试 |
 | P13 | ML / OOD / Behavioral Models | done | 已建立模型注册、特征抽取、OOD 评分与失败回退测试 |
-| P14 | Correlation / Storyline / Threat Feedback | doing | 当前进入关联缓存、storyline 合并与 feedback 回灌实现 |
-| P15 | 专项检测能力 | todo | 依赖 P11-P14 |
+| P14 | Correlation / Storyline / Threat Feedback | done | 已建立分片关联缓存、storyline 合并与 feedback 回灌测试 |
+| P15 | 专项检测能力 | doing | 当前进入勒索、ASR、Identity 与 Deception 检测基线实现 |
 | P16 | Vuln Scan / Passive Discovery / AI Monitor | todo | 依赖 P03-P04 |
 | P17 | Response Executor / Quarantine / Kill | todo | 依赖 P04/P07 |
 | P18 | Block Decision / Network Isolate / Firewall | todo | 依赖 P17 |

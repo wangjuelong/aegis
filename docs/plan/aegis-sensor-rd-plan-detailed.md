@@ -261,6 +261,11 @@
   - 建立云端 threat feedback 到本地 adaptive whitelist 的应用器
 - 验收：
   - 测试覆盖跨事件关联、storyline 合并、误报回灌生效
+- 完成记录（2026-04-19）：
+  - 已建立 `CorrelationCache`，支持按主机、根进程与 lineage 分片关联
+  - 已建立 `StorylineEngine`，支持多事件合并、叙事生成与 technique/tactic 汇总
+  - 已建立 `ThreatFeedbackApplier`，支持 feedback 到 `AdaptiveWhitelist` 的本地回灌
+  - 已通过跨事件关联、storyline 合并和白名单回灌测试
 
 ### P15：专项检测能力
 
