@@ -221,6 +221,11 @@
   - 建立 AMSI 命中与本地决策联动接口
 - 验收：
   - 测试覆盖扫描任务调度、解混淆层计数、AMSI fast-path 分流
+- 完成记录（2026-04-19）：
+  - 已建立 `YaraScheduler`，支持作业入队、待处理去重与结果缓存
+  - 已建立 `ScriptDecodePipeline`，覆盖 PowerShell `-enc`、base64 与 charcode 常见解码层
+  - 已建立 `AmsiInterlock`，支持本地阻断与 YARA 快速分流决策
+  - 已通过 YARA 调度、脚本解码和 AMSI fast-path 测试
 
 ### P13：ML / OOD / Behavioral Models
 
