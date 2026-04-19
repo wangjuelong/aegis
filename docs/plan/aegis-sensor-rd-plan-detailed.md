@@ -163,6 +163,11 @@
 - 验收：
   - 单元测试覆盖降级决策、provider 能力矩阵、容器感知转换
   - 平台描述与 `degrade_levels=4` 保持一致
+- 完成记录（2026-04-19）：
+  - 已建立 `LinuxPlatform`、7 类 provider 注册与 Linux descriptor
+  - 已建立 `Full / TracepointOnly / FanotifyAudit / Minimal` 4 级降级模型
+  - 已建立带 `container_id` 的 Linux 事件注入与 `EventBuffer` 轮询能力
+  - 已通过 provider 注册、降级层级和容器感知事件轮询测试
 
 ### P10：macOS 平台采集基线
 
