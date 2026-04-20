@@ -200,7 +200,7 @@ impl WindowsHostCapabilities {
             WindowsProviderKind::PsProcess => self.has_process_inventory,
             WindowsProviderKind::ObProcess => false,
             WindowsProviderKind::MinifilterFile => false,
-            WindowsProviderKind::WfpNetwork => false,
+            WindowsProviderKind::WfpNetwork => self.has_net_connection,
             WindowsProviderKind::RegistryCallback => false,
             WindowsProviderKind::AmsiScript => false,
             WindowsProviderKind::MemorySensor => false,
@@ -312,6 +312,63 @@ impl WindowsSecurityProcessEvent {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsNetworkConnection {
+    protocol: String,
+    local_address: String,
+    local_port: u16,
+    #[serde(default)]
+    remote_address: Option<String>,
+    #[serde(default)]
+    remote_port: Option<u16>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    owning_process: Option<u32>,
+}
+
+impl WindowsNetworkConnection {
+    fn key(&self) -> String {
+        format!(
+            "{}|{}|{}|{}|{}|{}|{}",
+            self.protocol,
+            self.local_address,
+            self.local_port,
+            self.remote_address.as_deref().unwrap_or("-"),
+            self.remote_port
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            self.state.as_deref().unwrap_or("-"),
+            self.owning_process
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        )
+    }
+
+    fn subject(&self) -> String {
+        truncate_subject(&format!(
+            "protocol={};local={}:{};remote={}:{};state={};pid={}",
+            self.protocol,
+            self.local_address,
+            self.local_port,
+            self.remote_address.as_deref().unwrap_or("-"),
+            self.remote_port
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            self.state.as_deref().unwrap_or("-"),
+            self.owning_process
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        ))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsFirewallIsolationReceipt {
+    backup_path: String,
+    rule_group: String,
+}
+
 struct WindowsState {
     base_dir: PathBuf,
     pending_events: VecDeque<Vec<u8>>,
@@ -320,6 +377,9 @@ struct WindowsState {
     host_capabilities_pinned: bool,
     known_processes: BTreeMap<u32, WindowsProcessSnapshot>,
     security_process_cursor: Option<u64>,
+    known_connections: BTreeMap<String, WindowsNetworkConnection>,
+    firewall_backup_path: Option<String>,
+    firewall_rule_group: Option<String>,
 }
 
 pub struct WindowsPlatform {
@@ -367,6 +427,9 @@ impl WindowsPlatform {
                 host_capabilities_pinned,
                 known_processes: BTreeMap::new(),
                 security_process_cursor: None,
+                known_connections: BTreeMap::new(),
+                firewall_backup_path: None,
+                firewall_rule_group: None,
             }),
         }
     }
@@ -475,6 +538,12 @@ impl PlatformSensor for WindowsPlatform {
         } else {
             state.security_process_cursor = None;
         }
+        if state.host.has_net_connection {
+            state.known_connections = snapshot_network_inventory(self.runner.as_ref())
+                .with_context(|| "snapshot initial windows network inventory")?;
+        } else {
+            state.known_connections.clear();
+        }
         state.execution.running = true;
         Ok(())
     }
@@ -514,7 +583,7 @@ impl PlatformSensor for WindowsPlatform {
         SensorCapabilities {
             process: host.has_process_inventory,
             file: false,
-            network: false,
+            network: host.has_net_connection,
             registry: false,
             auth: host.any_event_log(),
             script: false,
@@ -564,17 +633,28 @@ impl PlatformResponse for WindowsPlatform {
 
     fn network_isolate(&self, rules: &IsolationRulesV2) -> Result<()> {
         let mut state = self.state.lock().expect("windows state poisoned");
+        if !state.host.has_firewall {
+            bail!("windows firewall capability is unavailable");
+        }
+        let receipt = apply_windows_firewall_isolation(&mut state, self.runner.as_ref(), rules)
+            .with_context(|| "apply windows firewall isolation")?;
+        state.firewall_backup_path = Some(receipt.backup_path);
+        state.firewall_rule_group = Some(receipt.rule_group);
         state.execution.network_isolation_active = true;
         state.execution.last_isolation_rules = Some(rules.clone());
         Ok(())
     }
 
     fn network_release(&self) -> Result<()> {
-        self.state
-            .lock()
-            .expect("windows state poisoned")
-            .execution
-            .network_isolation_active = false;
+        let mut state = self.state.lock().expect("windows state poisoned");
+        if !state.execution.network_isolation_active {
+            bail!("windows network isolation is not active");
+        }
+        release_windows_firewall_isolation(&mut state, self.runner.as_ref())
+            .with_context(|| "release windows firewall isolation")?;
+        state.execution.network_isolation_active = false;
+        state.firewall_backup_path = None;
+        state.firewall_rule_group = None;
         Ok(())
     }
 
@@ -874,6 +954,9 @@ fn collect_live_windows_events(
     if state.host.has_process_creation_events {
         collect_security_process_audit_events(state, runner)?;
     }
+    if state.host.has_net_connection {
+        collect_network_delta_events(state, runner)?;
+    }
     Ok(())
 }
 
@@ -953,6 +1036,41 @@ fn collect_security_process_audit_events(
     Ok(())
 }
 
+fn collect_network_delta_events(
+    state: &mut WindowsState,
+    runner: &dyn WindowsCommandRunner,
+) -> Result<()> {
+    let current = snapshot_network_inventory(runner)?;
+    for (key, connection) in &current {
+        if !state.known_connections.contains_key(key) {
+            state.pending_events.push_back(
+                WindowsEventStub {
+                    provider: WindowsProviderKind::WfpNetwork,
+                    operation: "network-open".to_string(),
+                    subject: connection.subject(),
+                }
+                .encode(),
+            );
+        }
+    }
+
+    for (key, connection) in &state.known_connections {
+        if !current.contains_key(key) {
+            state.pending_events.push_back(
+                WindowsEventStub {
+                    provider: WindowsProviderKind::WfpNetwork,
+                    operation: "network-close".to_string(),
+                    subject: connection.subject(),
+                }
+                .encode(),
+            );
+        }
+    }
+
+    state.known_connections = current;
+    Ok(())
+}
+
 fn snapshot_process_inventory(
     runner: &dyn WindowsCommandRunner,
 ) -> Result<BTreeMap<u32, WindowsProcessSnapshot>> {
@@ -1012,6 +1130,58 @@ $rows | ConvertTo-Json -Compress
     run_powershell_json(runner, &script)
 }
 
+fn snapshot_network_inventory(
+    runner: &dyn WindowsCommandRunner,
+) -> Result<BTreeMap<String, WindowsNetworkConnection>> {
+    let script = r#"
+$tcpRows = @()
+if ((Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) -ne $null) {
+    $tcpRows = @(
+        Get-NetTCPConnection -ErrorAction SilentlyContinue |
+            Sort-Object OwningProcess, LocalAddress, LocalPort, RemoteAddress, RemotePort, State |
+            ForEach-Object {
+                [ordered]@{
+                    protocol = 'tcp'
+                    local_address = [string]$_.LocalAddress
+                    local_port = [uint16]$_.LocalPort
+                    remote_address = [string]$_.RemoteAddress
+                    remote_port = [uint16]$_.RemotePort
+                    state = [string]$_.State
+                    owning_process = if ($null -eq $_.OwningProcess) { $null } else { [uint32]$_.OwningProcess }
+                }
+            }
+    )
+}
+
+$udpRows = @()
+if ((Get-Command Get-NetUDPEndpoint -ErrorAction SilentlyContinue) -ne $null) {
+    $udpRows = @(
+        Get-NetUDPEndpoint -ErrorAction SilentlyContinue |
+            Sort-Object OwningProcess, LocalAddress, LocalPort |
+            ForEach-Object {
+                [ordered]@{
+                    protocol = 'udp'
+                    local_address = [string]$_.LocalAddress
+                    local_port = [uint16]$_.LocalPort
+                    remote_address = $null
+                    remote_port = $null
+                    state = 'Listen'
+                    owning_process = if ($null -eq $_.OwningProcess) { $null } else { [uint32]$_.OwningProcess }
+                }
+            }
+    )
+}
+
+$rows = @($tcpRows + $udpRows)
+$rows | ConvertTo-Json -Compress
+"#;
+    let rows: Vec<WindowsNetworkConnection> = run_powershell_json(runner, script)?;
+    Ok(rows
+        .into_iter()
+        .map(|connection| (connection.key(), connection))
+        .collect())
+}
+
 fn snapshot_tasklist_inventory(
     runner: &dyn WindowsCommandRunner,
 ) -> Result<BTreeMap<u32, WindowsTasklistSnapshot>> {
@@ -1035,6 +1205,103 @@ $rows | ConvertTo-Json -Compress
         .into_iter()
         .map(|process| (process.process_id, process))
         .collect())
+}
+
+fn apply_windows_firewall_isolation(
+    state: &mut WindowsState,
+    runner: &dyn WindowsCommandRunner,
+    rules: &IsolationRulesV2,
+) -> Result<WindowsFirewallIsolationReceipt> {
+    let rule_group = format!("AegisIsolation-{}", Uuid::now_v7().simple());
+    let backup_path = format!(
+        r"C:\ProgramData\Aegis\firewall\{}-profiles.json",
+        Uuid::now_v7().simple()
+    );
+    let script = build_windows_isolation_script(&rule_group, &backup_path, rules);
+    write_windows_firewall_manifest(state, "isolate.ps1", &script)?;
+    run_powershell_json(runner, &script)
+}
+
+fn release_windows_firewall_isolation(
+    state: &mut WindowsState,
+    runner: &dyn WindowsCommandRunner,
+) -> Result<()> {
+    let backup_path = state
+        .firewall_backup_path
+        .clone()
+        .ok_or_else(|| anyhow!("windows firewall isolation backup path is missing"))?;
+    let rule_group = state
+        .firewall_rule_group
+        .clone()
+        .ok_or_else(|| anyhow!("windows firewall isolation rule group is missing"))?;
+    let script = build_windows_release_script(&rule_group, &backup_path);
+    write_windows_firewall_manifest(state, "release.ps1", &script)?;
+    runner.run_powershell(&script)?;
+    Ok(())
+}
+
+fn write_windows_firewall_manifest(
+    state: &mut WindowsState,
+    file_name: &str,
+    script: &str,
+) -> Result<PathBuf> {
+    let path = state.base_dir.join("firewall").join(file_name);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, script)?;
+    Ok(path)
+}
+
+fn build_windows_isolation_script(
+    rule_group: &str,
+    backup_path: &str,
+    rules: &IsolationRulesV2,
+) -> String {
+    let mut lines = vec![
+        format!("$ruleGroup = '{}'", escape_windows_ps_string(rule_group)),
+        format!("$backupPath = '{}'", escape_windows_ps_string(backup_path)),
+        "$backupDir = Split-Path -Parent $backupPath".to_string(),
+        "New-Item -ItemType Directory -Force -Path $backupDir | Out-Null".to_string(),
+        "Get-NetFirewallRule -Group $ruleGroup -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue | Out-Null".to_string(),
+        "$profiles = @(Get-NetFirewallProfile | Select-Object Name, Enabled, DefaultInboundAction, DefaultOutboundAction)".to_string(),
+        "$profiles | ConvertTo-Json -Compress | Set-Content -LiteralPath $backupPath -Encoding UTF8".to_string(),
+        "New-NetFirewallRule -DisplayName ($ruleGroup + '-AllowLoopbackV4') -Group $ruleGroup -Direction Outbound -Action Allow -RemoteAddress 127.0.0.1 | Out-Null".to_string(),
+        "New-NetFirewallRule -DisplayName ($ruleGroup + '-AllowLoopbackV6') -Group $ruleGroup -Direction Outbound -Action Allow -RemoteAddress ::1 | Out-Null".to_string(),
+    ];
+    for (index, ip) in rules.allowed_control_plane_ips.iter().enumerate() {
+        lines.push(format!(
+            "New-NetFirewallRule -DisplayName ($ruleGroup + '-AllowControlPlane-{index}') -Group $ruleGroup -Direction Outbound -Action Allow -RemoteAddress '{}' | Out-Null",
+            escape_windows_ps_string(ip)
+        ));
+    }
+    lines.extend([
+        "@('Domain','Private','Public') | ForEach-Object { Set-NetFirewallProfile -Profile $_ -DefaultOutboundAction Block }".to_string(),
+        "[ordered]@{".to_string(),
+        "    backup_path = $backupPath".to_string(),
+        "    rule_group = $ruleGroup".to_string(),
+        "} | ConvertTo-Json -Compress".to_string(),
+    ]);
+    lines.join("\n")
+}
+
+fn build_windows_release_script(rule_group: &str, backup_path: &str) -> String {
+    [
+        format!("$ruleGroup = '{}'", escape_windows_ps_string(rule_group)),
+        format!("$backupPath = '{}'", escape_windows_ps_string(backup_path)),
+        "if (-not (Test-Path -LiteralPath $backupPath)) { throw \"windows firewall profile backup is missing\" }".to_string(),
+        "$profiles = @(Get-Content -LiteralPath $backupPath -Raw | ConvertFrom-Json)".to_string(),
+        "Get-NetFirewallRule -Group $ruleGroup -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue | Out-Null".to_string(),
+        "foreach ($profile in $profiles) {".to_string(),
+        "    Set-NetFirewallProfile -Profile $profile.Name -Enabled ([bool]$profile.Enabled) -DefaultInboundAction $profile.DefaultInboundAction -DefaultOutboundAction $profile.DefaultOutboundAction".to_string(),
+        "}".to_string(),
+        "Remove-Item -LiteralPath $backupPath -Force".to_string(),
+    ]
+    .join("\n")
+}
+
+fn escape_windows_ps_string(value: &str) -> String {
+    value.replace('\'', "''")
 }
 
 fn run_local_powershell(script: &str) -> Result<String> {
@@ -1298,6 +1565,64 @@ mod tests {
         format!("[{}]", rows.join(","))
     }
 
+    fn network_output(
+        entries: &[(
+            &str,
+            &str,
+            u16,
+            Option<&str>,
+            Option<u16>,
+            Option<&str>,
+            Option<u32>,
+        )],
+    ) -> String {
+        let rows = entries
+            .iter()
+            .map(
+                |(
+                    protocol,
+                    local_address,
+                    local_port,
+                    remote_address,
+                    remote_port,
+                    state,
+                    owning_process,
+                )| {
+                    let remote_address = remote_address
+                        .map(|value| {
+                            format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+                        })
+                        .unwrap_or_else(|| "null".to_string());
+                    let remote_port = remote_port
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "null".to_string());
+                    let state = state
+                        .map(|value| {
+                            format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+                        })
+                        .unwrap_or_else(|| "null".to_string());
+                    let owning_process = owning_process
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "null".to_string());
+                    format!(
+                        "{{\"protocol\":\"{}\",\"local_address\":\"{}\",\"local_port\":{local_port},\"remote_address\":{remote_address},\"remote_port\":{remote_port},\"state\":{state},\"owning_process\":{owning_process}}}",
+                        protocol.replace('\\', "\\\\").replace('"', "\\\""),
+                        local_address.replace('\\', "\\\\").replace('"', "\\\"")
+                    )
+                },
+            )
+            .collect::<Vec<_>>();
+        format!("[{}]", rows.join(","))
+    }
+
+    fn firewall_isolation_output(backup_path: &str, rule_group: &str) -> String {
+        format!(
+            r#"{{"backup_path":"{}","rule_group":"{}"}}"#,
+            backup_path.replace('\\', "\\\\").replace('"', "\\\""),
+            rule_group.replace('\\', "\\\\").replace('"', "\\\"")
+        )
+    }
+
     fn process_output(processes: &[(&str, u32, u32, Option<&str>)]) -> String {
         let rows = processes
             .iter()
@@ -1340,17 +1665,25 @@ mod tests {
             probe_output(),
             processes[0].clone(),
             audit_cursor_output(900),
+            network_output(&[]),
         ];
         for snapshot in processes.into_iter().skip(1) {
             responses.push(snapshot);
             responses.push(security_process_event_output(&[]));
+            responses.push(network_output(&[]));
         }
         WindowsPlatform::new_with_runner(Box::new(QueuedWindowsRunner::new(responses)), false)
     }
 
     fn platform_with_probe() -> WindowsPlatform {
         WindowsPlatform::with_runner_for_test(
-            Box::new(QueuedWindowsRunner::new(Vec::<String>::new())),
+            Box::new(QueuedWindowsRunner::new([
+                firewall_isolation_output(
+                    r"C:\ProgramData\Aegis\firewall\backup.json",
+                    "AegisIsolation-test",
+                ),
+                String::new(),
+            ])),
             healthy_host(),
         )
     }
@@ -1436,6 +1769,9 @@ mod tests {
             })
             .expect("network isolate");
         platform
+            .network_release()
+            .expect("network release should restore firewall state");
+        platform
             .block_hash("deadbeef", Duration::from_secs(90))
             .expect("block hash");
 
@@ -1454,7 +1790,7 @@ mod tests {
         assert_eq!(snapshot.forensic_artifacts.len(), 1);
         assert_eq!(snapshot.forensic_artifacts[0], bundle);
         assert!(snapshot.forensic_artifacts[0].location.exists());
-        assert!(snapshot.network_isolation_active);
+        assert!(!snapshot.network_isolation_active);
         assert_eq!(
             snapshot
                 .active_blocks
@@ -1487,6 +1823,10 @@ mod tests {
             Some(true)
         );
         assert_eq!(
+            snapshot.provider_health.get("WfpNetwork").copied(),
+            Some(true)
+        );
+        assert_eq!(
             snapshot.provider_health.get("RegistryCallback").copied(),
             Some(false)
         );
@@ -1510,6 +1850,7 @@ mod tests {
                 .healthy
         );
         assert!(platform.capabilities().process);
+        assert!(platform.capabilities().network);
         assert!(platform.capabilities().auth);
         assert!(!platform.capabilities().registry);
         assert!(
@@ -1580,14 +1921,17 @@ mod tests {
                 probe_output(),
                 process_output(&[("System", 4, 0, None)]),
                 audit_cursor_output(100),
+                network_output(&[]),
                 process_output(&[("System", 4, 0, None)]),
                 security_process_event_output(&[(
                     101,
                     Some("C:\\Windows\\System32\\cmd.exe"),
                     Some("cmd.exe /c whoami"),
                 )]),
+                network_output(&[]),
                 process_output(&[("System", 4, 0, None)]),
                 security_process_event_output(&[]),
+                network_output(&[]),
             ])),
             false,
         );
@@ -1616,6 +1960,65 @@ mod tests {
 
         assert_eq!(second_drained, 0);
         assert!(second_buffer.records.is_empty());
+    }
+
+    #[test]
+    fn windows_poll_events_emits_real_network_delta() {
+        let mut platform = WindowsPlatform::new_with_runner(
+            Box::new(QueuedWindowsRunner::new([
+                probe_output(),
+                process_output(&[("System", 4, 0, None)]),
+                audit_cursor_output(200),
+                network_output(&[(
+                    "tcp",
+                    "10.0.0.5",
+                    49822,
+                    Some("10.0.0.10"),
+                    Some(443),
+                    Some("Established"),
+                    Some(4242),
+                )]),
+                process_output(&[("System", 4, 0, None)]),
+                security_process_event_output(&[]),
+                network_output(&[
+                    (
+                        "tcp",
+                        "10.0.0.5",
+                        49822,
+                        Some("10.0.0.10"),
+                        Some(443),
+                        Some("Established"),
+                        Some(4242),
+                    ),
+                    (
+                        "udp",
+                        "10.0.0.5",
+                        5353,
+                        None,
+                        None,
+                        Some("Listen"),
+                        Some(9000),
+                    ),
+                ]),
+            ])),
+            false,
+        );
+        platform
+            .start(&SensorConfig {
+                profile: "windows".to_string(),
+                queue_capacity: 1024,
+            })
+            .expect("start windows runtime");
+
+        let mut buffer = EventBuffer::default();
+        let drained = platform.poll_events(&mut buffer).expect("poll events");
+
+        assert_eq!(drained, 1);
+        let event = String::from_utf8(buffer.records[0].clone()).expect("event utf8");
+        assert!(event.contains("WfpNetwork"));
+        assert!(event.contains("network-open"));
+        assert!(event.contains("udp"));
+        assert!(event.contains("5353"));
     }
 
     #[test]
