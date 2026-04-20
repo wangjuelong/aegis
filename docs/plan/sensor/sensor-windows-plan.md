@@ -35,6 +35,7 @@ Windows 平台目标覆盖：
 - `W03.3` 已完成：启动阶段会实测 Security 4688 可用性并固定增量游标，`poll_events()` 已接入基于 Security 4688 的真实进程审计增量事件；`EtwProcess` 健康状态不再只依赖“日志存在”，而是依赖真实的 Process Creation 审计可读性。
 - `W04.1` 已完成：启动阶段会采集 TCP/UDP 真实网络基线，`poll_events()` 已接入连接增量事件；`network_isolate/network_release` 已通过 Windows 防火墙真实执行隔离与释放，不再只修改内存态。
 - `W04.2` 已完成：`protect_files` 与 `registry_rollback` 会生成真实 JSON 审计工件，回滚目标、受保护路径和注册表保护面已可落盘并通过执行快照回看工件路径。
+- `W06.1` 已完成：`suspend_process/kill_process/kill_ppl_process/quarantine_file/collect_forensics` 已切换为真实 Windows 响应执行链；挂起链使用 `NtSuspendProcess`，终止链会等待进程退出，文件隔离与取证打包会返回真实主机产物路径，不再依赖本地伪造快照。
 - 当前仓库的主要缺口不是“没有接口”，而是 Windows 侧仍大量使用伪状态与伪成功返回，无法反映真实主机能力、真实事件链路与真实响应结果。
 - 本轮研发的原则是先把 `WindowsPlatform` 变成“只汇报真实能力、不伪造成功”的运行时，再逐步补齐进程、网络、注册表、脚本、自保护、签名与硬件根信任链。
 
@@ -58,7 +59,7 @@ Windows 平台目标覆盖：
 | W04.2 | 注册表回滚与保护清单落盘 | done | 不允许只把 rollback 目标塞进快照；必须生成可审计的注册表回滚/保护清单 | 已完成保护清单与回滚清单 JSON 工件落盘，执行快照可回看真实工件路径，并覆盖受保护路径、回滚目标和注册表保护面 |
 | W05.1 | Named Pipe / DLL / VSS / Device 资产可见性 | done | 不允许 provider 名义存在但永远返回健康；必须对每类 provider 给出真实“已实现/未实现/主机不可用”状态 | 已完成四类 provider 的真实能力探测、启动基线与差分事件；并在 `192.168.2.218` 实测拿到四类能力均为 `true` 的探测 JSON，以及命名管道、模块、VSS、PnP 设备枚举样本 |
 | W05.2 | AMSI / 脚本 / ETW 篡改健康面 | done | 不允许把 `check_amsi_integrity()` 固定返回健康；必须根据 Defender/AMSI/审计实际状态给出结论 | 已完成 AMSI runtime、ScriptBlockLogging 与 ETW ingest 的真实能力探测、健康报告与 provider 收口；在 `192.168.2.218` 实测得到 `has_amsi_runtime=true`、`has_script_block_logging=false`、`has_powershell_operational_log=true`、`has_process_creation_audit=true` |
-| W06.1 | 真实进程终止、挂起、隔离、取证执行链 | todo | 不允许继续只改内存；必须执行真实 Windows 命令并在失败时返回错误 | `suspend_process/kill_process/kill_ppl_process/quarantine_file/collect_forensics` 能执行真实动作或诚实失败 |
+| W06.1 | 真实进程终止、挂起、隔离、取证执行链 | done | 不允许继续只改内存；必须执行真实 Windows 命令并在失败时返回错误 | 已完成真实挂起/终止/隔离/取证执行链；`192.168.2.218` 实测确认挂起/终止、文件隔离、取证打包闭环，且 `Suspend-Process` 缺失主机已改用 `NtSuspendProcess` 实现 |
 | W06.2 | 预防性阻断与保护面审计 | todo | 不允许只记录 block lease；必须把阻断/保护面结果写成工件用于复盘 | hash/path/network block、受保护 PID/路径和完整性验证结果可形成真实审计工件 |
 | W07.1 | 真实 Windows 测试主机验证、兼容性矩阵与验收脚本 | todo | 不允许只跑本地单测；必须在可用 Windows 主机验证 | 仓库内有可复跑验证脚本，且文档记录实际使用主机、验证项与结果 |
 | W08.1 | Windows 凭据存储、DPAPI/TPM 根信任与回滚锚点方案收口 | todo | 不允许继续只依赖 Linux TPM 分支；Windows 必须有独立的正式方案和代码接入面 | `aegis-core` 对 Windows 密钥保护与回滚锚点具备明确实现路径和状态输出 |
@@ -81,7 +82,7 @@ Windows 平台目标覆盖：
 5. `W04.2` `done`
 6. `W05.1` `done`
 7. `W05.2` `done`
-8. `W06.1`
+8. `W06.1` `done`
 9. `W06.2`
 10. `W07.1`
 11. `W08.1`
@@ -98,6 +99,7 @@ Windows 平台目标覆盖：
 - Windows 注册表回滚与保护审计工件：`done`
 - Windows Named Pipe / DLL / VSS / Device 资产可见性：`done`
 - Windows AMSI / ScriptBlock / ETW 健康面：`done`
+- Windows 真实挂起/终止/隔离/取证执行链：`done`
 - Windows 真实系统级交付：`doing`
 
 因此，本文件中的平台状态应保持：
@@ -110,7 +112,8 @@ Windows 平台目标覆盖：
 - `W04.2 = done`
 - `W05.1 = done`
 - `W05.2 = done`
-- `W06.1-W08.1 = todo`，进入实施后逐项更新为 `doing/done`
+- `W06.1 = done`
+- `W06.2-W08.1 = todo`，进入实施后逐项更新为 `doing/done`
 
 ## 7. Windows 后续执行顺序
 
