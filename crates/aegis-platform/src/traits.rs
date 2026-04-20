@@ -20,6 +20,7 @@ pub enum KernelTransport {
     Driver,
     EBpf,
     SystemExtension,
+    CommandProbe,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

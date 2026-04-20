@@ -521,6 +521,7 @@ pub struct EventBuffer {
 pub struct SensorConfig {
     pub profile: String,
     pub queue_capacity: usize,
+    pub require_kernel_driver: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]

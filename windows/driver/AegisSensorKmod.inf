@@ -1,0 +1,44 @@
+[Version]
+Signature="$WINDOWS NT$"
+Class=System
+ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider=%ProviderName%
+DriverVer=04/20/2026,1.0.0.0
+CatalogFile=AegisSensorKmod.cat
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[DefaultInstall]
+CopyFiles = DriverCopyFiles
+
+[DefaultInstall.Services]
+AddService = %ServiceName%,0x00000002,DriverServiceInstall
+
+[DefaultUninstall]
+DelFiles = DriverCopyFiles
+
+[DefaultUninstall.Services]
+DelService = %ServiceName%,0x00000200
+
+[DriverCopyFiles]
+AegisSensorKmod.sys
+
+[DriverServiceInstall]
+DisplayName = %ServiceDisplayName%
+ServiceType = 1
+StartType = 3
+ErrorControl = 1
+ServiceBinary = %12%\AegisSensorKmod.sys
+
+[SourceDisksFiles]
+AegisSensorKmod.sys = 1
+
+[SourceDisksNames]
+1 = %DiskName%,,,
+
+[Strings]
+ProviderName = "Aegis"
+ServiceName = "AegisSensorKmod"
+ServiceDisplayName = "Aegis Sensor Kernel Bridge"
+DiskName = "Aegis Driver Install Media"

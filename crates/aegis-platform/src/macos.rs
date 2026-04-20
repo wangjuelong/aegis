@@ -586,6 +586,7 @@ mod tests {
             .start(&SensorConfig {
                 profile: "macos".to_string(),
                 queue_capacity: 1024,
+                require_kernel_driver: false,
             })
             .expect("start macos baseline");
         let descriptor = platform.descriptor();
@@ -625,6 +626,7 @@ mod tests {
             .start(&SensorConfig {
                 profile: "macos".to_string(),
                 queue_capacity: 1024,
+                require_kernel_driver: false,
             })
             .expect("start macos baseline");
         assert_eq!(

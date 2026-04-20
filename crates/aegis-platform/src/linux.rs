@@ -1928,6 +1928,7 @@ mod tests {
             .start(&SensorConfig {
                 profile: "linux".to_string(),
                 queue_capacity: 1024,
+                require_kernel_driver: false,
             })
             .expect("start linux baseline");
 
@@ -1953,6 +1954,7 @@ mod tests {
             .start(&SensorConfig {
                 profile: "linux".to_string(),
                 queue_capacity: 1024,
+                require_kernel_driver: false,
             })
             .expect("start linux baseline");
         platform.set_degrade_level(LinuxDegradeLevel::FanotifyAudit);
@@ -1976,6 +1978,7 @@ mod tests {
             .start(&SensorConfig {
                 profile: "linux".to_string(),
                 queue_capacity: 1024,
+                require_kernel_driver: false,
             })
             .expect("start linux baseline");
         platform.inject_event(LinuxEventStub {
@@ -2098,6 +2101,7 @@ mod tests {
             .start(&SensorConfig {
                 profile: "linux".to_string(),
                 queue_capacity: 1024,
+                require_kernel_driver: false,
             })
             .expect("start linux baseline");
 
@@ -2149,6 +2153,7 @@ mod tests {
             .start(&SensorConfig {
                 profile: "linux".to_string(),
                 queue_capacity: 1024,
+                require_kernel_driver: false,
             })
             .expect("start linux baseline");
 
@@ -2213,6 +2218,7 @@ mod tests {
             .start(&SensorConfig {
                 profile: "linux".to_string(),
                 queue_capacity: 1024,
+                require_kernel_driver: false,
             })
             .expect("start linux baseline");
 
@@ -2263,6 +2269,7 @@ mod tests {
             .start(&SensorConfig {
                 profile: "linux".to_string(),
                 queue_capacity: 1024,
+                require_kernel_driver: false,
             })
             .expect("start linux baseline");
 
@@ -2316,6 +2323,7 @@ mod tests {
             .start(&SensorConfig {
                 profile: "linux".to_string(),
                 queue_capacity: 1024,
+                require_kernel_driver: false,
             })
             .expect("start linux baseline");
 

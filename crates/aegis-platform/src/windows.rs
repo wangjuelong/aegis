@@ -20,6 +20,11 @@ use std::sync::Mutex;
 use std::time::Duration;
 use uuid::Uuid;
 
+const AEGIS_WINDOWS_DRIVER_SERVICE_NAME: &str = "AegisSensorKmod";
+const AEGIS_WINDOWS_DRIVER_DEVICE_PATH: &str = r"\\.\AegisSensor";
+const AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION: u32 = 0x0001_0000;
+const AEGIS_WINDOWS_DRIVER_IOCTL_QUERY_VERSION: u32 = 0x0022_2000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowsProviderKind {
     EtwProcess,
@@ -182,6 +187,12 @@ struct WindowsHostCapabilities {
     has_module_inventory: bool,
     has_vss_inventory: bool,
     has_device_inventory: bool,
+    has_driver_service: bool,
+    has_driver_service_running: bool,
+    has_driver_control_device: bool,
+    driver_protocol_version: Option<u32>,
+    driver_version: Option<String>,
+    driver_status_detail: Option<String>,
     last_error: Option<String>,
 }
 
@@ -192,6 +203,38 @@ impl WindowsHostCapabilities {
             || self.has_wmi_log
             || self.has_task_scheduler_log
             || self.has_sysmon_log
+    }
+
+    fn driver_transport_ready(&self) -> bool {
+        self.reachable
+            && self.running_on_windows
+            && self.has_driver_service_running
+            && self.has_driver_control_device
+            && self.driver_protocol_version == Some(AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION)
+    }
+
+    fn driver_transport_summary(&self) -> String {
+        let protocol = self
+            .driver_protocol_version
+            .map(|value| format!("0x{value:08x}"))
+            .unwrap_or_else(|| "none".to_string());
+        let version = self
+            .driver_version
+            .clone()
+            .unwrap_or_else(|| "-".to_string());
+        let detail = self
+            .driver_status_detail
+            .clone()
+            .unwrap_or_else(|| "-".to_string());
+        format!(
+            "driver_service={};driver_running={};driver_device={};driver_protocol={};driver_version={};detail={}",
+            self.has_driver_service,
+            self.has_driver_service_running,
+            self.has_driver_control_device,
+            protocol,
+            version,
+            detail
+        )
     }
 
     fn provider_health(&self, provider: WindowsProviderKind, running: bool) -> bool {
@@ -246,6 +289,7 @@ impl WindowsHostCapabilities {
             "script_block_logging={}",
             self.has_script_block_logging
         ));
+        facts.push(self.driver_transport_summary());
         facts.join(", ")
     }
 }
@@ -273,6 +317,18 @@ struct WindowsCapabilityProbe {
     has_module_inventory: bool,
     has_vss_inventory: bool,
     has_device_inventory: bool,
+    #[serde(default)]
+    has_driver_service: bool,
+    #[serde(default)]
+    has_driver_service_running: bool,
+    #[serde(default)]
+    has_driver_control_device: bool,
+    #[serde(default)]
+    driver_protocol_version: Option<u32>,
+    #[serde(default)]
+    driver_version: Option<String>,
+    #[serde(default)]
+    driver_status_detail: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -657,6 +713,10 @@ impl WindowsPlatform {
                     "platform_protection".to_string(),
                     protection_report(&host),
                 ),
+                (
+                    "driver_transport".to_string(),
+                    driver_transport_report(&host),
+                ),
                 ("etw_ingest".to_string(), etw_report(&host)),
                 ("amsi_script".to_string(), amsi_report(&host)),
             ]),
@@ -670,11 +730,17 @@ impl WindowsPlatform {
 }
 
 impl PlatformSensor for WindowsPlatform {
-    fn start(&mut self, _config: &SensorConfig) -> Result<()> {
+    fn start(&mut self, config: &SensorConfig) -> Result<()> {
         let mut state = self.state.lock().expect("windows state poisoned");
         if !state.host_capabilities_pinned {
             state.host = probe_host_capabilities(self.runner.as_ref())
                 .with_context(|| "probe windows host capabilities")?;
+        }
+        if config.require_kernel_driver {
+            ensure_windows_driver_transport(
+                &state.host,
+                "start windows platform in kernel-driver mode",
+            )?;
         }
         if state.host.has_process_inventory {
             state.known_processes = snapshot_process_inventory(self.runner.as_ref())
@@ -1102,13 +1168,18 @@ impl PlatformProtection for WindowsPlatform {
 
 impl PlatformRuntime for WindowsPlatform {
     fn descriptor(&self) -> PlatformDescriptor {
+        let host = self.host_capabilities();
         PlatformDescriptor {
             target: PlatformTarget::Windows,
-            kernel_transport: KernelTransport::Driver,
+            kernel_transport: if host.driver_transport_ready() {
+                KernelTransport::Driver
+            } else {
+                KernelTransport::CommandProbe
+            },
             degrade_levels: 3,
-            supports_registry: true,
-            supports_amsi: true,
-            supports_etw_integrity: true,
+            supports_registry: false,
+            supports_amsi: false,
+            supports_etw_integrity: false,
             supports_bpf_integrity: false,
             supports_container_sensor: false,
         }
@@ -1202,6 +1273,119 @@ if ((Get-Command Get-PnpDevice -ErrorAction SilentlyContinue) -ne $null) {
     }
 }
 
+if (-not ("AegisProbe.DriverBridge" -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+namespace AegisProbe {
+    public static class DriverBridge {
+        public static readonly IntPtr InvalidHandleValue = new IntPtr(-1);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern IntPtr CreateFile(
+            string fileName,
+            uint desiredAccess,
+            uint shareMode,
+            IntPtr securityAttributes,
+            uint creationDisposition,
+            uint flagsAndAttributes,
+            IntPtr templateFile);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool DeviceIoControl(
+            IntPtr device,
+            uint ioControlCode,
+            byte[] inBuffer,
+            uint inBufferSize,
+            byte[] outBuffer,
+            uint outBufferSize,
+            out uint bytesReturned,
+            IntPtr overlapped);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool CloseHandle(IntPtr handle);
+    }
+}
+"@ | Out-Null
+}
+
+$hasDriverService = $false
+$hasDriverServiceRunning = $false
+$hasDriverControlDevice = $false
+$driverProtocolVersion = $null
+$driverVersion = $null
+$driverStatusDetail = $null
+
+try {
+    $driverService = Get-Service -Name 'AegisSensorKmod' -ErrorAction Stop
+    $hasDriverService = $true
+    $hasDriverServiceRunning = [string]$driverService.Status -eq 'Running'
+    $driverStatusDetail = [string]$driverService.Status
+} catch {
+    $driverStatusDetail = $_.Exception.Message
+}
+
+if ($hasDriverServiceRunning) {
+    $GENERIC_READ_WRITE = 0xC0000000
+    $FILE_SHARE_READ_WRITE = 0x00000003
+    $OPEN_EXISTING = 3
+    $handle = [AegisProbe.DriverBridge]::CreateFile(
+        '\\.\AegisSensor',
+        [uint32]$GENERIC_READ_WRITE,
+        [uint32]$FILE_SHARE_READ_WRITE,
+        [IntPtr]::Zero,
+        [uint32]$OPEN_EXISTING,
+        0,
+        [IntPtr]::Zero
+    )
+
+    if ($handle -eq [AegisProbe.DriverBridge]::InvalidHandleValue) {
+        $driverStatusDetail = "CreateFile(\\.\AegisSensor) failed: Win32=$([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+    } else {
+        try {
+            $buffer = New-Object byte[] 512
+            $bytesReturned = [uint32]0
+            $ok = [AegisProbe.DriverBridge]::DeviceIoControl(
+                $handle,
+                [uint32]0x00222000,
+                $null,
+                0,
+                $buffer,
+                [uint32]$buffer.Length,
+                [ref]$bytesReturned,
+                [IntPtr]::Zero
+            )
+            if (-not $ok) {
+                throw "DeviceIoControl(0x00222000) failed: Win32=$([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+            }
+            if ($bytesReturned -lt 1) {
+                throw "driver query returned empty payload"
+            }
+
+            $rawPayload = [System.Text.Encoding]::ASCII.GetString($buffer, 0, [int]$bytesReturned).Trim([char]0)
+            if ([string]::IsNullOrWhiteSpace($rawPayload)) {
+                throw "driver query returned blank payload"
+            }
+
+            $payload = $rawPayload | ConvertFrom-Json -ErrorAction Stop
+            $hasDriverControlDevice = $true
+            if ($payload.PSObject.Properties.Name -contains 'protocol_version') {
+                $driverProtocolVersion = [uint32]$payload.protocol_version
+            }
+            if ($payload.PSObject.Properties.Name -contains 'driver_version') {
+                $driverVersion = [string]$payload.driver_version
+            }
+            $driverStatusDetail = $rawPayload
+        } catch {
+            $driverStatusDetail = $_.Exception.Message
+        } finally {
+            [void][AegisProbe.DriverBridge]::CloseHandle($handle)
+        }
+    }
+}
+
 $data = [ordered]@{
     computer_name = $env:COMPUTERNAME
     user_name = (whoami)
@@ -1222,6 +1406,12 @@ $data = [ordered]@{
     has_module_inventory = $hasModuleInventory
     has_vss_inventory = $hasVssInventory
     has_device_inventory = $hasDeviceInventory
+    has_driver_service = $hasDriverService
+    has_driver_service_running = $hasDriverServiceRunning
+    has_driver_control_device = $hasDriverControlDevice
+    driver_protocol_version = $driverProtocolVersion
+    driver_version = $driverVersion
+    driver_status_detail = $driverStatusDetail
 }
 
 $data | ConvertTo-Json -Compress
@@ -1251,8 +1441,28 @@ $data | ConvertTo-Json -Compress
         has_module_inventory: probe.has_module_inventory,
         has_vss_inventory: probe.has_vss_inventory,
         has_device_inventory: probe.has_device_inventory,
+        has_driver_service: probe.has_driver_service,
+        has_driver_service_running: probe.has_driver_service_running,
+        has_driver_control_device: probe.has_driver_control_device,
+        driver_protocol_version: probe.driver_protocol_version,
+        driver_version: probe.driver_version,
+        driver_status_detail: probe.driver_status_detail,
         last_error: None,
     })
+}
+
+fn ensure_windows_driver_transport(host: &WindowsHostCapabilities, action: &str) -> Result<()> {
+    if host.driver_transport_ready() {
+        return Ok(());
+    }
+
+    bail!(
+        "{action} requires kernel driver transport {service} at {device} with protocol 0x{protocol:08x}; {}",
+        host.driver_transport_summary(),
+        service = AEGIS_WINDOWS_DRIVER_SERVICE_NAME,
+        device = AEGIS_WINDOWS_DRIVER_DEVICE_PATH,
+        protocol = AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION,
+    );
 }
 
 fn run_powershell_json<T: DeserializeOwned>(
@@ -2491,9 +2701,14 @@ fn kernel_report(passed: bool, details: impl Into<String>) -> IntegrityReport {
 fn protection_report(host: &WindowsHostCapabilities) -> IntegrityReport {
     let details = if !host.reachable {
         host.summary()
+    } else if host.driver_transport_ready() {
+        format!(
+            "driver bridge is present, but kernel callbacks / block enforcement are still not implemented; {}",
+            host.summary()
+        )
     } else {
         format!(
-            "windows protection plane still lacks kernel callbacks and blocking transport; {}",
+            "windows protection plane is running without driver transport; {}",
             host.summary()
         )
     };
@@ -2501,6 +2716,23 @@ fn protection_report(host: &WindowsHostCapabilities) -> IntegrityReport {
         passed: false,
         details,
     }
+}
+
+fn driver_transport_report(host: &WindowsHostCapabilities) -> IntegrityReport {
+    let passed = host.driver_transport_ready();
+    let details = if !host.reachable {
+        host.summary()
+    } else {
+        format!(
+            "expected_service={};expected_device={};expected_ioctl=0x{:08x};expected_protocol=0x{:08x};{}",
+            AEGIS_WINDOWS_DRIVER_SERVICE_NAME,
+            AEGIS_WINDOWS_DRIVER_DEVICE_PATH,
+            AEGIS_WINDOWS_DRIVER_IOCTL_QUERY_VERSION,
+            AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION,
+            host.driver_transport_summary()
+        )
+    };
+    IntegrityReport { passed, details }
 }
 
 fn etw_report(host: &WindowsHostCapabilities) -> IntegrityReport {
@@ -2567,10 +2799,12 @@ fn push_block(
 mod tests {
     use super::{
         WindowsCommandRunner, WindowsEventStub, WindowsHostCapabilities, WindowsPlatform,
-        WindowsProviderKind,
+        WindowsProviderKind, AEGIS_WINDOWS_DRIVER_DEVICE_PATH,
+        AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION, AEGIS_WINDOWS_DRIVER_SERVICE_NAME,
     };
     use crate::{
-        KernelIntegrity, PlatformProtection, PlatformResponse, PlatformSensor, PreemptiveBlock,
+        KernelIntegrity, KernelTransport, PlatformProtection, PlatformResponse, PlatformRuntime,
+        PlatformSensor, PreemptiveBlock,
     };
     use aegis_model::{EventBuffer, ForensicSpec, IsolationRulesV2, RollbackTarget, SensorConfig};
     use anyhow::{anyhow, bail, Result};
@@ -2642,8 +2876,27 @@ mod tests {
             has_module_inventory: false,
             has_vss_inventory: false,
             has_device_inventory: false,
+            has_driver_service: false,
+            has_driver_service_running: false,
+            has_driver_control_device: false,
+            driver_protocol_version: None,
+            driver_version: None,
+            driver_status_detail: None,
             last_error: None,
         }
+    }
+
+    fn healthy_host_with_driver() -> WindowsHostCapabilities {
+        let mut host = healthy_host();
+        host.has_driver_service = true;
+        host.has_driver_service_running = true;
+        host.has_driver_control_device = true;
+        host.driver_protocol_version = Some(AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION);
+        host.driver_version = Some("1.0.0-test".to_string());
+        host.driver_status_detail = Some(
+            r#"{"protocol_version":65536,"driver_version":"1.0.0-test"}"#.to_string(),
+        );
+        host
     }
 
     fn probe_output() -> String {
@@ -2979,18 +3232,81 @@ mod tests {
     }
 
     #[test]
+    fn windows_descriptor_uses_command_probe_until_driver_bridge_is_ready() {
+        let platform = WindowsPlatform::with_runner_for_test(
+            Box::new(QueuedWindowsRunner::new(Vec::<String>::new())),
+            healthy_host(),
+        );
+
+        let descriptor = platform.descriptor();
+
+        assert_eq!(descriptor.kernel_transport, KernelTransport::CommandProbe);
+        assert!(!descriptor.supports_registry);
+        assert!(!descriptor.supports_amsi);
+        assert!(!descriptor.supports_etw_integrity);
+    }
+
+    #[test]
     fn windows_start_requires_real_execution_mode() {
         let mut platform = WindowsPlatform::new_with_runner(Box::new(FailingWindowsRunner), false);
         let error = platform
             .start(&SensorConfig {
                 profile: "windows".to_string(),
                 queue_capacity: 1024,
+                require_kernel_driver: false,
             })
             .expect_err("start should fail without a reachable windows host");
         let message = error.to_string();
         assert!(
             message.contains("windows host unavailable")
                 || message.contains("probe windows host capabilities")
+        );
+    }
+
+    #[test]
+    fn windows_start_rejects_required_driver_mode_when_bridge_is_absent() {
+        let mut platform = WindowsPlatform::new_with_runner(
+            Box::new(QueuedWindowsRunner::new([probe_output()])),
+            false,
+        );
+        let error = platform
+            .start(&SensorConfig {
+                profile: "windows-system".to_string(),
+                queue_capacity: 1024,
+                require_kernel_driver: true,
+            })
+            .expect_err("start should fail when kernel driver mode is required without bridge");
+        let message = error.to_string();
+        assert!(message.contains(AEGIS_WINDOWS_DRIVER_SERVICE_NAME));
+        assert!(message.contains(AEGIS_WINDOWS_DRIVER_DEVICE_PATH));
+    }
+
+    #[test]
+    fn windows_start_accepts_required_driver_mode_when_bridge_is_ready() {
+        let mut platform = WindowsPlatform::with_runner_for_test(
+            Box::new(QueuedWindowsRunner::new([
+                process_output(&[("System", 4, 0, None)]),
+                audit_cursor_output(450),
+                network_output(&[]),
+            ])),
+            healthy_host_with_driver(),
+        );
+        platform
+            .start(&SensorConfig {
+                profile: "windows-system".to_string(),
+                queue_capacity: 1024,
+                require_kernel_driver: true,
+            })
+            .expect("start windows runtime in kernel-driver mode");
+
+        assert_eq!(platform.descriptor().kernel_transport, KernelTransport::Driver);
+        let snapshot = platform.health_snapshot();
+        assert_eq!(
+            snapshot
+                .integrity_reports
+                .get("driver_transport")
+                .map(|report| report.passed),
+            Some(true)
         );
     }
 
@@ -3002,6 +3318,7 @@ mod tests {
             .start(&SensorConfig {
                 profile: "windows".to_string(),
                 queue_capacity: 1024,
+                require_kernel_driver: false,
             })
             .expect("start windows runtime");
         platform.inject_event(WindowsEventStub {
@@ -3195,6 +3512,7 @@ mod tests {
             .start(&SensorConfig {
                 profile: "windows".to_string(),
                 queue_capacity: 1024,
+                require_kernel_driver: false,
             })
             .expect("start windows runtime");
 
@@ -3220,6 +3538,13 @@ mod tests {
             snapshot
                 .integrity_reports
                 .get("platform_protection")
+                .map(|report| report.passed),
+            Some(false)
+        );
+        assert_eq!(
+            snapshot
+                .integrity_reports
+                .get("driver_transport")
                 .map(|report| report.passed),
             Some(false)
         );
@@ -3276,6 +3601,7 @@ mod tests {
             .start(&SensorConfig {
                 profile: "windows".to_string(),
                 queue_capacity: 1024,
+                require_kernel_driver: false,
             })
             .expect("start windows runtime");
 
@@ -3331,6 +3657,7 @@ mod tests {
             .start(&SensorConfig {
                 profile: "windows".to_string(),
                 queue_capacity: 1024,
+                require_kernel_driver: false,
             })
             .expect("start windows runtime");
 
@@ -3391,6 +3718,7 @@ mod tests {
             .start(&SensorConfig {
                 profile: "windows".to_string(),
                 queue_capacity: 1024,
+                require_kernel_driver: false,
             })
             .expect("start windows runtime");
 
@@ -3459,6 +3787,7 @@ mod tests {
             .start(&SensorConfig {
                 profile: "windows".to_string(),
                 queue_capacity: 1024,
+                require_kernel_driver: false,
             })
             .expect("start windows runtime");
 
@@ -3532,6 +3861,7 @@ mod tests {
             .start(&SensorConfig {
                 profile: "windows".to_string(),
                 queue_capacity: 1024,
+                require_kernel_driver: false,
             })
             .expect("start windows runtime");
 

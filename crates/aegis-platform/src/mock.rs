@@ -388,6 +388,7 @@ mod tests {
             .start(&SensorConfig {
                 profile: "test".to_string(),
                 queue_capacity: 128,
+                require_kernel_driver: false,
             })
             .expect("start mock platform");
 

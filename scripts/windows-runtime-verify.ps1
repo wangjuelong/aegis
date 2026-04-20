@@ -1,3 +1,11 @@
+param(
+    [string]$DriverRoot = (Join-Path $PSScriptRoot "driver"),
+    [string]$BuildScriptPath = (Join-Path $PSScriptRoot "windows-build-driver.ps1"),
+    [string]$InstallScriptPath = (Join-Path $PSScriptRoot "windows-install-driver.ps1"),
+    [string]$UninstallScriptPath = (Join-Path $PSScriptRoot "windows-uninstall-driver.ps1"),
+    [string]$DriverServiceName = "AegisSensorKmod"
+)
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -34,6 +42,22 @@ New-Item -ItemType Directory -Path $forensicsRoot -Force | Out-Null
 $results = [ordered]@{}
 $requiredFailures = New-Object System.Collections.Generic.List[string]
 
+function Resolve-ExistingPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $true)]
+        [string]$Description
+    )
+
+    $resolved = Resolve-Path -LiteralPath $Path -ErrorAction SilentlyContinue
+    if ($null -eq $resolved) {
+        throw "missing ${Description}: ${Path}"
+    }
+
+    $resolved.Path
+}
+
 function Invoke-ValidationStep {
     param(
         [Parameter(Mandatory = $true)]
@@ -60,6 +84,42 @@ function Invoke-ValidationStep {
             $requiredFailures.Add($Name) | Out-Null
         }
     }
+}
+
+function Invoke-JsonScript {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ScriptPath,
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Arguments
+    )
+
+    $resolvedScript = Resolve-ExistingPath -Path $ScriptPath -Description "script"
+    $invokeArgs = @(
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        $resolvedScript
+    )
+
+    foreach ($entry in $Arguments.GetEnumerator()) {
+        $invokeArgs += "-$($entry.Key)"
+        $invokeArgs += [string]$entry.Value
+    }
+
+    $output = & powershell @invokeArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "script failed: $resolvedScript (exit code $LASTEXITCODE)"
+    }
+
+    $jsonLine = @($output | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Last 1)
+    if ($jsonLine.Count -ne 1) {
+        throw "script did not emit a terminal JSON line: $resolvedScript"
+    }
+
+    $jsonLine[0] | ConvertFrom-Json -ErrorAction Stop
 }
 
 function Get-ScriptBlockLoggingEnabled {
@@ -136,6 +196,45 @@ Invoke-ValidationStep -Name "host_baseline" -Body {
         build_number = [string]$os.BuildNumber
         architecture = [string]$os.OSArchitecture
         powershell_version = $PSVersionTable.PSVersion.ToString()
+    }
+}
+
+Invoke-ValidationStep -Name "driver_transport" -Body {
+    $resolvedDriverRoot = Resolve-ExistingPath -Path $DriverRoot -Description "driver root"
+    $resolvedBuildScript = Resolve-ExistingPath -Path $BuildScriptPath -Description "driver build script"
+    $resolvedInstallScript = Resolve-ExistingPath -Path $InstallScriptPath -Description "driver install script"
+    $resolvedUninstallScript = Resolve-ExistingPath -Path $UninstallScriptPath -Description "driver uninstall script"
+
+    $buildResult = Invoke-JsonScript -ScriptPath $resolvedBuildScript -Arguments @{
+        DriverRoot = $resolvedDriverRoot
+        Configuration = "Release"
+        Platform = "x64"
+    }
+
+    $installResult = $null
+    $uninstallResult = $null
+    try {
+        $installResult = Invoke-JsonScript -ScriptPath $resolvedInstallScript -Arguments @{
+            DriverRoot = $resolvedDriverRoot
+            Configuration = "Release"
+            Platform = "x64"
+            ServiceName = $DriverServiceName
+        }
+
+        $protocolVersion = [int]$installResult.driver_query.protocol_version
+        if ($protocolVersion -ne 65536) {
+            throw "driver protocol mismatch: $protocolVersion"
+        }
+    } finally {
+        $uninstallResult = Invoke-JsonScript -ScriptPath $resolvedUninstallScript -Arguments @{
+            ServiceName = $DriverServiceName
+        }
+    }
+
+    [ordered]@{
+        build = $buildResult
+        install = $installResult
+        uninstall = $uninstallResult
     }
 }
 

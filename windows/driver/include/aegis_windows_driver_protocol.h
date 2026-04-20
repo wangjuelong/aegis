@@ -1,0 +1,22 @@
+#ifndef AEGIS_WINDOWS_DRIVER_PROTOCOL_H
+#define AEGIS_WINDOWS_DRIVER_PROTOCOL_H
+
+#include <ntddk.h>
+
+#define AEGIS_DRIVER_PROTOCOL_VERSION 0x00010000UL
+
+#define AEGIS_DRIVER_SERVICE_NAME_A "AegisSensorKmod"
+#define AEGIS_DRIVER_SERVICE_NAME_W L"AegisSensorKmod"
+
+#define AEGIS_DRIVER_NT_DEVICE_NAME_W L"\\Device\\AegisSensor"
+#define AEGIS_DRIVER_DOS_DEVICE_NAME_W L"\\DosDevices\\AegisSensor"
+#define AEGIS_DRIVER_DOS_DEVICE_PATH_A "\\\\.\\AegisSensor"
+
+#define AEGIS_DRIVER_VERSION_STRING_A "1.0.0"
+#define AEGIS_DRIVER_QUERY_VERSION_JSON \
+    "{\"protocol_version\":65536,\"driver_version\":\"1.0.0\"}"
+
+#define AEGIS_IOCTL_QUERY_VERSION \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+#endif

@@ -7,7 +7,16 @@ PASSWORD=${AEGIS_WINDOWS_PASSWORD:-lamba}
 OUTPUT_PATH=${AEGIS_WINDOWS_VALIDATE_OUTPUT:-target/windows-validation/${HOST}.json}
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
 REMOTE_SCRIPT_PATH="${SCRIPT_DIR}/windows-runtime-verify.ps1"
+BUILD_SCRIPT_PATH="${SCRIPT_DIR}/windows-build-driver.ps1"
+INSTALL_SCRIPT_PATH="${SCRIPT_DIR}/windows-install-driver.ps1"
+UNINSTALL_SCRIPT_PATH="${SCRIPT_DIR}/windows-uninstall-driver.ps1"
+DRIVER_SOURCE_DIR="${REPO_ROOT}/windows/driver"
+
+REMOTE_PAYLOAD_ID="windows-runtime-verify-$(date +%Y%m%d-%H%M%S)"
+REMOTE_PAYLOAD_POSIX="/c:/ProgramData/Aegis/validation/${REMOTE_PAYLOAD_ID}"
+REMOTE_PAYLOAD_WIN="C:\\ProgramData\\Aegis\\validation\\${REMOTE_PAYLOAD_ID}"
 
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
 
@@ -22,12 +31,32 @@ if [[ ! -f "$REMOTE_SCRIPT_PATH" ]]; then
   echo "missing powershell validation script: $REMOTE_SCRIPT_PATH" >&2
   exit 1
 fi
+for path in "$BUILD_SCRIPT_PATH" "$INSTALL_SCRIPT_PATH" "$UNINSTALL_SCRIPT_PATH"; do
+  if [[ ! -f "$path" ]]; then
+    echo "missing driver helper script: $path" >&2
+    exit 1
+  fi
+done
+if [[ ! -d "$DRIVER_SOURCE_DIR" ]]; then
+  echo "missing driver source directory: $DRIVER_SOURCE_DIR" >&2
+  exit 1
+fi
 
 mkdir -p "$(dirname "$OUTPUT_PATH")"
 
+sshpass -p "$PASSWORD" ssh "${SSH_OPTS[@]}" "$USER_NAME@$HOST" \
+  "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"New-Item -ItemType Directory -Force -Path ${REMOTE_PAYLOAD_WIN} | Out-Null\"" >/dev/null
+
+sshpass -p "$PASSWORD" scp -r "${SSH_OPTS[@]}" \
+  "$REMOTE_SCRIPT_PATH" \
+  "$BUILD_SCRIPT_PATH" \
+  "$INSTALL_SCRIPT_PATH" \
+  "$UNINSTALL_SCRIPT_PATH" \
+  "$DRIVER_SOURCE_DIR" \
+  "$USER_NAME@$HOST:${REMOTE_PAYLOAD_POSIX}/" >/dev/null
+
 RESULT_JSON=$(sshpass -p "$PASSWORD" ssh "${SSH_OPTS[@]}" "$USER_NAME@$HOST" \
-  "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command -" \
-  < "$REMOTE_SCRIPT_PATH")
+  "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${REMOTE_PAYLOAD_WIN}\\windows-runtime-verify.ps1\" -DriverRoot \"${REMOTE_PAYLOAD_WIN}\\driver\" -BuildScriptPath \"${REMOTE_PAYLOAD_WIN}\\windows-build-driver.ps1\" -InstallScriptPath \"${REMOTE_PAYLOAD_WIN}\\windows-install-driver.ps1\" -UninstallScriptPath \"${REMOTE_PAYLOAD_WIN}\\windows-uninstall-driver.ps1\"")
 
 printf '%s\n' "$RESULT_JSON" | tee "$OUTPUT_PATH"
 
