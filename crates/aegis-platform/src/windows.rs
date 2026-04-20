@@ -12,7 +12,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -248,12 +248,44 @@ struct WindowsCapabilityProbe {
     has_registry_cli: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsProcessSnapshot {
+    process_id: u32,
+    parent_process_id: u32,
+    name: String,
+    #[serde(default)]
+    command_line: Option<String>,
+}
+
+impl WindowsProcessSnapshot {
+    fn start_subject(&self) -> String {
+        truncate_subject(&format!(
+            "pid={};ppid={};name={};cmdline={}",
+            self.process_id,
+            self.parent_process_id,
+            self.name,
+            self.command_line.as_deref().unwrap_or("-")
+        ))
+    }
+
+    fn exit_subject(&self) -> String {
+        truncate_subject(&format!("pid={};name={}", self.process_id, self.name))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsTasklistSnapshot {
+    process_id: u32,
+    image_name: String,
+}
+
 struct WindowsState {
     base_dir: PathBuf,
     pending_events: VecDeque<Vec<u8>>,
     execution: PlatformExecutionSnapshot,
     host: WindowsHostCapabilities,
     host_capabilities_pinned: bool,
+    known_processes: BTreeMap<u32, WindowsProcessSnapshot>,
 }
 
 pub struct WindowsPlatform {
@@ -296,6 +328,7 @@ impl WindowsPlatform {
                     ..WindowsHostCapabilities::default()
                 },
                 host_capabilities_pinned,
+                known_processes: BTreeMap::new(),
             }),
         }
     }
@@ -396,6 +429,12 @@ impl PlatformSensor for WindowsPlatform {
             state.host = probe_host_capabilities(self.runner.as_ref())
                 .with_context(|| "probe windows host capabilities")?;
         }
+        if state.host.has_process_inventory {
+            state.known_processes = snapshot_process_inventory(self.runner.as_ref())
+                .with_context(|| "snapshot initial windows process inventory")?;
+        } else {
+            state.known_processes.clear();
+        }
         state.execution.running = true;
         Ok(())
     }
@@ -414,6 +453,8 @@ impl PlatformSensor for WindowsPlatform {
         if !state.execution.running {
             return Ok(0);
         }
+
+        collect_live_windows_events(&mut state, self.runner.as_ref())?;
 
         let mut drained = 0usize;
         while let Some(event) = state.pending_events.pop_front() {
@@ -602,7 +643,44 @@ impl KernelIntegrity for WindowsPlatform {
     }
 
     fn detect_hidden_processes(&self) -> Result<Vec<SuspiciousProcess>> {
-        bail!("windows hidden process detection is not implemented yet")
+        let host = self.host_capabilities();
+        if !host.reachable || !host.has_process_inventory {
+            bail!("windows process inventory is unavailable")
+        }
+
+        let wmi = snapshot_process_inventory(self.runner.as_ref())
+            .with_context(|| "snapshot windows processes via win32_process")?;
+        let tasklist = snapshot_tasklist_inventory(self.runner.as_ref())
+            .with_context(|| "snapshot windows processes via tasklist")?;
+        let wmi_pids = wmi.keys().copied().collect::<BTreeSet<_>>();
+        let tasklist_pids = tasklist.keys().copied().collect::<BTreeSet<_>>();
+
+        let mut suspicious = Vec::new();
+        for pid in wmi_pids.difference(&tasklist_pids) {
+            let reason = wmi
+                .get(pid)
+                .map(|process| {
+                    format!(
+                        "present in Win32_Process but absent from tasklist: {}",
+                        process.name
+                    )
+                })
+                .unwrap_or_else(|| "present in Win32_Process but absent from tasklist".to_string());
+            suspicious.push(SuspiciousProcess { pid: *pid, reason });
+        }
+        for pid in tasklist_pids.difference(&wmi_pids) {
+            let reason = tasklist
+                .get(pid)
+                .map(|process| {
+                    format!(
+                        "present in tasklist but absent from Win32_Process: {}",
+                        process.image_name
+                    )
+                })
+                .unwrap_or_else(|| "present in tasklist but absent from Win32_Process".to_string());
+            suspicious.push(SuspiciousProcess { pid: *pid, reason });
+        }
+        Ok(suspicious)
     }
 }
 
@@ -734,6 +812,102 @@ fn run_powershell_json<T: DeserializeOwned>(
         .with_context(|| format!("parse powershell json output: {}", raw.trim()))
 }
 
+fn collect_live_windows_events(
+    state: &mut WindowsState,
+    runner: &dyn WindowsCommandRunner,
+) -> Result<()> {
+    if state.host.has_process_inventory {
+        collect_process_delta_events(state, runner)?;
+    }
+    Ok(())
+}
+
+fn collect_process_delta_events(
+    state: &mut WindowsState,
+    runner: &dyn WindowsCommandRunner,
+) -> Result<()> {
+    let current = snapshot_process_inventory(runner)?;
+    for (pid, process) in &current {
+        if !state.known_processes.contains_key(pid) {
+            state.pending_events.push_back(
+                WindowsEventStub {
+                    provider: WindowsProviderKind::PsProcess,
+                    operation: "process-start".to_string(),
+                    subject: process.start_subject(),
+                }
+                .encode(),
+            );
+        }
+    }
+
+    for (pid, process) in &state.known_processes {
+        if !current.contains_key(pid) {
+            state.pending_events.push_back(
+                WindowsEventStub {
+                    provider: WindowsProviderKind::PsProcess,
+                    operation: "process-exit".to_string(),
+                    subject: process.exit_subject(),
+                }
+                .encode(),
+            );
+        }
+    }
+
+    state.known_processes = current;
+    Ok(())
+}
+
+fn snapshot_process_inventory(
+    runner: &dyn WindowsCommandRunner,
+) -> Result<BTreeMap<u32, WindowsProcessSnapshot>> {
+    let script = r#"
+$rows = @(
+    Get-CimInstance Win32_Process |
+        Sort-Object ProcessId |
+        ForEach-Object {
+            [ordered]@{
+                process_id = [uint32]$_.ProcessId
+                parent_process_id = [uint32]$_.ParentProcessId
+                name = $_.Name
+                command_line = $_.CommandLine
+            }
+        }
+)
+
+$rows | ConvertTo-Json -Compress
+"#;
+    let rows: Vec<WindowsProcessSnapshot> = run_powershell_json(runner, script)?;
+    Ok(rows
+        .into_iter()
+        .map(|process| (process.process_id, process))
+        .collect())
+}
+
+fn snapshot_tasklist_inventory(
+    runner: &dyn WindowsCommandRunner,
+) -> Result<BTreeMap<u32, WindowsTasklistSnapshot>> {
+    let script = r#"
+$rows = @(
+    tasklist /FO CSV /NH |
+        Where-Object { $_ -and $_.Trim() } |
+        ConvertFrom-Csv -Header 'Image Name','PID','Session Name','Session#','Mem Usage' |
+        ForEach-Object {
+            [ordered]@{
+                process_id = [uint32](($_.PID -replace '[^0-9]', ''))
+                image_name = $_.'Image Name'
+            }
+        }
+)
+
+$rows | ConvertTo-Json -Compress
+"#;
+    let rows: Vec<WindowsTasklistSnapshot> = run_powershell_json(runner, script)?;
+    Ok(rows
+        .into_iter()
+        .map(|process| (process.process_id, process))
+        .collect())
+}
+
 fn run_local_powershell(script: &str) -> Result<String> {
     let encoded = encode_powershell_script(script);
     let output = Command::new("powershell")
@@ -819,6 +993,16 @@ fn protection_report(host: &WindowsHostCapabilities) -> IntegrityReport {
     }
 }
 
+fn truncate_subject(value: &str) -> String {
+    const LIMIT: usize = 256;
+    if value.chars().count() <= LIMIT {
+        value.to_string()
+    } else {
+        let truncated = value.chars().take(LIMIT).collect::<String>();
+        format!("{truncated}...")
+    }
+}
+
 fn platform_root(prefix: &str) -> PathBuf {
     std::env::temp_dir().join(format!("aegis-{prefix}-{}", Uuid::now_v7().simple()))
 }
@@ -893,21 +1077,35 @@ mod tests {
         KernelIntegrity, PlatformProtection, PlatformResponse, PlatformSensor, PreemptiveBlock,
     };
     use aegis_model::{EventBuffer, ForensicSpec, IsolationRulesV2, SensorConfig};
-    use anyhow::{bail, Result};
+    use anyhow::{anyhow, bail, Result};
+    use std::collections::VecDeque;
     use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
     use std::time::Duration;
 
-    struct ScriptedWindowsRunner {
-        probe_output: String,
+    struct QueuedWindowsRunner {
+        responses: Mutex<VecDeque<String>>,
     }
 
-    impl WindowsCommandRunner for ScriptedWindowsRunner {
+    impl QueuedWindowsRunner {
+        fn new(responses: impl IntoIterator<Item = String>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into_iter().collect()),
+            }
+        }
+    }
+
+    impl WindowsCommandRunner for QueuedWindowsRunner {
         fn mode_name(&self) -> &'static str {
             "ssh"
         }
 
         fn run_powershell(&self, _script: &str) -> Result<String> {
-            Ok(self.probe_output.clone())
+            self.responses
+                .lock()
+                .expect("queued runner poisoned")
+                .pop_front()
+                .ok_or_else(|| anyhow!("queued runner exhausted"))
         }
     }
 
@@ -944,12 +1142,50 @@ mod tests {
         }
     }
 
+    fn probe_output() -> String {
+        r#"{"computer_name":"DESKTOP-TLASHJG","user_name":"desktop-tlashjg\\lamba","is_admin":true,"has_process_inventory":true,"has_security_log":true,"has_powershell_log":true,"has_wmi_log":true,"has_task_scheduler_log":true,"has_sysmon_log":false,"has_net_connection":true,"has_firewall":true,"has_registry_cli":true}"#.to_string()
+    }
+
+    fn process_output(processes: &[(&str, u32, u32, Option<&str>)]) -> String {
+        let rows = processes
+            .iter()
+            .map(|(name, pid, ppid, cmdline)| {
+                let cmdline = cmdline
+                    .map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+                    .unwrap_or_else(|| "null".to_string());
+                format!(
+                    "{{\"process_id\":{pid},\"parent_process_id\":{ppid},\"name\":\"{}\",\"command_line\":{cmdline}}}",
+                    name.replace('\\', "\\\\").replace('"', "\\\"")
+                )
+            })
+            .collect::<Vec<_>>();
+        format!("[{}]", rows.join(","))
+    }
+
+    fn tasklist_output(entries: &[(&str, u32)]) -> String {
+        let rows = entries
+            .iter()
+            .map(|(name, pid)| {
+                format!(
+                    "{{\"process_id\":{pid},\"image_name\":\"{}\"}}",
+                    name.replace('\\', "\\\\").replace('"', "\\\"")
+                )
+            })
+            .collect::<Vec<_>>();
+        format!("[{}]", rows.join(","))
+    }
+
+    fn platform_with_probe_and_processes(
+        processes: impl IntoIterator<Item = String>,
+    ) -> WindowsPlatform {
+        let mut responses = vec![probe_output()];
+        responses.extend(processes);
+        WindowsPlatform::new_with_runner(Box::new(QueuedWindowsRunner::new(responses)), false)
+    }
+
     fn platform_with_probe() -> WindowsPlatform {
-        let probe_output = r#"{"computer_name":"DESKTOP-TLASHJG","user_name":"desktop-tlashjg\\lamba","is_admin":true,"has_process_inventory":true,"has_security_log":true,"has_powershell_log":true,"has_wmi_log":true,"has_task_scheduler_log":true,"has_sysmon_log":false,"has_net_connection":true,"has_firewall":true,"has_registry_cli":true}"#;
         WindowsPlatform::with_runner_for_test(
-            Box::new(ScriptedWindowsRunner {
-                probe_output: probe_output.to_string(),
-            }),
+            Box::new(QueuedWindowsRunner::new(Vec::<String>::new())),
             healthy_host(),
         )
     }
@@ -986,7 +1222,9 @@ mod tests {
 
     #[test]
     fn windows_baseline_polls_injected_events() {
-        let mut platform = platform_with_probe();
+        let baseline = process_output(&[("System", 4, 0, None)]);
+        let mut platform =
+            platform_with_probe_and_processes([baseline.clone(), baseline]);
         platform
             .start(&SensorConfig {
                 profile: "windows".to_string(),
@@ -1065,7 +1303,9 @@ mod tests {
 
     #[test]
     fn windows_health_snapshot_reports_real_host_probe_state() {
-        let mut platform = platform_with_probe();
+        let mut platform = platform_with_probe_and_processes([process_output(&[
+            ("System", 4, 0, None),
+        ])]);
         platform
             .start(&SensorConfig {
                 profile: "windows".to_string(),
@@ -1115,5 +1355,58 @@ mod tests {
                 .expect("ssdt integrity")
                 .passed
         );
+    }
+
+    #[test]
+    fn windows_poll_events_emits_real_process_delta() {
+        let mut platform = platform_with_probe_and_processes([
+            process_output(&[("System", 4, 0, None)]),
+            process_output(&[
+                ("System", 4, 0, None),
+                (
+                    "powershell.exe",
+                    4242,
+                    640,
+                    Some("powershell.exe -NoProfile -EncodedCommand AAAA"),
+                ),
+            ]),
+        ]);
+        platform
+            .start(&SensorConfig {
+                profile: "windows".to_string(),
+                queue_capacity: 1024,
+            })
+            .expect("start windows runtime");
+
+        let mut buffer = EventBuffer::default();
+        let drained = platform.poll_events(&mut buffer).expect("poll events");
+
+        assert_eq!(drained, 1);
+        let event = String::from_utf8(buffer.records[0].clone()).expect("event utf8");
+        assert!(event.contains("PsProcess"));
+        assert!(event.contains("process-start"));
+        assert!(event.contains("powershell.exe"));
+    }
+
+    #[test]
+    fn windows_hidden_process_detection_compares_wmi_and_tasklist_views() {
+        let platform = WindowsPlatform::with_runner_for_test(
+            Box::new(QueuedWindowsRunner::new([
+                process_output(&[
+                    ("System", 4, 0, None),
+                    ("hidden.exe", 500, 4, Some("C:\\hidden.exe")),
+                ]),
+                tasklist_output(&[("System", 4), ("ghost.exe", 600)]),
+            ])),
+            healthy_host(),
+        );
+
+        let suspicious = platform
+            .detect_hidden_processes()
+            .expect("detect hidden processes");
+
+        assert_eq!(suspicious.len(), 2);
+        assert!(suspicious.iter().any(|entry| entry.pid == 500));
+        assert!(suspicious.iter().any(|entry| entry.pid == 600));
     }
 }
