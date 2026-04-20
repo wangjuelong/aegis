@@ -37,6 +37,7 @@ Windows 平台目标覆盖：
 - `W04.2` 已完成：`protect_files` 与 `registry_rollback` 会生成真实 JSON 审计工件，回滚目标、受保护路径和注册表保护面已可落盘并通过执行快照回看工件路径。
 - `W06.1` 已完成：`suspend_process/kill_process/kill_ppl_process/quarantine_file/collect_forensics` 已切换为真实 Windows 响应执行链；挂起链使用 `NtSuspendProcess`，终止链会等待进程退出，文件隔离与取证打包会返回真实主机产物路径，不再依赖本地伪造快照。
 - `W06.2` 已完成：`block_hash/block_pid/block_path` 已不再只保留 lease，而是生成可复盘的阻断审计工件；`block_network/clear_all_blocks` 已接入真实 Windows 防火墙 rule group 创建/清理；`protect_process/protect_files/verify_integrity` 也会产出保护面与完整性审计工件。
+- `W07.1` 已完成：仓库已新增 `scripts/windows-runtime-verify.sh` / `scripts/windows-runtime-verify.ps1` 真机验收脚本，并在 `192.168.2.218` 跑通完整矩阵；详细结果见 `docs/plan/sensor/sensor-windows-validation-matrix.md`。
 - 当前仓库的主要缺口不是“没有接口”，而是 Windows 侧仍大量使用伪状态与伪成功返回，无法反映真实主机能力、真实事件链路与真实响应结果。
 - 本轮研发的原则是先把 `WindowsPlatform` 变成“只汇报真实能力、不伪造成功”的运行时，再逐步补齐进程、网络、注册表、脚本、自保护、签名与硬件根信任链。
 
@@ -62,7 +63,7 @@ Windows 平台目标覆盖：
 | W05.2 | AMSI / 脚本 / ETW 篡改健康面 | done | 不允许把 `check_amsi_integrity()` 固定返回健康；必须根据 Defender/AMSI/审计实际状态给出结论 | 已完成 AMSI runtime、ScriptBlockLogging 与 ETW ingest 的真实能力探测、健康报告与 provider 收口；在 `192.168.2.218` 实测得到 `has_amsi_runtime=true`、`has_script_block_logging=false`、`has_powershell_operational_log=true`、`has_process_creation_audit=true` |
 | W06.1 | 真实进程终止、挂起、隔离、取证执行链 | done | 不允许继续只改内存；必须执行真实 Windows 命令并在失败时返回错误 | 已完成真实挂起/终止/隔离/取证执行链；`192.168.2.218` 实测确认挂起/终止、文件隔离、取证打包闭环，且 `Suspend-Process` 缺失主机已改用 `NtSuspendProcess` 实现 |
 | W06.2 | 预防性阻断与保护面审计 | done | 不允许只记录 block lease；必须把阻断/保护面结果写成工件用于复盘 | 已完成 hash/pid/path 阻断审计工件、network block 真实防火墙 rule group 执行/清理、保护面工件与完整性工件；`192.168.2.218` 已实测完成防火墙阻断与清理闭环 |
-| W07.1 | 真实 Windows 测试主机验证、兼容性矩阵与验收脚本 | todo | 不允许只跑本地单测；必须在可用 Windows 主机验证 | 仓库内有可复跑验证脚本，且文档记录实际使用主机、验证项与结果 |
+| W07.1 | 真实 Windows 测试主机验证、兼容性矩阵与验收脚本 | done | 不允许只跑本地单测；必须在可用 Windows 主机验证 | 已完成 `scripts/windows-runtime-verify.sh` / `scripts/windows-runtime-verify.ps1`，并在 `192.168.2.218` 实测通过；主机选择、兼容性矩阵与验收结果已记录在 `sensor-windows-validation-matrix.md` |
 | W08.1 | Windows 凭据存储、DPAPI/TPM 根信任与回滚锚点方案收口 | todo | 不允许继续只依赖 Linux TPM 分支；Windows 必须有独立的正式方案和代码接入面 | `aegis-core` 对 Windows 密钥保护与回滚锚点具备明确实现路径和状态输出 |
 
 ### 5.3 执行顺序与提交粒度
@@ -85,7 +86,7 @@ Windows 平台目标覆盖：
 7. `W05.2` `done`
 8. `W06.1` `done`
 9. `W06.2` `done`
-10. `W07.1`
+10. `W07.1` `done`
 11. `W08.1`
 
 ## 6. Windows 完成判定
@@ -102,6 +103,7 @@ Windows 平台目标覆盖：
 - Windows AMSI / ScriptBlock / ETW 健康面：`done`
 - Windows 真实挂起/终止/隔离/取证执行链：`done`
 - Windows 预防性阻断与保护面审计：`done`
+- Windows 真机验收、兼容性矩阵与验收脚本：`done`
 - Windows 真实系统级交付：`doing`
 
 因此，本文件中的平台状态应保持：
@@ -116,7 +118,8 @@ Windows 平台目标覆盖：
 - `W05.2 = done`
 - `W06.1 = done`
 - `W06.2 = done`
-- `W07.1-W08.1 = todo`，进入实施后逐项更新为 `doing/done`
+- `W07.1 = done`
+- `W08.1 = todo`
 
 ## 7. Windows 后续执行顺序
 
