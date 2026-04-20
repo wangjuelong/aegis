@@ -7,6 +7,8 @@
 - 本地输出：`target/windows-validation/192.168.2.218.json`
 - 实际验证时间：`2026-04-20 16:07:16 +08:00`
 - 实际验证 ID：`windows-runtime-20260420-160648`
+- W10 补充验证时间：`2026-04-20 16:46:03 +08:00`
+- W10 补充验证方式：远端构建 `AegisSensorKmod + AegisFileMonitor`，并执行文件/注册表真实链路脚本
 
 ## 2. 主机选择结果
 
@@ -43,6 +45,10 @@
 | `suspend_kill_response` | pass | 真实执行 `NtSuspendProcess + Stop-Process`，目标 `pid=6532` |
 | `quarantine_response` | pass | 真实移动文件到 `C:\ProgramData\Aegis\quarantine\windows-runtime-20260420-160648-quarantine-input.txt` |
 | `forensics_response` | pass | 真实生成 `C:\ProgramData\Aegis\forensics\windows-runtime-20260420-160648.zip` |
+| `file_minifilter_build_install` | pass | 真实构建并安装 `AegisFileMonitor`，通信端口 `\AegisFileMonitorPort` 可用 |
+| `file_minifilter_events` | pass | 真实捕获 `C:\ProgramData\Aegis\validation\w10-file-test\sample.txt` 的 `write/rename/delete` 事件 |
+| `registry_journal_status` | pass | `registry_callback_registered=true`，journal 容量 `256`，序列号持续推进 |
+| `registry_rollback_roundtrip` | pass | `\REGISTRY\MACHINE\SOFTWARE\AegisW10Test` 的 `SampleValue` 已完成 `before -> after -> rollback -> before` 闭环，`applied_count=1` |
 
 ## 5. 关键产物
 
@@ -50,9 +56,13 @@
 - 隔离产物：`C:\ProgramData\Aegis\quarantine\windows-runtime-20260420-160648-quarantine-input.txt`
 - 取证目录：`C:\ProgramData\Aegis\forensics\windows-runtime-20260420-160648`
 - 取证压缩包：`C:\ProgramData\Aegis\forensics\windows-runtime-20260420-160648.zip`
+- W10 远端构建根目录：`C:\ProgramData\Aegis\w10-build-20260420-163112`
+- W10 注册表回滚验证脚本：`C:\ProgramData\Aegis\w10-build-20260420-163112\registry-rollback-validate.ps1`
+- W10 关键结果：`{"restored_ok":true,"rollback_applied_count":1,"target_key_path":"\\REGISTRY\\MACHINE\\SOFTWARE\\AegisW10Test"}`
 
 ## 6. 结论
 
 - `scripts/windows-runtime-verify.sh` 已可从仓库直接复跑 Windows 真机验收。
 - `192.168.2.218` 已验证通过当前已完成的 Windows 运行时、驱动桥接、网络隔离、响应链、DPAPI 凭据保护与 TPM 观测链。
+- `W10` 已额外验证通过文件 Minifilter 和注册表 callback/rollback 真实链路，`WindowsPlatform` 不再把这两项能力固定为 `false`。
 - `security_4688` 的验收口径以“日志可读、record_id 可取”为准；`cmd.exe` 临时探针命中率被保留为观察项，不作为失败条件。

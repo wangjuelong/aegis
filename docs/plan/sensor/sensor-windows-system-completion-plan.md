@@ -8,6 +8,17 @@
 
 **Tech Stack:** Rust 用户态、Windows WDM/Minifilter/WFP 驱动工程、PowerShell/SSH 真机验收、MSBuild/Windows Kits/Signtool、MSI/INF/CAT 打包与签名校验。
 
+## 当前进度（2026-04-20）
+
+| 工作包 | 状态 | 结果 |
+|--------|------|------|
+| `W09` | `done` | 已完成驱动工程、安装链、协议握手与 `driver mode` 严格失败闭环 |
+| `W10` | `done` | 已完成 Minifilter 文件事件、注册表 journal/rollback 真实链路，以及 Rust 平台层接入 |
+| `W11` | `pending` | 保护面与内核完整性检查仍需继续实现 |
+| `W12` | `pending` | AMSI provider / memory signal 仍需继续实现 |
+| `W13` | `pending` | 安装、自检、watchdog、自举链仍需继续实现 |
+| `W14` | `pending` | 正式签名、兼容性矩阵与发布门禁仍需继续实现 |
+
 ---
 
 ## 1. 不妥协约束
@@ -30,6 +41,12 @@
 ## 3. 研发工作包
 
 ### W09: Windows 驱动工程、安装链与用户态桥接
+
+**状态**
+
+- 已完成，真机主机：`192.168.2.218`
+- 已验证驱动构建、安装、协议握手、卸载闭环
+- 参考提交：`3bc839c`、`7f5111e`
 
 **目标**
 
@@ -57,6 +74,13 @@
 - 修改：`scripts/windows-runtime-verify.ps1`
 
 ### W10: 文件与注册表系统采集链
+
+**状态**
+
+- 已完成，真机主机：`192.168.2.218`
+- 已验证 Minifilter 文件事件采集：`write/rename/delete`
+- 已验证注册表 journal 与回滚闭环：`before -> after -> rollback -> before`
+- 代码提交：`0677754`
 
 **目标**
 
