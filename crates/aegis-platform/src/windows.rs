@@ -11,7 +11,7 @@ use aegis_model::{
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::de::DeserializeOwned;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -369,6 +369,19 @@ struct WindowsFirewallIsolationReceipt {
     rule_group: String,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct WindowsProtectionSurfaceArtifact {
+    protected_paths: Vec<String>,
+    registry_protection_surface: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct WindowsRegistryRollbackArtifact {
+    selector: String,
+    protected_paths: Vec<String>,
+    registry_protection_surface: Vec<String>,
+}
+
 struct WindowsState {
     base_dir: PathBuf,
     pending_events: VecDeque<Vec<u8>>,
@@ -659,12 +672,11 @@ impl PlatformResponse for WindowsPlatform {
     }
 
     fn registry_rollback(&self, target: &RollbackTarget) -> Result<()> {
-        self.state
-            .lock()
-            .expect("windows state poisoned")
-            .execution
-            .rollback_targets
-            .push(target.clone());
+        let mut state = self.state.lock().expect("windows state poisoned");
+        state.execution.rollback_targets.push(target.clone());
+        let artifact_path = write_windows_registry_rollback_artifact(&mut state, target)
+            .with_context(|| "write windows registry rollback artifact")?;
+        state.execution.audit_artifacts.push(artifact_path);
         Ok(())
     }
 
@@ -816,12 +828,14 @@ impl PlatformProtection for WindowsPlatform {
     }
 
     fn protect_files(&self, paths: &[PathBuf]) -> Result<()> {
-        self.state
-            .lock()
-            .expect("windows state poisoned")
+        let mut state = self.state.lock().expect("windows state poisoned");
+        state
             .execution
             .protected_paths
             .extend(paths.iter().cloned());
+        let artifact_path = write_windows_protection_surface_artifact(&mut state)
+            .with_context(|| "write windows protection surface artifact")?;
+        state.execution.audit_artifacts.push(artifact_path);
         Ok(())
     }
 
@@ -1253,6 +1267,68 @@ fn write_windows_firewall_manifest(
     Ok(path)
 }
 
+const WINDOWS_REGISTRY_PROTECTION_SURFACE: [&str; 5] = [
+    r"HKLM\Software\Microsoft\Windows\CurrentVersion\Run",
+    r"HKLM\SYSTEM\CurrentControlSet\Services",
+    r"HKLM\Software\Microsoft\Windows NT\CurrentVersion\Image File Execution Options",
+    r"HKLM\Software\Classes\CLSID",
+    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+];
+
+fn write_windows_protection_surface_artifact(state: &mut WindowsState) -> Result<PathBuf> {
+    let artifact = WindowsProtectionSurfaceArtifact {
+        protected_paths: state
+            .execution
+            .protected_paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+        registry_protection_surface: WINDOWS_REGISTRY_PROTECTION_SURFACE
+            .iter()
+            .map(|path| (*path).to_string())
+            .collect(),
+    };
+    let path = state
+        .base_dir
+        .join("registry")
+        .join("protection-surface.json");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_vec_pretty(&artifact)?;
+    fs::write(&path, json)?;
+    Ok(path)
+}
+
+fn write_windows_registry_rollback_artifact(
+    state: &mut WindowsState,
+    target: &RollbackTarget,
+) -> Result<PathBuf> {
+    let artifact = WindowsRegistryRollbackArtifact {
+        selector: target.selector.clone(),
+        protected_paths: state
+            .execution
+            .protected_paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+        registry_protection_surface: WINDOWS_REGISTRY_PROTECTION_SURFACE
+            .iter()
+            .map(|path| (*path).to_string())
+            .collect(),
+    };
+    let path = state
+        .base_dir
+        .join("registry")
+        .join(format!("rollback-{}.json", Uuid::now_v7().simple()));
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_vec_pretty(&artifact)?;
+    fs::write(&path, json)?;
+    Ok(path)
+}
+
 fn build_windows_isolation_script(
     rule_group: &str,
     backup_path: &str,
@@ -1472,9 +1548,10 @@ mod tests {
     use crate::{
         KernelIntegrity, PlatformProtection, PlatformResponse, PlatformSensor, PreemptiveBlock,
     };
-    use aegis_model::{EventBuffer, ForensicSpec, IsolationRulesV2, SensorConfig};
+    use aegis_model::{EventBuffer, ForensicSpec, IsolationRulesV2, RollbackTarget, SensorConfig};
     use anyhow::{anyhow, bail, Result};
     use std::collections::VecDeque;
+    use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
     use std::time::Duration;
@@ -1763,6 +1840,11 @@ mod tests {
             })
             .expect("collect forensics should materialize bundle");
         platform
+            .registry_rollback(&RollbackTarget {
+                selector: r"HKLM\Software\Microsoft\Windows\CurrentVersion\Run".to_string(),
+            })
+            .expect("registry rollback should materialize audit artifact");
+        platform
             .network_isolate(&IsolationRulesV2 {
                 ttl: Duration::from_secs(300),
                 allowed_control_plane_ips: vec!["10.0.0.10".to_string()],
@@ -1790,6 +1872,38 @@ mod tests {
         assert_eq!(snapshot.forensic_artifacts.len(), 1);
         assert_eq!(snapshot.forensic_artifacts[0], bundle);
         assert!(snapshot.forensic_artifacts[0].location.exists());
+        assert_eq!(snapshot.rollback_targets.len(), 1);
+        assert_eq!(
+            snapshot.rollback_targets[0].selector,
+            r"HKLM\Software\Microsoft\Windows\CurrentVersion\Run"
+        );
+        assert_eq!(snapshot.audit_artifacts.len(), 2);
+        let protection_artifact = snapshot
+            .audit_artifacts
+            .iter()
+            .find(|path| {
+                path.file_name().and_then(|value| value.to_str()) == Some("protection-surface.json")
+            })
+            .expect("protection artifact should exist");
+        let rollback_artifact = snapshot
+            .audit_artifacts
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .map(|value| value.starts_with("rollback-"))
+                    .unwrap_or(false)
+            })
+            .expect("rollback artifact should exist");
+        assert!(protection_artifact.exists());
+        assert!(rollback_artifact.exists());
+        let protection_json =
+            fs::read_to_string(protection_artifact).expect("read protection artifact");
+        assert!(protection_json.contains("C:/temp/payload.exe"));
+        assert!(protection_json.contains("Image File Execution Options"));
+        let rollback_json = fs::read_to_string(rollback_artifact).expect("read rollback artifact");
+        assert!(rollback_json.contains(r"HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"));
+        assert!(rollback_json.contains("C:/temp/payload.exe"));
         assert!(!snapshot.network_isolation_active);
         assert_eq!(
             snapshot

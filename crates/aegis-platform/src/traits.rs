@@ -51,6 +51,7 @@ pub struct PlatformExecutionSnapshot {
     pub protected_paths: Vec<PathBuf>,
     pub quarantined_files: Vec<QuarantineReceipt>,
     pub forensic_artifacts: Vec<ArtifactBundle>,
+    pub audit_artifacts: Vec<PathBuf>,
     pub rollback_targets: Vec<RollbackTarget>,
     pub active_blocks: Vec<BlockLease>,
     pub network_isolation_active: bool,
