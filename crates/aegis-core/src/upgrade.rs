@@ -832,6 +832,36 @@ impl WindowsInstallManifest {
             }
         }
 
+        let mut dependency_names = HashMap::new();
+        for dependency in &self.release_dependencies {
+            if dependency.name.trim().is_empty() {
+                bail!("windows release dependency name is required");
+            }
+            if dependency_names
+                .insert(
+                    dependency.name.clone(),
+                    dependency.install_relative_path.clone(),
+                )
+                .is_some()
+            {
+                bail!("duplicate windows release dependency: {}", dependency.name);
+            }
+            if let Some(relative_path) = &dependency.install_relative_path {
+                if relative_path.as_os_str().is_empty() {
+                    bail!(
+                        "windows release dependency install_relative_path cannot be empty: {}",
+                        dependency.name
+                    );
+                }
+                if relative_path.is_absolute() || path_is_windows_absolute(relative_path) {
+                    bail!(
+                        "windows release dependency install_relative_path must be relative: {}",
+                        relative_path.display()
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -1487,6 +1517,67 @@ mod tests {
               "source_relative_path": "C:/payload/aegis-agentd.exe",
               "install_relative_path": "bin/aegis-agentd.exe",
               "required": true
+            }
+          ]
+        }
+        "#;
+
+        let error = WindowsInstallManifest::from_json_str(invalid).expect_err("reject absolute");
+        assert!(error.to_string().contains("must be relative"));
+    }
+
+    #[test]
+    fn windows_install_manifest_requires_relative_release_dependency_paths() {
+        let manifest = r#"
+        {
+          "schema_version": 1,
+          "bundle_channel": "release",
+          "install_root": "C:\\Program Files\\Aegis",
+          "state_root": "C:\\ProgramData\\Aegis\\state",
+          "driver_service_name": "AegisSensorKmod",
+          "components": [
+            {
+              "name": "agentd",
+              "kind": "binary",
+              "source_relative_path": "bin/aegis-agentd.exe",
+              "install_relative_path": "bin/aegis-agentd.exe",
+              "required": true
+            }
+          ],
+          "release_dependencies": [
+            {
+              "name": "trusted_bundle_receipt",
+              "required": true,
+              "install_relative_path": "metadata/signed-release.json"
+            }
+          ]
+        }
+        "#;
+
+        let parsed = WindowsInstallManifest::from_json_str(manifest).expect("parse manifest");
+        assert_eq!(parsed.release_dependencies.len(), 1);
+
+        let invalid = r#"
+        {
+          "schema_version": 1,
+          "bundle_channel": "release",
+          "install_root": "C:\\Program Files\\Aegis",
+          "state_root": "C:\\ProgramData\\Aegis\\state",
+          "driver_service_name": "AegisSensorKmod",
+          "components": [
+            {
+              "name": "agentd",
+              "kind": "binary",
+              "source_relative_path": "bin/aegis-agentd.exe",
+              "install_relative_path": "bin/aegis-agentd.exe",
+              "required": true
+            }
+          ],
+          "release_dependencies": [
+            {
+              "name": "trusted_bundle_receipt",
+              "required": true,
+              "install_relative_path": "C:/payload/metadata/signed-release.json"
             }
           ]
         }

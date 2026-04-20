@@ -2,7 +2,9 @@
 
 use crate::config::{AgentConfig, SecurityConfig};
 use anyhow::{bail, Context, Result};
+#[cfg(windows)]
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+#[cfg(windows)]
 use base64::Engine as _;
 use getrandom::fill as getrandom_fill;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};

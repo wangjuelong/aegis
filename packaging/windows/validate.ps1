@@ -1,6 +1,8 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$RepoRoot,
+    [ValidateSet("development", "release")]
+    [string]$BundleChannel = "development",
     [ValidateSet("Debug", "Release")]
     [string]$Configuration = "Release",
     [ValidateSet("x64")]
@@ -9,7 +11,12 @@ param(
     [string]$InstallRoot = "C:\Program Files\Aegis",
     [string]$StateRoot = "C:\ProgramData\Aegis\state",
     [string]$RustToolchain = "1.91.0",
-    [string]$ToolchainRoot
+    [string]$ToolchainRoot,
+    [string]$SigningCertificateThumbprint,
+    [string]$SigningCertificateStorePath = "Cert:\CurrentUser\My",
+    [string]$TimestampServer,
+    [string]$ElamApprovalPath,
+    [string]$WatchdogPplApprovalPath
 )
 
 Set-StrictMode -Version Latest
@@ -131,12 +138,19 @@ function Resolve-CargoBuildArguments {
 }
 
 $resolvedRepoRoot = Resolve-ExistingPath -Path $RepoRoot -Description "repo root"
-$manifestSource = Resolve-ExistingPath -Path (Join-Path $resolvedRepoRoot "packaging\windows\manifest.json") -Description "windows packaging manifest"
+$manifestTemplatePath = if ($BundleChannel -eq "release") {
+    Join-Path $resolvedRepoRoot "packaging\windows\manifest.release.json"
+} else {
+    Join-Path $resolvedRepoRoot "packaging\windows\manifest.json"
+}
+$manifestSource = Resolve-ExistingPath -Path $manifestTemplatePath -Description "windows packaging manifest"
 $installScriptPath = Resolve-ExistingPath -Path (Join-Path $resolvedRepoRoot "packaging\windows\install.ps1") -Description "windows install script"
 $uninstallScriptPath = Resolve-ExistingPath -Path (Join-Path $resolvedRepoRoot "packaging\windows\uninstall.ps1") -Description "windows uninstall script"
+$releaseVerifierScriptPath = Resolve-ExistingPath -Path (Join-Path $resolvedRepoRoot "packaging\windows\verify-release.ps1") -Description "windows release verifier"
 $driverBuildScriptPath = Resolve-ExistingPath -Path (Join-Path $resolvedRepoRoot "scripts\windows-build-driver.ps1") -Description "windows driver build script"
 $driverInstallScriptPath = Resolve-ExistingPath -Path (Join-Path $resolvedRepoRoot "scripts\windows-install-driver.ps1") -Description "windows driver install script"
 $driverUninstallScriptPath = Resolve-ExistingPath -Path (Join-Path $resolvedRepoRoot "scripts\windows-uninstall-driver.ps1") -Description "windows driver uninstall script"
+$releaseSignScriptPath = Resolve-ExistingPath -Path (Join-Path $resolvedRepoRoot "scripts\windows-sign-driver.ps1") -Description "windows release signing script"
 $driverSourceRoot = Resolve-ExistingPath -Path (Join-Path $resolvedRepoRoot "windows\driver") -Description "windows driver source"
 $vendoredCargoConfigPath = Join-Path $resolvedRepoRoot ".cargo\config.toml"
 $vendoredCargoRoot = Join-Path $resolvedRepoRoot "vendor"
@@ -151,6 +165,21 @@ if ($ToolchainRoot) {
     $rustcExecutable = Resolve-ExistingPath -Path (Join-Path $resolvedToolchainRoot "bin\rustc.exe") -Description "offline rustc executable"
     $rustdocExecutable = Resolve-ExistingPath -Path (Join-Path $resolvedToolchainRoot "bin\rustdoc.exe") -Description "offline rustdoc executable"
     $toolchainBinPath = Resolve-ExistingPath -Path (Join-Path $resolvedToolchainRoot "bin") -Description "offline toolchain bin directory"
+}
+
+if ($BundleChannel -eq "release") {
+    if ([string]::IsNullOrWhiteSpace($SigningCertificateThumbprint)) {
+        throw "release bundle validation requires SigningCertificateThumbprint"
+    }
+    if ([string]::IsNullOrWhiteSpace($TimestampServer)) {
+        throw "release bundle validation requires TimestampServer"
+    }
+    if ([string]::IsNullOrWhiteSpace($ElamApprovalPath)) {
+        throw "release bundle validation requires ElamApprovalPath"
+    }
+    if ([string]::IsNullOrWhiteSpace($WatchdogPplApprovalPath)) {
+        throw "release bundle validation requires WatchdogPplApprovalPath"
+    }
 }
 $cargoBuildArguments = Resolve-CargoBuildArguments -RequiredToolchain $RustToolchain -UseVendoredSources $useVendoredSources -RustcPath $rustcExecutable
 
@@ -225,6 +254,7 @@ if (Test-Path -LiteralPath $PayloadRoot) {
 Ensure-Directory -Path $PayloadRoot | Out-Null
 Ensure-Directory -Path (Join-Path $PayloadRoot "bin") | Out-Null
 Ensure-Directory -Path (Join-Path $PayloadRoot "scripts") | Out-Null
+Ensure-Directory -Path (Join-Path $PayloadRoot "metadata") | Out-Null
 
 Copy-Item -LiteralPath $manifestSource -Destination (Join-Path $PayloadRoot "manifest.json") -Force
 Copy-Item -LiteralPath (Join-Path $cargoTargetRoot "release\aegis-agentd.exe") -Destination (Join-Path $PayloadRoot "bin\aegis-agentd.exe") -Force
@@ -248,6 +278,32 @@ Invoke-External -FilePath "powershell" -Arguments @(
     "-Platform",
     $Platform
 )
+
+$releaseSignResult = $null
+$payloadReleaseVerification = $null
+if ($BundleChannel -eq "release") {
+    $releaseSignResult = & powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $releaseSignScriptPath `
+        -BundleRoot $PayloadRoot `
+        -ManifestPath (Join-Path $PayloadRoot "manifest.json") `
+        -CertificateThumbprint $SigningCertificateThumbprint `
+        -CertificateStorePath $SigningCertificateStorePath `
+        -TimestampServer $TimestampServer `
+        -ElamApprovalPath $ElamApprovalPath `
+        -WatchdogPplApprovalPath $WatchdogPplApprovalPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "windows release signing failed"
+    }
+    $releaseSignResult = $releaseSignResult | ConvertFrom-Json -ErrorAction Stop
+
+    $payloadReleaseVerification = & powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $releaseVerifierScriptPath `
+        -BundleRoot $PayloadRoot `
+        -ManifestPath (Join-Path $PayloadRoot "manifest.json") `
+        -ExpectedCertificateThumbprint $SigningCertificateThumbprint
+    if ($LASTEXITCODE -ne 0) {
+        throw "windows release verification failed before install"
+    }
+    $payloadReleaseVerification = $payloadReleaseVerification | ConvertFrom-Json -ErrorAction Stop
+}
 
 $installJson = & powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $installScriptPath `
     -PayloadRoot $PayloadRoot `
@@ -284,6 +340,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 [ordered]@{
+    bundle_channel = $BundleChannel
     validated_at = (Get-Date).ToString("o")
     repo_root = $resolvedRepoRoot
     payload_root = $PayloadRoot
@@ -292,6 +349,8 @@ if ($LASTEXITCODE -ne 0) {
     install_result_path = $installResultPath
     bootstrap_report_path = $bootstrapReportPath
     watchdog_snapshot_path = $watchdogSnapshotPath
+    release_sign_result = $releaseSignResult
+    payload_release_verification = $payloadReleaseVerification
     install_result = $installResult
     bootstrap_report = $bootstrapReport
     watchdog_snapshot = $watchdogSnapshot

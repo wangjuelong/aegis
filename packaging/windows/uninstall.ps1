@@ -76,16 +76,38 @@ foreach ($component in $components) {
     }
 }
 
+$dependencies = @($manifest.release_dependencies | Where-Object {
+    -not [string]::IsNullOrWhiteSpace([string]$_.install_relative_path)
+} | Sort-Object {
+    ([string]$_.install_relative_path).Length
+} -Descending)
+foreach ($dependency in $dependencies) {
+    $installedDependencyPath = Join-Path $InstallRoot $dependency.install_relative_path
+    if (Test-Path -LiteralPath $installedDependencyPath) {
+        Remove-Item -LiteralPath $installedDependencyPath -Force
+        $removedPaths.Add($installedDependencyPath) | Out-Null
+    }
+}
+
 $installedManifestPath = Join-Path $InstallRoot "manifest.json"
 if (Test-Path -LiteralPath $installedManifestPath) {
     Remove-Item -LiteralPath $installedManifestPath -Force
     $removedPaths.Add($installedManifestPath) | Out-Null
 }
 
+foreach ($scriptName in @("install.ps1", "uninstall.ps1", "verify-release.ps1")) {
+    $installedScriptPath = Join-Path $InstallRoot $scriptName
+    if (Test-Path -LiteralPath $installedScriptPath) {
+        Remove-Item -LiteralPath $installedScriptPath -Force
+        $removedPaths.Add($installedScriptPath) | Out-Null
+    }
+}
+
 foreach ($candidate in @(
     (Join-Path $InstallRoot "bin"),
     (Join-Path $InstallRoot "scripts"),
     (Join-Path $InstallRoot "driver"),
+    (Join-Path $InstallRoot "metadata"),
     $InstallRoot
 )) {
     if ((Test-Path -LiteralPath $candidate) -and

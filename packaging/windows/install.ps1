@@ -100,6 +100,29 @@ function Copy-BundleComponent {
     $destination
 }
 
+function Copy-RelativeArtifact {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceRoot,
+        [Parameter(Mandatory = $true)][string]$RelativePath,
+        [Parameter(Mandatory = $true)][string]$DestinationRoot,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    $source = Join-Path $SourceRoot $RelativePath
+    if (-not (Test-Path -LiteralPath $source)) {
+        throw "${Description} is missing: $source"
+    }
+
+    $destination = Join-Path $DestinationRoot $RelativePath
+    $destinationParent = Split-Path -Path $destination -Parent
+    if (-not [string]::IsNullOrWhiteSpace($destinationParent)) {
+        Ensure-Directory -Path $destinationParent | Out-Null
+    }
+
+    Copy-Item -LiteralPath $source -Destination $destination -Force
+    $destination
+}
+
 function Invoke-JsonCommand {
     param([Parameter(Mandatory = $true)][string[]]$Command)
 
@@ -138,6 +161,9 @@ if ([string]::IsNullOrWhiteSpace($StateRoot)) {
 $copiedPaths = New-Object System.Collections.Generic.List[string]
 $installReceiptPath = Join-Path $StateRoot "install-result.json"
 $driverInstalled = $false
+$payloadReleaseVerification = $null
+$installedReleaseVerification = $null
+$releaseVerifierScript = Join-Path $PSScriptRoot "verify-release.ps1"
 
 foreach ($component in @($manifest.components)) {
     $source = Join-Path $payloadRoot $component.source_relative_path
@@ -150,8 +176,40 @@ try {
     Ensure-Directory -Path $InstallRoot | Out-Null
     Ensure-Directory -Path $StateRoot | Out-Null
 
+    if ($manifest.bundle_channel -eq "release") {
+        $payloadReleaseVerification = Invoke-JsonCommand -Command @(
+            "powershell",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            $releaseVerifierScript,
+            "-BundleRoot",
+            $payloadRoot,
+            "-ManifestPath",
+            $resolvedManifestPath
+        )
+    }
+
     foreach ($component in @($manifest.components)) {
         $copiedPaths.Add((Copy-BundleComponent -Component $component -PayloadRoot $payloadRoot -InstallRoot $InstallRoot)) | Out-Null
+    }
+
+    foreach ($dependency in @($manifest.release_dependencies)) {
+        if ([string]::IsNullOrWhiteSpace([string]$dependency.install_relative_path)) {
+            continue
+        }
+        $payloadDependencyPath = Join-Path $payloadRoot $dependency.install_relative_path
+        if (Test-Path -LiteralPath $payloadDependencyPath) {
+            $copiedPaths.Add((Copy-RelativeArtifact `
+                    -SourceRoot $payloadRoot `
+                    -RelativePath ([string]$dependency.install_relative_path) `
+                    -DestinationRoot $InstallRoot `
+                    -Description "release dependency artifact")) | Out-Null
+        } elseif ([bool]$dependency.required) {
+            throw "required release dependency artifact is missing from payload: $payloadDependencyPath"
+        }
     }
 
     $installedManifestPath = Join-Path $InstallRoot "manifest.json"
@@ -163,12 +221,31 @@ try {
     $installedUninstallScriptPath = Join-Path $InstallRoot "uninstall.ps1"
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot "uninstall.ps1") -Destination $installedUninstallScriptPath -Force
     $copiedPaths.Add($installedUninstallScriptPath) | Out-Null
+    $installedReleaseVerifierScriptPath = Join-Path $InstallRoot "verify-release.ps1"
+    Copy-Item -LiteralPath $releaseVerifierScript -Destination $installedReleaseVerifierScriptPath -Force
+    $copiedPaths.Add($installedReleaseVerifierScriptPath) | Out-Null
 
     $agentPath = Get-InstalledComponentPath -Manifest $manifest -InstallRoot $InstallRoot -Name "agentd"
     $watchdogPath = Get-InstalledComponentPath -Manifest $manifest -InstallRoot $InstallRoot -Name "watchdog"
     $driverRoot = Get-InstalledComponentPath -Manifest $manifest -InstallRoot $InstallRoot -Name "driver_tree"
     $driverInstallScriptPath = Get-InstalledComponentPath -Manifest $manifest -InstallRoot $InstallRoot -Name "driver_install_script"
     $driverUninstallScriptPath = Get-InstalledComponentPath -Manifest $manifest -InstallRoot $InstallRoot -Name "driver_uninstall_script"
+
+    if ($manifest.bundle_channel -eq "release") {
+        $installedReleaseVerification = Invoke-JsonCommand -Command @(
+            "powershell",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            $installedReleaseVerifierScriptPath,
+            "-BundleRoot",
+            $InstallRoot,
+            "-ManifestPath",
+            $installedManifestPath
+        )
+    }
 
     $configResult = Invoke-JsonCommand -Command @(
         $agentPath,
@@ -226,6 +303,8 @@ try {
         manifest_path = $installedManifestPath
         install_result_path = $installReceiptPath
         copied_paths = @($copiedPaths)
+        payload_release_verification = $payloadReleaseVerification
+        installed_release_verification = $installedReleaseVerification
         config_result = $configResult
         driver_result = $driverResult
         bootstrap_report_path = (Join-Path $StateRoot "bootstrap-check.json")
@@ -249,6 +328,7 @@ catch {
             install_root = $InstallRoot
             state_root = $StateRoot
             manifest_path = $resolvedManifestPath
+            bundle_channel = $manifest.bundle_channel
             copied_paths = @($copiedPaths)
             driver_installed = $driverInstalled
             error = $failure.Exception.Message
