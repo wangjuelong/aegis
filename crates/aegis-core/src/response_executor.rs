@@ -195,7 +195,7 @@ fn now_unix_ns() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{ResponseActionKind, ResponseAuditLog, ResponseExecutor, TerminationRequest};
-    use aegis_platform::{MockAction, MockPlatform, WindowsPlatform};
+    use aegis_platform::{MockAction, MockPlatform};
     use std::fs;
     use std::path::{Path, PathBuf};
     use uuid::Uuid;
@@ -250,8 +250,8 @@ mod tests {
     }
 
     #[test]
-    fn response_executor_updates_windows_platform_snapshot() {
-        let platform = WindowsPlatform::default();
+    fn response_executor_drives_windows_actions_without_runtime_fallbacks() {
+        let platform = MockPlatform::windows();
         let audit = ResponseAuditLog::new(audit_path("windows-platform"));
         let executor = ResponseExecutor::new(&platform, audit);
 
@@ -266,10 +266,14 @@ mod tests {
             .quarantine_file(Path::new("C:/temp/runtime.dll"))
             .expect("quarantine runtime artifact");
 
-        let snapshot = platform.execution_snapshot();
-        assert_eq!(snapshot.suspended_pids, vec![7331]);
-        assert_eq!(snapshot.terminated_protected_pids, vec![7331]);
-        assert_eq!(snapshot.quarantined_files.len(), 1);
-        assert!(snapshot.quarantined_files[0].vault_path.exists());
+        let actions = platform.take_actions();
+        assert_eq!(
+            actions,
+            vec![
+                MockAction::SuspendProcess(7331),
+                MockAction::KillPplProcess(7331),
+                MockAction::QuarantineFile(PathBuf::from("C:/temp/runtime.dll")),
+            ]
+        );
     }
 }

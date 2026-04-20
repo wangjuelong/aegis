@@ -735,38 +735,52 @@ impl PlatformSensor for WindowsPlatform {
 
 impl PlatformResponse for WindowsPlatform {
     fn suspend_process(&self, pid: u32) -> Result<()> {
-        self.state
-            .lock()
-            .expect("windows state poisoned")
-            .execution
-            .suspended_pids
-            .push(pid);
+        let mut state = self.state.lock().expect("windows state poisoned");
+        ensure_windows_response_host(&state.host, "suspend windows process")?;
+        let script = build_windows_suspend_process_script(pid);
+        write_windows_response_script(&mut state, &format!("suspend-{pid}.ps1"), &script)?;
+        self.runner
+            .run_powershell(&script)
+            .with_context(|| format!("suspend windows process {pid}"))?;
+        state.execution.suspended_pids.push(pid);
         Ok(())
     }
 
     fn kill_process(&self, pid: u32) -> Result<()> {
-        self.state
-            .lock()
-            .expect("windows state poisoned")
-            .execution
-            .terminated_pids
-            .push(pid);
+        let mut state = self.state.lock().expect("windows state poisoned");
+        ensure_windows_response_host(&state.host, "kill windows process")?;
+        let script = build_windows_kill_process_script(pid, false);
+        write_windows_response_script(&mut state, &format!("kill-{pid}.ps1"), &script)?;
+        self.runner
+            .run_powershell(&script)
+            .with_context(|| format!("kill windows process {pid}"))?;
+        state.execution.terminated_pids.push(pid);
         Ok(())
     }
 
     fn kill_ppl_process(&self, pid: u32) -> Result<()> {
-        self.state
-            .lock()
-            .expect("windows state poisoned")
-            .execution
-            .terminated_protected_pids
-            .push(pid);
+        let mut state = self.state.lock().expect("windows state poisoned");
+        ensure_windows_response_host(&state.host, "kill protected windows process")?;
+        let script = build_windows_kill_process_script(pid, true);
+        write_windows_response_script(&mut state, &format!("kill-protected-{pid}.ps1"), &script)?;
+        self.runner
+            .run_powershell(&script)
+            .with_context(|| format!("kill protected windows process {pid}"))?;
+        state.execution.terminated_protected_pids.push(pid);
         Ok(())
     }
 
     fn quarantine_file(&self, path: &Path) -> Result<QuarantineReceipt> {
         let mut state = self.state.lock().expect("windows state poisoned");
-        let receipt = materialize_quarantine(&mut state, path, "windows-quarantine")?;
+        ensure_windows_response_host(&state.host, "quarantine windows file")?;
+        let script = build_windows_quarantine_script(path);
+        write_windows_response_script(
+            &mut state,
+            &format!("quarantine-{}.ps1", Uuid::now_v7().simple()),
+            &script,
+        )?;
+        let receipt: QuarantineReceipt = run_powershell_json(self.runner.as_ref(), &script)
+            .with_context(|| format!("quarantine windows file {}", path.display()))?;
         state.execution.quarantined_files.push(receipt.clone());
         Ok(receipt)
     }
@@ -809,7 +823,16 @@ impl PlatformResponse for WindowsPlatform {
 
     fn collect_forensics(&self, spec: &ForensicSpec) -> Result<ArtifactBundle> {
         let mut state = self.state.lock().expect("windows state poisoned");
-        let bundle = materialize_artifact(&mut state, spec, "zip", "windows-forensics")?;
+        ensure_windows_forensics_host(&state.host, spec)?;
+        let artifact_id = Uuid::now_v7();
+        let script = build_windows_forensics_script(spec, artifact_id);
+        write_windows_response_script(
+            &mut state,
+            &format!("forensics-{}.ps1", artifact_id.simple()),
+            &script,
+        )?;
+        let bundle: ArtifactBundle = run_powershell_json(self.runner.as_ref(), &script)
+            .with_context(|| format!("collect windows forensics {}", artifact_id))?;
         state.execution.forensic_artifacts.push(bundle.clone());
         Ok(bundle)
     }
@@ -1729,6 +1752,19 @@ fn write_windows_firewall_manifest(
     Ok(path)
 }
 
+fn write_windows_response_script(
+    state: &mut WindowsState,
+    file_name: &str,
+    script: &str,
+) -> Result<PathBuf> {
+    let path = state.base_dir.join("response").join(file_name);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, script)?;
+    Ok(path)
+}
+
 const WINDOWS_REGISTRY_PROTECTION_SURFACE: [&str; 5] = [
     r"HKLM\Software\Microsoft\Windows\CurrentVersion\Run",
     r"HKLM\SYSTEM\CurrentControlSet\Services",
@@ -1840,6 +1876,303 @@ fn build_windows_release_script(rule_group: &str, backup_path: &str) -> String {
 
 fn escape_windows_ps_string(value: &str) -> String {
     value.replace('\'', "''")
+}
+
+fn ensure_windows_response_host(host: &WindowsHostCapabilities, action: &str) -> Result<()> {
+    if !host.reachable {
+        bail!(
+            "{action} requires a reachable windows host: {}",
+            host.summary()
+        );
+    }
+    if !host.running_on_windows {
+        bail!("{action} requires a windows host: {}", host.summary());
+    }
+    if !host.is_admin {
+        bail!(
+            "{action} requires an administrative windows session: {}",
+            host.summary()
+        );
+    }
+    Ok(())
+}
+
+fn ensure_windows_forensics_host(
+    host: &WindowsHostCapabilities,
+    spec: &ForensicSpec,
+) -> Result<()> {
+    ensure_windows_response_host(host, "collect windows forensics")?;
+    if !host.has_process_inventory {
+        bail!(
+            "collect windows forensics requires process inventory capability: {}",
+            host.summary()
+        );
+    }
+    if spec.include_network && !host.has_net_connection {
+        bail!(
+            "collect windows forensics requires network inventory capability: {}",
+            host.summary()
+        );
+    }
+    if spec.include_registry && !host.has_registry_cli {
+        bail!(
+            "collect windows forensics requires registry cli capability: {}",
+            host.summary()
+        );
+    }
+    Ok(())
+}
+
+fn windows_ps_bool(value: bool) -> &'static str {
+    if value {
+        "$true"
+    } else {
+        "$false"
+    }
+}
+
+fn build_windows_suspend_process_script(pid: u32) -> String {
+    format!(
+        r#"
+$pid = [uint32]{pid}
+$process = Get-Process -Id $pid -ErrorAction Stop
+$nativeSource = @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class AegisProcessControl {{
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, uint processId);
+
+    [DllImport("ntdll.dll")]
+    public static extern uint NtSuspendProcess(IntPtr processHandle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr handle);
+}}
+"@
+Add-Type -TypeDefinition $nativeSource -ErrorAction Stop
+$PROCESS_SUSPEND_RESUME = [uint32]0x0800
+$PROCESS_QUERY_LIMITED_INFORMATION = [uint32]0x1000
+$access = [uint32]($PROCESS_SUSPEND_RESUME -bor $PROCESS_QUERY_LIMITED_INFORMATION)
+$handle = [AegisProcessControl]::OpenProcess($access, $false, $process.Id)
+if ($handle -eq [IntPtr]::Zero) {{
+    throw ("OpenProcess failed with Win32Error={{0}}" -f [Runtime.InteropServices.Marshal]::GetLastWin32Error())
+}}
+try {{
+    $status = [AegisProcessControl]::NtSuspendProcess($handle)
+    if ($status -ne 0) {{
+        throw ("NtSuspendProcess failed with NTSTATUS=0x{{0:X8}}" -f $status)
+    }}
+}} finally {{
+    [AegisProcessControl]::CloseHandle($handle) | Out-Null
+}}
+"#
+    )
+}
+
+fn build_windows_kill_process_script(pid: u32, protected_process: bool) -> String {
+    let process_kind = if protected_process {
+        "protected process"
+    } else {
+        "process"
+    };
+    format!(
+        r#"
+$pid = [uint32]{pid}
+if ((Get-Command Stop-Process -ErrorAction SilentlyContinue) -eq $null) {{
+    throw "Stop-Process is unavailable on this host"
+}}
+$process = Get-Process -Id $pid -ErrorAction Stop
+Stop-Process -Id $process.Id -Force -ErrorAction Stop
+Wait-Process -Id $pid -Timeout 5 -ErrorAction SilentlyContinue
+if (Get-Process -Id $pid -ErrorAction SilentlyContinue) {{
+    throw "{process_kind} $pid is still running after Stop-Process"
+}}
+"#
+    )
+}
+
+fn build_windows_quarantine_script(path: &Path) -> String {
+    let original = escape_windows_ps_string(&path.display().to_string());
+    let quarantine_id = Uuid::now_v7().simple().to_string();
+    format!(
+        r#"
+$originalPath = '{original}'
+$quarantineRoot = 'C:\ProgramData\Aegis\quarantine'
+$quarantineId = '{quarantine_id}'
+if (-not (Test-Path -LiteralPath $originalPath -PathType Leaf)) {{
+    throw "quarantine target is missing: $originalPath"
+}}
+New-Item -ItemType Directory -Force -Path $quarantineRoot | Out-Null
+$sha256 = (Get-FileHash -LiteralPath $originalPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+$fileName = [System.IO.Path]::GetFileName($originalPath)
+if ([string]::IsNullOrWhiteSpace($fileName)) {{
+    throw "quarantine target has no file name: $originalPath"
+}}
+$destination = Join-Path $quarantineRoot ($quarantineId + '-' + $fileName)
+Move-Item -LiteralPath $originalPath -Destination $destination -Force -ErrorAction Stop
+if (-not (Test-Path -LiteralPath $destination -PathType Leaf)) {{
+    throw "quarantine destination is missing: $destination"
+}}
+[ordered]@{{
+    vault_path = $destination
+    sha256 = $sha256
+}} | ConvertTo-Json -Compress
+"#
+    )
+}
+
+fn build_windows_forensics_script(spec: &ForensicSpec, artifact_id: Uuid) -> String {
+    let bundle_root = format!(r"C:\ProgramData\Aegis\forensics\{}", artifact_id.simple());
+    format!(
+        r#"
+$artifactId = '{artifact_id}'
+$bundleRoot = '{}'
+$bundleZip = $bundleRoot + '.zip'
+$includeMemory = {}
+$includeRegistry = {}
+$includeNetwork = {}
+if ((Get-Command Compress-Archive -ErrorAction SilentlyContinue) -eq $null) {{
+    throw "Compress-Archive is unavailable on this host"
+}}
+if (Test-Path -LiteralPath $bundleRoot) {{
+    Remove-Item -LiteralPath $bundleRoot -Recurse -Force
+}}
+if (Test-Path -LiteralPath $bundleZip) {{
+    Remove-Item -LiteralPath $bundleZip -Force
+}}
+New-Item -ItemType Directory -Force -Path $bundleRoot | Out-Null
+
+$processPath = Join-Path $bundleRoot 'processes.json'
+$processes = @(
+    Get-CimInstance Win32_Process -ErrorAction Stop |
+        Sort-Object ProcessId |
+        ForEach-Object {{
+            [ordered]@{{
+                process_id = [uint32]$_.ProcessId
+                parent_process_id = [uint32]$_.ParentProcessId
+                name = [string]$_.Name
+                executable_path = if ($_.ExecutablePath) {{ [string]$_.ExecutablePath }} else {{ $null }}
+                command_line = if ($_.CommandLine) {{ [string]$_.CommandLine }} else {{ $null }}
+            }}
+        }}
+)
+$processes | ConvertTo-Json -Depth 5 -Compress | Set-Content -LiteralPath $processPath -Encoding UTF8
+$collectedFiles = @('processes.json')
+
+if ($includeMemory) {{
+    $memoryPath = Join-Path $bundleRoot 'memory-summary.json'
+    $memoryRows = @(
+        Get-Process -ErrorAction Stop |
+            Sort-Object Id |
+            ForEach-Object {{
+                [ordered]@{{
+                    process_id = [uint32]$_.Id
+                    process_name = [string]$_.ProcessName
+                    working_set_bytes = [int64]$_.WorkingSet64
+                    private_memory_bytes = [int64]$_.PrivateMemorySize64
+                    virtual_memory_bytes = [int64]$_.VirtualMemorySize64
+                    paged_memory_bytes = [int64]$_.PagedMemorySize64
+                    cpu_seconds = if ($null -eq $_.CPU) {{ $null }} else {{ [double]$_.CPU }}
+                    path = if ($_.Path) {{ [string]$_.Path }} else {{ $null }}
+                }}
+            }}
+    )
+    $memoryRows | ConvertTo-Json -Depth 5 -Compress | Set-Content -LiteralPath $memoryPath -Encoding UTF8
+    $collectedFiles += 'memory-summary.json'
+}}
+
+if ($includeNetwork) {{
+    if ((Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) -eq $null) {{
+        throw "Get-NetTCPConnection is unavailable on this host"
+    }}
+    if ((Get-Command Get-NetUDPEndpoint -ErrorAction SilentlyContinue) -eq $null) {{
+        throw "Get-NetUDPEndpoint is unavailable on this host"
+    }}
+    $networkPath = Join-Path $bundleRoot 'network.json'
+    $network = [ordered]@{{
+        tcp = @(
+            Get-NetTCPConnection -ErrorAction Stop |
+                Sort-Object OwningProcess, LocalAddress, LocalPort, RemoteAddress, RemotePort, State |
+                ForEach-Object {{
+                    [ordered]@{{
+                        local_address = [string]$_.LocalAddress
+                        local_port = [uint16]$_.LocalPort
+                        remote_address = [string]$_.RemoteAddress
+                        remote_port = [uint16]$_.RemotePort
+                        state = [string]$_.State
+                        owning_process = if ($null -eq $_.OwningProcess) {{ $null }} else {{ [uint32]$_.OwningProcess }}
+                    }}
+                }}
+        )
+        udp = @(
+            Get-NetUDPEndpoint -ErrorAction Stop |
+                Sort-Object OwningProcess, LocalAddress, LocalPort |
+                ForEach-Object {{
+                    [ordered]@{{
+                        local_address = [string]$_.LocalAddress
+                        local_port = [uint16]$_.LocalPort
+                        owning_process = if ($null -eq $_.OwningProcess) {{ $null }} else {{ [uint32]$_.OwningProcess }}
+                    }}
+                }}
+        )
+    }}
+    $network | ConvertTo-Json -Depth 5 -Compress | Set-Content -LiteralPath $networkPath -Encoding UTF8
+    $collectedFiles += 'network.json'
+}}
+
+if ($includeRegistry) {{
+    if ((Get-Command reg.exe -ErrorAction SilentlyContinue) -eq $null) {{
+        throw "reg.exe is unavailable on this host"
+    }}
+    $registryDir = Join-Path $bundleRoot 'registry'
+    New-Item -ItemType Directory -Force -Path $registryDir | Out-Null
+    $runPath = Join-Path $registryDir 'current-version-run.reg'
+    & reg.exe export 'HKLM\Software\Microsoft\Windows\CurrentVersion\Run' $runPath /y | Out-Null
+    if ($LASTEXITCODE -ne 0) {{
+        throw "failed to export HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+    }}
+    $servicesPath = Join-Path $registryDir 'services.reg'
+    & reg.exe export 'HKLM\SYSTEM\CurrentControlSet\Services' $servicesPath /y | Out-Null
+    if ($LASTEXITCODE -ne 0) {{
+        throw "failed to export HKLM\\SYSTEM\\CurrentControlSet\\Services"
+    }}
+    $collectedFiles += 'registry/current-version-run.reg'
+    $collectedFiles += 'registry/services.reg'
+}}
+
+$manifestPath = Join-Path $bundleRoot 'manifest.json'
+[ordered]@{{
+    artifact_id = $artifactId
+    collected_at = (Get-Date).ToUniversalTime().ToString('o')
+    include_memory = $includeMemory
+    include_registry = $includeRegistry
+    include_network = $includeNetwork
+    files = $collectedFiles
+}} | ConvertTo-Json -Depth 5 -Compress | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+
+$archiveInputs = @(
+    Get-ChildItem -LiteralPath $bundleRoot -Force |
+        Select-Object -ExpandProperty FullName
+)
+if ($archiveInputs.Count -eq 0) {{
+    throw "forensics bundle is empty: $bundleRoot"
+}}
+Compress-Archive -LiteralPath $archiveInputs -DestinationPath $bundleZip -Force
+if (-not (Test-Path -LiteralPath $bundleZip -PathType Leaf)) {{
+    throw "forensics archive is missing: $bundleZip"
+}}
+[ordered]@{{
+    artifact_id = $artifactId
+    location = $bundleZip
+}} | ConvertTo-Json -Compress
+"#,
+        escape_windows_ps_string(&bundle_root),
+        windows_ps_bool(spec.include_memory),
+        windows_ps_bool(spec.include_registry),
+        windows_ps_bool(spec.include_network),
+    )
 }
 
 fn run_local_powershell(script: &str) -> Result<String> {
@@ -1972,53 +2305,6 @@ fn truncate_subject(value: &str) -> String {
 
 fn platform_root(prefix: &str) -> PathBuf {
     std::env::temp_dir().join(format!("aegis-{prefix}-{}", Uuid::now_v7().simple()))
-}
-
-fn materialize_quarantine(
-    state: &mut WindowsState,
-    original: &Path,
-    marker: &str,
-) -> Result<QuarantineReceipt> {
-    let file_name = original
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("artifact.bin");
-    let vault_path = state.base_dir.join("quarantine").join(file_name);
-    if let Some(parent) = vault_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&vault_path, format!("{marker}:{}", original.display()))?;
-    Ok(QuarantineReceipt {
-        vault_path,
-        sha256: format!("windows:{}", original.display()),
-    })
-}
-
-fn materialize_artifact(
-    state: &mut WindowsState,
-    spec: &ForensicSpec,
-    extension: &str,
-    marker: &str,
-) -> Result<ArtifactBundle> {
-    let artifact_id = Uuid::now_v7();
-    let location = state
-        .base_dir
-        .join("forensics")
-        .join(format!("{artifact_id}.{extension}"));
-    if let Some(parent) = location.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(
-        &location,
-        format!(
-            "{marker}|memory={}|registry={}|network={}",
-            spec.include_memory, spec.include_registry, spec.include_network
-        ),
-    )?;
-    Ok(ArtifactBundle {
-        artifact_id,
-        location,
-    })
 }
 
 fn push_block(
@@ -2311,6 +2597,29 @@ mod tests {
         )
     }
 
+    fn quarantine_receipt_output(vault_path: &Path, sha256: &str) -> String {
+        format!(
+            r#"{{"vault_path":"{}","sha256":"{}"}}"#,
+            vault_path
+                .display()
+                .to_string()
+                .replace('\\', "\\\\")
+                .replace('"', "\\\""),
+            sha256.replace('\\', "\\\\").replace('"', "\\\"")
+        )
+    }
+
+    fn artifact_bundle_output(artifact_id: uuid::Uuid, location: &Path) -> String {
+        format!(
+            r#"{{"artifact_id":"{artifact_id}","location":"{}"}}"#,
+            location
+                .display()
+                .to_string()
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+        )
+    }
+
     fn process_output(processes: &[(&str, u32, u32, Option<&str>)]) -> String {
         let rows = processes
             .iter()
@@ -2364,8 +2673,27 @@ mod tests {
     }
 
     fn platform_with_probe() -> WindowsPlatform {
+        let response_root = std::env::temp_dir().join(format!(
+            "aegis-windows-response-{}",
+            uuid::Uuid::now_v7().simple()
+        ));
+        let quarantine_path = response_root.join("quarantine").join("payload.exe");
+        if let Some(parent) = quarantine_path.parent() {
+            fs::create_dir_all(parent).expect("create quarantine fixture dir");
+        }
+        fs::write(&quarantine_path, b"payload").expect("write quarantine fixture");
+        let bundle_path = response_root.join("forensics").join("bundle.zip");
+        if let Some(parent) = bundle_path.parent() {
+            fs::create_dir_all(parent).expect("create forensics fixture dir");
+        }
+        fs::write(&bundle_path, b"forensics").expect("write forensics fixture");
+        let artifact_id = uuid::Uuid::now_v7();
         WindowsPlatform::with_runner_for_test(
             Box::new(QueuedWindowsRunner::new([
+                String::new(),
+                String::new(),
+                quarantine_receipt_output(&quarantine_path, "deadbeef"),
+                artifact_bundle_output(artifact_id, &bundle_path),
                 firewall_isolation_output(
                     r"C:\ProgramData\Aegis\firewall\backup.json",
                     "AegisIsolation-test",
@@ -2442,14 +2770,14 @@ mod tests {
             .expect("protect files should record");
         let receipt = platform
             .quarantine_file(Path::new("C:/temp/payload.exe"))
-            .expect("quarantine should materialize receipt");
+            .expect("quarantine should execute");
         let bundle = platform
             .collect_forensics(&ForensicSpec {
                 include_memory: true,
                 include_registry: true,
                 include_network: false,
             })
-            .expect("collect forensics should materialize bundle");
+            .expect("collect forensics should execute");
         platform
             .registry_rollback(&RollbackTarget {
                 selector: r"HKLM\Software\Microsoft\Windows\CurrentVersion\Run".to_string(),
