@@ -4,6 +4,10 @@ use crate::linux_tpm::{
     detect_linux_tpm_runtime, generate_attestation_quote, load_or_initialize_master_key_from_tpm,
     verify_attestation_quote,
 };
+use crate::windows_security::{
+    detect_windows_tpm_runtime, load_or_initialize_master_key_from_windows_dpapi,
+    windows_dpapi_provider_detail,
+};
 use aegis_model::Severity;
 use getrandom::fill as getrandom_fill;
 use hkdf::Hkdf;
@@ -104,6 +108,7 @@ pub struct DerivedKeyMaterial {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum KeyProtectionTier {
     HardwareBound,
+    WindowsDpapi,
     OsCredentialStore,
     FileBackedFallback,
     InMemoryTestOnly,
@@ -112,6 +117,7 @@ pub enum KeyProtectionTier {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct KeyProtectionStatus {
     pub active_tier: KeyProtectionTier,
+    pub provider_detail: Option<String>,
     pub hardware_root_available: bool,
     pub degraded: bool,
     pub memory_lock_supported: bool,
@@ -197,6 +203,7 @@ impl KeyDerivationService {
             root_secret,
             protection_status: KeyProtectionStatus {
                 active_tier: KeyProtectionTier::InMemoryTestOnly,
+                provider_detail: None,
                 hardware_root_available: false,
                 degraded: true,
                 memory_lock_supported: memory_lock.supported,
@@ -285,17 +292,56 @@ pub fn verify_linux_tpm_attestation_roundtrip(
 
 fn load_master_key(config: &AgentConfig) -> Result<(Vec<u8>, KeyProtectionStatus), CoreError> {
     let mut last_error = None;
-    let tpm_runtime = detect_linux_tpm_runtime(&config.security);
-    let (attestation_quote_ready, attestation_pcrs, attestation_error) =
-        linux_attestation_status(&tpm_runtime);
+    let linux_tpm_runtime = detect_linux_tpm_runtime(&config.security);
+    let windows_tpm_runtime = detect_windows_tpm_runtime(&config.security);
+    let hardware_root_available = linux_tpm_runtime.available() || windows_tpm_runtime.available();
+    let (attestation_quote_ready, attestation_pcrs, attestation_error) = if cfg!(windows) {
+        (false, None, None)
+    } else {
+        linux_attestation_status(&linux_tpm_runtime)
+    };
 
-    if tpm_runtime.master_key_enabled() {
+    if cfg!(windows) && config.security.use_os_credential_store {
+        if let Some(error) = windows_tpm_runtime.last_error() {
+            merge_status_error(&mut last_error, Some(error));
+        }
+
+        match load_or_initialize_master_key_from_windows_dpapi(config) {
+            Ok(key) => {
+                return Ok((
+                    key,
+                    KeyProtectionStatus {
+                        active_tier: KeyProtectionTier::WindowsDpapi,
+                        provider_detail: Some(windows_dpapi_provider_detail(&config.security)),
+                        hardware_root_available,
+                        degraded: !windows_tpm_runtime.available(),
+                        memory_lock_supported: false,
+                        memory_lock_enabled: false,
+                        attestation_quote_ready,
+                        attestation_pcrs,
+                        attestation_error,
+                        last_error: None,
+                    },
+                ));
+            }
+            Err(error) => merge_status_error(
+                &mut last_error,
+                Some(format!("windows dpapi master key unavailable: {error}")),
+            ),
+        }
+    }
+
+    if linux_tpm_runtime.master_key_enabled() {
         match load_or_initialize_master_key_from_tpm(&config.security) {
             Ok(key) => {
                 return Ok((
                     key,
                     KeyProtectionStatus {
                         active_tier: KeyProtectionTier::HardwareBound,
+                        provider_detail: Some(linux_master_key_provider_detail(
+                            config,
+                            &linux_tpm_runtime,
+                        )),
                         hardware_root_available: true,
                         degraded: false,
                         memory_lock_supported: false,
@@ -312,7 +358,7 @@ fn load_master_key(config: &AgentConfig) -> Result<(Vec<u8>, KeyProtectionStatus
                 Some(format!("linux tpm master key unavailable: {error}")),
             ),
         }
-    } else if tpm_runtime.master_key_configured() {
+    } else if linux_tpm_runtime.master_key_configured() {
         merge_status_error(
             &mut last_error,
             Some(
@@ -320,21 +366,22 @@ fn load_master_key(config: &AgentConfig) -> Result<(Vec<u8>, KeyProtectionStatus
                     .to_string(),
             ),
         );
-    } else if tpm_runtime.nv_available() || tpm_runtime.sealed_object_available() {
+    } else if linux_tpm_runtime.nv_available() || linux_tpm_runtime.sealed_object_available() {
         merge_status_error(
             &mut last_error,
             Some("linux tpm available but no master key provider is configured".to_string()),
         );
     }
 
-    if config.security.use_os_credential_store {
+    if !cfg!(windows) && config.security.use_os_credential_store {
         match load_master_key_from_keyring(config) {
             Ok(key) => {
                 return Ok((
                     key,
                     KeyProtectionStatus {
                         active_tier: KeyProtectionTier::OsCredentialStore,
-                        hardware_root_available: tpm_runtime.available(),
+                        provider_detail: Some(os_credential_store_provider_detail()),
+                        hardware_root_available,
                         degraded: true,
                         memory_lock_supported: false,
                         memory_lock_enabled: false,
@@ -359,7 +406,13 @@ fn load_master_key(config: &AgentConfig) -> Result<(Vec<u8>, KeyProtectionStatus
                     key,
                     KeyProtectionStatus {
                         active_tier: KeyProtectionTier::FileBackedFallback,
-                        hardware_root_available: tpm_runtime.available(),
+                        provider_detail: Some(
+                            secure_root(&config.storage.state_root)
+                                .join("master-key.bin")
+                                .display()
+                                .to_string(),
+                        ),
+                        hardware_root_available,
                         degraded: true,
                         memory_lock_supported: false,
                         memory_lock_enabled: false,
@@ -390,6 +443,37 @@ fn linux_attestation_status(
         tpm_runtime.attestation_pcrs.clone(),
         tpm_runtime.attestation_status_error(),
     )
+}
+
+fn linux_master_key_provider_detail(
+    config: &AgentConfig,
+    runtime: &crate::linux_tpm::LinuxTpmRuntime,
+) -> String {
+    if runtime.master_key_sealed_enabled() {
+        if let Some(path) = config
+            .security
+            .linux_tpm_master_key_sealed_object_path
+            .as_ref()
+        {
+            return format!("linux-tpm-sealed:{}", path.display());
+        }
+    }
+    if runtime.master_key_nv_enabled() {
+        if let Some(index) = config.security.linux_tpm_master_key_nv_index.as_ref() {
+            return format!("linux-tpm-nv:{index}");
+        }
+    }
+    "linux-tpm".to_string()
+}
+
+fn os_credential_store_provider_detail() -> String {
+    if cfg!(target_os = "macos") {
+        "keyring:keychain".to_string()
+    } else if cfg!(target_os = "windows") {
+        "keyring:windows-credential-manager".to_string()
+    } else {
+        "keyring:secret-service".to_string()
+    }
 }
 
 fn load_master_key_from_keyring(config: &AgentConfig) -> Result<Vec<u8>, CoreError> {

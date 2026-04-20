@@ -4,6 +4,9 @@ use crate::linux_tpm::{
     persist_rollback_floor_to_tpm,
 };
 use crate::transport_drivers::{build_transport_drivers, TransportAgentContext};
+use crate::windows_security::{
+    detect_windows_tpm_runtime, load_or_initialize_windows_dpapi_json, persist_windows_dpapi_json,
+};
 use aegis_model::{
     AgentHealth, ApproverEntry, ArtifactChunk, CommunicationChannelHealth,
     CommunicationChannelKind, CommunicationRuntimeStatus, DownlinkMessage, EventBatch,
@@ -614,6 +617,7 @@ enum CommandReplayLedgerBackend {
 pub enum RollbackProtectionAnchor {
     TpmNvCounter,
     TpmNvIndex,
+    WindowsDpapiCrossChecked,
     OsStoreCrossChecked,
     FileBackedCrossChecked,
     Ephemeral,
@@ -791,7 +795,78 @@ fn load_or_initialize_rollback_status(
         updated_at_ms: now_ms,
     };
     let tpm_runtime = detect_linux_tpm_runtime(security);
+    let windows_tpm_runtime = detect_windows_tpm_runtime(security);
     let mut last_error = None;
+
+    if cfg!(windows) && security.use_os_credential_store {
+        if let Some(error) = windows_tpm_runtime.last_error() {
+            append_status_error(&mut last_error, error);
+        }
+
+        match load_or_initialize_windows_dpapi_json(
+            path,
+            &default_record,
+            security,
+            "rollback-anchor",
+        ) {
+            Ok(dpapi_record) => {
+                let (mut sidecar_record, fs_cross_check_ms) =
+                    load_or_initialize_rollback_record_from_sidecar(path, &dpapi_record)?;
+                let floor_issued_at_ms = max_floor(
+                    dpapi_record.floor_issued_at_ms,
+                    sidecar_record.floor_issued_at_ms,
+                );
+                let cross_check_ok =
+                    dpapi_record.floor_issued_at_ms == sidecar_record.floor_issued_at_ms;
+                if !cross_check_ok {
+                    append_status_error(
+                        &mut last_error,
+                        "rollback anchor mismatch detected between windows dpapi and sidecar",
+                    );
+                    sidecar_record = RollbackAnchorRecord {
+                        floor_issued_at_ms,
+                        updated_at_ms: now_ms,
+                    };
+                    persist_windows_dpapi_json(path, &sidecar_record, security, "rollback-anchor")?;
+                    persist_rollback_record_to_sidecar(path, &sidecar_record)?;
+                }
+                return Ok(RollbackProtectionStatus {
+                    anchor_kind: RollbackProtectionAnchor::WindowsDpapiCrossChecked,
+                    floor_issued_at_ms,
+                    fs_cross_check_ms,
+                    cross_check_ok,
+                    degraded: !windows_tpm_runtime.available(),
+                    last_error,
+                });
+            }
+            Err(error) => {
+                append_status_error(
+                    &mut last_error,
+                    format!("windows dpapi rollback anchor unavailable: {error}"),
+                );
+                if security.allow_file_fallback {
+                    let (record, fs_cross_check_ms) =
+                        load_or_initialize_rollback_record_from_sidecar(path, &default_record)?;
+                    return Ok(RollbackProtectionStatus {
+                        anchor_kind: RollbackProtectionAnchor::FileBackedCrossChecked,
+                        floor_issued_at_ms: record.floor_issued_at_ms,
+                        fs_cross_check_ms,
+                        cross_check_ok: fs_cross_check_ms.is_some(),
+                        degraded: true,
+                        last_error,
+                    });
+                }
+                bail!(
+                    "{}",
+                    last_error.unwrap_or_else(|| {
+                        format!(
+                            "windows dpapi rollback anchor unavailable and file fallback disabled: {error}"
+                        )
+                    })
+                );
+            }
+        }
+    }
 
     if tpm_runtime.rollback_enabled() {
         match load_or_initialize_rollback_floor_from_tpm(security) {
@@ -822,7 +897,7 @@ fn load_or_initialize_rollback_status(
         );
     }
 
-    if security.use_os_credential_store {
+    if !cfg!(windows) && security.use_os_credential_store {
         match load_or_initialize_rollback_record_from_keyring(path, &default_record) {
             Ok(keyring_record) => {
                 let (mut sidecar_record, fs_cross_check_ms) =
@@ -914,6 +989,12 @@ fn advance_rollback_status(
             persist_rollback_floor_to_tpm(security, record.floor_issued_at_ms)?;
             status.fs_cross_check_ms = None;
             status.cross_check_ok = false;
+        }
+        RollbackProtectionAnchor::WindowsDpapiCrossChecked => {
+            persist_windows_dpapi_json(path, &record, security, "rollback-anchor")?;
+            persist_rollback_record_to_sidecar(path, &record)?;
+            status.fs_cross_check_ms = sidecar_mtime_ms(&rollback_anchor_sidecar_path(path));
+            status.cross_check_ok = true;
         }
         RollbackProtectionAnchor::OsStoreCrossChecked => {
             persist_rollback_record_to_keyring(path, &record)?;

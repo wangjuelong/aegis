@@ -32,4 +32,5 @@ pub mod temporal;
 pub mod transport_drivers;
 pub mod upgrade;
 pub mod wal;
+mod windows_security;
 pub mod yara;

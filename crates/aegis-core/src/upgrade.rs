@@ -467,6 +467,7 @@ pub struct DiagnoseWalStatus {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiagnoseKeyProtectionStatus {
     pub active_tier: KeyProtectionTier,
+    pub provider_detail: Option<String>,
     pub degraded: bool,
     pub hardware_root_available: bool,
     pub memory_lock_supported: bool,
@@ -486,6 +487,7 @@ impl Default for DiagnoseKeyProtectionStatus {
     fn default() -> Self {
         Self {
             active_tier: KeyProtectionTier::InMemoryTestOnly,
+            provider_detail: None,
             degraded: true,
             hardware_root_available: false,
             memory_lock_supported: cfg!(unix),
@@ -510,6 +512,7 @@ impl DiagnoseKeyProtectionStatus {
     ) -> Self {
         Self {
             active_tier: key_status.active_tier,
+            provider_detail: key_status.provider_detail.clone(),
             degraded: key_status.degraded
                 || rollback_status.degraded
                 || !rollback_status.cross_check_ok,

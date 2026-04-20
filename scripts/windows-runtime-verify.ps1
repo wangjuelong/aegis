@@ -108,6 +108,23 @@ function Suspend-ProcessWithNt {
     }
 }
 
+function Convert-HexStringToByteArray {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Hex
+    )
+
+    if (($Hex.Length % 2) -ne 0) {
+        throw "hex string length must be even"
+    }
+
+    $buffer = New-Object byte[] ($Hex.Length / 2)
+    for ($i = 0; $i -lt $buffer.Length; $i++) {
+        $buffer[$i] = [Convert]::ToByte($Hex.Substring($i * 2, 2), 16)
+    }
+    $buffer
+}
+
 Invoke-ValidationStep -Name "host_baseline" -Body {
     $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
     [ordered]@{
@@ -119,6 +136,73 @@ Invoke-ValidationStep -Name "host_baseline" -Body {
         build_number = [string]$os.BuildNumber
         architecture = [string]$os.OSArchitecture
         powershell_version = $PSVersionTable.PSVersion.ToString()
+    }
+}
+
+Invoke-ValidationStep -Name "tpm_surface" -Required $false -Body {
+    if ((Get-Command Get-Tpm -ErrorAction SilentlyContinue) -eq $null) {
+        throw "Get-Tpm is unavailable"
+    }
+
+    $tpm = Get-Tpm -ErrorAction Stop
+    [ordered]@{
+        tpm_present = [bool]$tpm.TpmPresent
+        tpm_ready = [bool]$tpm.TpmReady
+        managed_auth_level = [string]$tpm.ManagedAuthLevel
+        auto_provisioning = [string]$tpm.AutoProvisioning
+        manufacturer_id = [string]$tpm.ManufacturerIdTxt
+    }
+}
+
+Invoke-ValidationStep -Name "dpapi_roundtrip" -Body {
+    Add-Type -AssemblyName System.Security | Out-Null
+
+    $entropySource = Join-Path $PSHOME "powershell.exe"
+    if (-not (Test-Path -LiteralPath $entropySource)) {
+        throw "missing entropy source: $entropySource"
+    }
+
+    $entropyHash = Get-FileHash -LiteralPath $entropySource -Algorithm SHA256 -ErrorAction Stop
+    $entropyBytes = Convert-HexStringToByteArray -Hex $entropyHash.Hash
+    $plaintext = [System.Text.Encoding]::UTF8.GetBytes("aegis-windows-dpapi-validation::$validationId")
+
+    $machineCipher = [System.Security.Cryptography.ProtectedData]::Protect(
+        $plaintext,
+        $entropyBytes,
+        [System.Security.Cryptography.DataProtectionScope]::LocalMachine
+    )
+    $machinePlain = [System.Security.Cryptography.ProtectedData]::Unprotect(
+        $machineCipher,
+        $entropyBytes,
+        [System.Security.Cryptography.DataProtectionScope]::LocalMachine
+    )
+
+    $userCipher = [System.Security.Cryptography.ProtectedData]::Protect(
+        $plaintext,
+        $entropyBytes,
+        [System.Security.Cryptography.DataProtectionScope]::CurrentUser
+    )
+    $userPlain = [System.Security.Cryptography.ProtectedData]::Unprotect(
+        $userCipher,
+        $entropyBytes,
+        [System.Security.Cryptography.DataProtectionScope]::CurrentUser
+    )
+
+    $plaintextBase64 = [Convert]::ToBase64String($plaintext)
+    if ([Convert]::ToBase64String($machinePlain) -ne $plaintextBase64) {
+        throw "machine-scope DPAPI roundtrip mismatch"
+    }
+    if ([Convert]::ToBase64String($userPlain) -ne $plaintextBase64) {
+        throw "user-scope DPAPI roundtrip mismatch"
+    }
+
+    [ordered]@{
+        entropy_source = $entropySource
+        entropy_sha256 = $entropyHash.Hash.ToLowerInvariant()
+        machine_scope_roundtrip = $true
+        machine_ciphertext_length = $machineCipher.Length
+        user_scope_roundtrip = $true
+        user_ciphertext_length = $userCipher.Length
     }
 }
 

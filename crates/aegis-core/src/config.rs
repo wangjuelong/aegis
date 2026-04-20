@@ -163,6 +163,10 @@ pub struct SecurityConfig {
     pub allow_file_fallback: bool,
     pub memory_lock_best_effort: bool,
     #[serde(default)]
+    pub windows_tpm_required: bool,
+    #[serde(default = "default_true")]
+    pub windows_dpapi_machine_scope: bool,
+    #[serde(default)]
     pub linux_tpm_tools_dir: Option<PathBuf>,
     #[serde(default)]
     pub linux_tpm_device_path: Option<PathBuf>,
@@ -188,6 +192,8 @@ impl Default for SecurityConfig {
             use_os_credential_store: true,
             allow_file_fallback: true,
             memory_lock_best_effort: true,
+            windows_tpm_required: false,
+            windows_dpapi_machine_scope: true,
             linux_tpm_tools_dir: None,
             linux_tpm_device_path: None,
             linux_tpm_master_key_sealed_object_path: None,
@@ -199,6 +205,10 @@ impl Default for SecurityConfig {
             linux_tpm_auto_provision_nv: false,
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -334,6 +344,8 @@ mod tests {
         assert_eq!(restored.storage.agent_db_path, config.storage.agent_db_path);
         assert!(!restored.communication.development_allow_loopback);
         assert!(restored.security.use_os_credential_store);
+        assert!(!restored.security.windows_tpm_required);
+        assert!(restored.security.windows_dpapi_machine_scope);
         assert!(restored.security.linux_tpm_tools_dir.is_none());
         assert!(restored.security.linux_tpm_device_path.is_none());
         assert!(restored

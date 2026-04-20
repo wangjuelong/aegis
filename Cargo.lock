@@ -72,6 +72,7 @@ dependencies = [
  "uuid",
  "wasmtime",
  "wat",
+ "windows-sys 0.59.0",
  "zeroize",
 ]
 
