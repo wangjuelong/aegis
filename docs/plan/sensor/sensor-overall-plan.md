@@ -39,7 +39,7 @@
 
 - 跨平台公共研发包已完成，仓库内主链路已经闭合。
 - Linux 在当前测试机可闭合的运行时、eBPF 资产链、TPM key protection、sealed object、quote/checkquote、PCR policy session 已完成。
-- Windows 当前完成的是平台代码骨架、provider 注册、事件注入、能力矩阵与测试基线；当前正在按 Windows 专项计划把运行时改造成真实主机能力探测、真实事件链路与真实响应执行。
+- Windows 当前完成的是平台代码骨架、provider 注册、事件注入、能力矩阵与测试基线；其中真实主机能力探测链已完成，当前正在继续补齐真实事件链路与真实响应执行。
 - macOS 当前完成的是平台代码骨架、授权状态机、provider 基线、订阅集与测试基线，真实 ESF / Network Extension / System Extension 交付尚未完成。
 
 ## 5. 跨平台公共研发计划与状态
@@ -102,7 +102,7 @@
 | 编号 | 剩余事项 | 状态 | 说明 |
 |------|----------|------|------|
 | O01 | Linux 更高阶 remote attestation / verifier 分离信任链 | todo | 当前仅完成单机 TPM attestation 基线，远端证明链未入仓 |
-| O02 | Windows 真实运行时、事件链路、响应链与系统级交付 | doing | 已进入 `sensor-windows-plan.md` 详细工作包实施，当前仍未收口 |
+| O02 | Windows 真实运行时、事件链路、响应链与系统级交付 | doing | `W03.1` 已完成，真实进程/网络/响应链与系统级交付仍未收口 |
 | O03 | Windows 正式硬件根信任、签名与兼容性验证 | todo | 当前未完成正式硬件 trust chain、驱动签发与发布验证 |
 | O04 | macOS ESF / Network Extension / System Extension 真实系统级交付 | todo | 当前仅完成 macOS 平台骨架与测试基线 |
 | O05 | macOS notarization、授权流与正式硬件根信任 | todo | 当前未完成签名、公证、用户批准与 Secure Enclave/Keychain 正式接入 |
