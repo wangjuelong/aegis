@@ -176,6 +176,8 @@ struct WindowsHostCapabilities {
     has_net_connection: bool,
     has_firewall: bool,
     has_registry_cli: bool,
+    has_amsi_runtime: bool,
+    has_script_block_logging: bool,
     has_named_pipe_inventory: bool,
     has_module_inventory: bool,
     has_vss_inventory: bool,
@@ -206,7 +208,9 @@ impl WindowsHostCapabilities {
             WindowsProviderKind::MinifilterFile => false,
             WindowsProviderKind::WfpNetwork => self.has_net_connection,
             WindowsProviderKind::RegistryCallback => false,
-            WindowsProviderKind::AmsiScript => false,
+            WindowsProviderKind::AmsiScript => {
+                self.has_amsi_runtime && self.has_script_block_logging
+            }
             WindowsProviderKind::MemorySensor => false,
             WindowsProviderKind::IpcSensor => self.has_named_pipe_inventory,
             WindowsProviderKind::ModuleLoadSensor => self.has_module_inventory,
@@ -237,6 +241,11 @@ impl WindowsHostCapabilities {
             "process_creation_audit={}",
             self.has_process_creation_events
         ));
+        facts.push(format!("amsi_runtime={}", self.has_amsi_runtime));
+        facts.push(format!(
+            "script_block_logging={}",
+            self.has_script_block_logging
+        ));
         facts.join(", ")
     }
 }
@@ -258,6 +267,8 @@ struct WindowsCapabilityProbe {
     has_net_connection: bool,
     has_firewall: bool,
     has_registry_cli: bool,
+    has_amsi_runtime: bool,
+    has_script_block_logging: bool,
     has_named_pipe_inventory: bool,
     has_module_inventory: bool,
     has_vss_inventory: bool,
@@ -612,6 +623,8 @@ impl WindowsPlatform {
                     "platform_protection".to_string(),
                     protection_report(&host),
                 ),
+                ("etw_ingest".to_string(), etw_report(&host)),
+                ("amsi_script".to_string(), amsi_report(&host)),
             ]),
         }
     }
@@ -963,13 +976,20 @@ impl PlatformProtection for WindowsPlatform {
         Ok(EtwStatus {
             healthy: host.reachable
                 && host.running_on_windows
-                && host.any_event_log()
+                && host.has_security_log
+                && host.has_powershell_log
                 && host.has_process_creation_events,
         })
     }
 
     fn check_amsi_integrity(&self) -> Result<AmsiStatus> {
-        Ok(AmsiStatus { healthy: false })
+        let host = self.host_capabilities();
+        Ok(AmsiStatus {
+            healthy: host.reachable
+                && host.running_on_windows
+                && host.has_amsi_runtime
+                && host.has_script_block_logging,
+        })
     }
 
     fn check_bpf_integrity(&self) -> Result<BpfStatus> {
@@ -1020,6 +1040,22 @@ try {
     $hasProcessCreationEvents = (Get-WinEvent -FilterHashtable @{ LogName='Security'; Id=4688 } -MaxEvents 1 -ErrorAction Stop | Select-Object -First 1) -ne $null
 } catch {
     $hasProcessCreationEvents = $false
+}
+
+$hasAmsiRuntime = $false
+try {
+    $amsiDll = Join-Path $env:WINDIR 'System32\amsi.dll'
+    $hasAmsiRuntime = (Test-Path -LiteralPath $amsiDll) -and ($null -ne [Ref].Assembly.GetType('System.Management.Automation.AmsiUtils'))
+} catch {
+    $hasAmsiRuntime = $false
+}
+
+$hasScriptBlockLogging = $false
+try {
+    $policy = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging' -Name 'EnableScriptBlockLogging' -ErrorAction Stop
+    $hasScriptBlockLogging = [int]$policy.EnableScriptBlockLogging -eq 1
+} catch {
+    $hasScriptBlockLogging = $false
 }
 
 $hasNamedPipeInventory = $false
@@ -1077,6 +1113,8 @@ $data = [ordered]@{
     has_net_connection = (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) -ne $null
     has_firewall = ((Get-Command Get-NetFirewallRule -ErrorAction SilentlyContinue) -ne $null) -and ((Get-Command netsh.exe -ErrorAction SilentlyContinue) -ne $null)
     has_registry_cli = (Get-Command reg.exe -ErrorAction SilentlyContinue) -ne $null
+    has_amsi_runtime = $hasAmsiRuntime
+    has_script_block_logging = $hasScriptBlockLogging
     has_named_pipe_inventory = $hasNamedPipeInventory
     has_module_inventory = $hasModuleInventory
     has_vss_inventory = $hasVssInventory
@@ -1104,6 +1142,8 @@ $data | ConvertTo-Json -Compress
         has_net_connection: probe.has_net_connection,
         has_firewall: probe.has_firewall,
         has_registry_cli: probe.has_registry_cli,
+        has_amsi_runtime: probe.has_amsi_runtime,
+        has_script_block_logging: probe.has_script_block_logging,
         has_named_pipe_inventory: probe.has_named_pipe_inventory,
         has_module_inventory: probe.has_module_inventory,
         has_vss_inventory: probe.has_vss_inventory,
@@ -1887,6 +1927,39 @@ fn protection_report(host: &WindowsHostCapabilities) -> IntegrityReport {
     }
 }
 
+fn etw_report(host: &WindowsHostCapabilities) -> IntegrityReport {
+    let passed = host.reachable
+        && host.running_on_windows
+        && host.has_security_log
+        && host.has_powershell_log
+        && host.has_process_creation_events;
+    let details = if !host.reachable {
+        host.summary()
+    } else {
+        format!(
+            "security_log={};powershell_operational_log={};process_creation_audit={}",
+            host.has_security_log, host.has_powershell_log, host.has_process_creation_events
+        )
+    };
+    IntegrityReport { passed, details }
+}
+
+fn amsi_report(host: &WindowsHostCapabilities) -> IntegrityReport {
+    let passed = host.reachable
+        && host.running_on_windows
+        && host.has_amsi_runtime
+        && host.has_script_block_logging;
+    let details = if !host.reachable {
+        host.summary()
+    } else {
+        format!(
+            "amsi_runtime={};script_block_logging={};powershell_operational_log={}",
+            host.has_amsi_runtime, host.has_script_block_logging, host.has_powershell_log
+        )
+    };
+    IntegrityReport { passed, details }
+}
+
 fn truncate_subject(value: &str) -> String {
     const LIMIT: usize = 256;
     if value.chars().count() <= LIMIT {
@@ -2034,6 +2107,8 @@ mod tests {
             has_net_connection: true,
             has_firewall: true,
             has_registry_cli: true,
+            has_amsi_runtime: false,
+            has_script_block_logging: false,
             has_named_pipe_inventory: false,
             has_module_inventory: false,
             has_vss_inventory: false,
@@ -2052,16 +2127,40 @@ mod tests {
         has_vss_inventory: bool,
         has_device_inventory: bool,
     ) -> String {
+        probe_output_with_surface(
+            false,
+            false,
+            has_named_pipe_inventory,
+            has_module_inventory,
+            has_vss_inventory,
+            has_device_inventory,
+        )
+    }
+
+    fn probe_output_with_surface(
+        has_amsi_runtime: bool,
+        has_script_block_logging: bool,
+        has_named_pipe_inventory: bool,
+        has_module_inventory: bool,
+        has_vss_inventory: bool,
+        has_device_inventory: bool,
+    ) -> String {
         format!(
             concat!(
                 r#"{{"computer_name":"DESKTOP-TLASHJG","user_name":"desktop-tlashjg\\lamba","is_admin":true,"#,
                 r#""has_process_inventory":true,"has_security_log":true,"has_powershell_log":true,"#,
                 r#""has_wmi_log":true,"has_task_scheduler_log":true,"has_sysmon_log":false,"#,
                 r#""has_process_creation_events":true,"has_net_connection":true,"has_firewall":true,"#,
-                r#""has_registry_cli":true,"has_named_pipe_inventory":{},"has_module_inventory":{},"#,
-                r#""has_vss_inventory":{},"has_device_inventory":{}}}"#
+                r#""has_registry_cli":true,"has_amsi_runtime":{},"has_script_block_logging":{},"#,
+                r#""has_named_pipe_inventory":{},"has_module_inventory":{},"has_vss_inventory":{},"#,
+                r#""has_device_inventory":{}}}"#
             ),
-            has_named_pipe_inventory, has_module_inventory, has_vss_inventory, has_device_inventory
+            has_amsi_runtime,
+            has_script_block_logging,
+            has_named_pipe_inventory,
+            has_module_inventory,
+            has_vss_inventory,
+            has_device_inventory
         )
     }
 
@@ -2463,6 +2562,20 @@ mod tests {
                 .map(|report| report.passed),
             Some(false)
         );
+        assert_eq!(
+            snapshot
+                .integrity_reports
+                .get("etw_ingest")
+                .map(|report| report.passed),
+            Some(true)
+        );
+        assert_eq!(
+            snapshot
+                .integrity_reports
+                .get("amsi_script")
+                .map(|report| report.passed),
+            Some(false)
+        );
         assert!(
             platform
                 .check_etw_integrity()
@@ -2484,6 +2597,58 @@ mod tests {
                 .check_ssdt_integrity()
                 .expect("ssdt integrity")
                 .passed
+        );
+    }
+
+    #[test]
+    fn windows_amsi_health_reflects_runtime_and_script_block_state() {
+        let mut platform = WindowsPlatform::new_with_runner(
+            Box::new(QueuedWindowsRunner::new([
+                probe_output_with_surface(true, true, false, false, false, false),
+                process_output(&[("System", 4, 0, None)]),
+                audit_cursor_output(150),
+                network_output(&[]),
+            ])),
+            false,
+        );
+        platform
+            .start(&SensorConfig {
+                profile: "windows".to_string(),
+                queue_capacity: 1024,
+            })
+            .expect("start windows runtime");
+
+        let snapshot = platform.health_snapshot();
+
+        assert_eq!(
+            snapshot.provider_health.get("AmsiScript").copied(),
+            Some(true)
+        );
+        assert_eq!(
+            snapshot
+                .integrity_reports
+                .get("amsi_script")
+                .map(|report| report.passed),
+            Some(true)
+        );
+        assert_eq!(
+            snapshot
+                .integrity_reports
+                .get("etw_ingest")
+                .map(|report| report.passed),
+            Some(true)
+        );
+        assert!(
+            platform
+                .check_amsi_integrity()
+                .expect("amsi integrity")
+                .healthy
+        );
+        assert!(
+            platform
+                .check_etw_integrity()
+                .expect("etw integrity")
+                .healthy
         );
     }
 
