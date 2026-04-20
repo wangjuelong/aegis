@@ -39,7 +39,7 @@
 
 - 跨平台公共研发包已完成，仓库内主链路已经闭合。
 - Linux 在当前测试机可闭合的运行时、eBPF 资产链、TPM key protection、sealed object、quote/checkquote、PCR policy session 已完成。
-- Windows 当前完成的是平台代码骨架、provider 注册、事件注入、能力矩阵与测试基线；其中真实主机能力探测链、真实进程差分、隐藏进程检测、Security 4688 进程审计事件链、真实网络基线/防火墙隔离执行链、注册表回滚/保护审计工件、真实挂起/终止/隔离/取证执行链、预防性阻断/保护面审计工件以及真机验收脚本/兼容性矩阵已完成，当前只剩正式硬件信任链收口。
+- Windows 当前已完成平台代码骨架、provider 注册、事件注入、能力矩阵与测试基线，以及真实主机能力探测链、真实进程差分、隐藏进程检测、Security 4688 进程审计事件链、真实网络基线/防火墙隔离执行链、注册表回滚/保护审计工件、真实挂起/终止/隔离/取证执行链、预防性阻断/保护面审计工件、真机验收脚本/兼容性矩阵，以及 Windows 专用 DPAPI/TPM 根信任与回滚锚点方案。
 - macOS 当前完成的是平台代码骨架、授权状态机、provider 基线、订阅集与测试基线，真实 ESF / Network Extension / System Extension 交付尚未完成。
 
 ## 5. 跨平台公共研发计划与状态
@@ -102,7 +102,7 @@
 | 编号 | 剩余事项 | 状态 | 说明 |
 |------|----------|------|------|
 | O01 | Linux 更高阶 remote attestation / verifier 分离信任链 | todo | 当前仅完成单机 TPM attestation 基线，远端证明链未入仓 |
-| O02 | Windows 真实运行时、事件链路、响应链与系统级交付 | doing | `W03.1-W07.1` 已完成，仅剩 `W08.1` 的正式硬件信任链未收口 |
+| O02 | Windows 真实运行时、事件链路、响应链与系统级交付 | done | `W03.1-W08.1` 已全部完成，真实运行时、响应链和 Windows 凭据保护方案已闭环 |
 | O03 | Windows 正式硬件根信任、签名与兼容性验证 | todo | 当前未完成正式硬件 trust chain、驱动签发与发布验证 |
 | O04 | macOS ESF / Network Extension / System Extension 真实系统级交付 | todo | 当前仅完成 macOS 平台骨架与测试基线 |
 | O05 | macOS notarization、授权流与正式硬件根信任 | todo | 当前未完成签名、公证、用户批准与 Secure Enclave/Keychain 正式接入 |
