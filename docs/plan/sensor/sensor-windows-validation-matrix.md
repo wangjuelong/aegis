@@ -9,6 +9,8 @@
 - 实际验证 ID：`windows-runtime-20260420-160648`
 - W10 补充验证时间：`2026-04-20 16:46:03 +08:00`
 - W10 补充验证方式：远端构建 `AegisSensorKmod + AegisFileMonitor`，并执行文件/注册表真实链路脚本
+- W11 补充验证时间：`2026-04-20 17:32:50 +08:00`
+- W11 补充验证方式：远端重构建并安装 `AegisSensorKmod + AegisFileMonitor`，执行进程保护、文件保护与完整性回执脚本
 
 ## 2. 主机选择结果
 
@@ -49,6 +51,11 @@
 | `file_minifilter_events` | pass | 真实捕获 `C:\ProgramData\Aegis\validation\w10-file-test\sample.txt` 的 `write/rename/delete` 事件 |
 | `registry_journal_status` | pass | `registry_callback_registered=true`，journal 容量 `256`，序列号持续推进 |
 | `registry_rollback_roundtrip` | pass | `\REGISTRY\MACHINE\SOFTWARE\AegisW10Test` 的 `SampleValue` 已完成 `before -> after -> rollback -> before` 闭环，`applied_count=1` |
+| `driver_ob_process_build_install` | pass | 控制驱动以 `/INTEGRITYCHECK` 重构建并成功加载；`ob_callback_registered=true` |
+| `process_protection_roundtrip` | pass | 受保护 `powershell.exe(pid=11492)` 执行 `Stop-Process -Force` 返回 `Access is denied`，目标进程仍存活 |
+| `file_protection_roundtrip` | pass | `C:\ProgramData\Aegis\validation\w11-protection-test\protected-dir` 下文件 `write/rename/delete` 全部返回“访问被拒绝” |
+| `file_protection_block_events` | pass | Minifilter 队列捕获到 `3` 条 `block-create` 事件，路径命中 `w11-block-event-test\\protected-dir\\sample.txt` |
+| `driver_integrity_roundtrip` | pass | `ssdt/callback/kernel_code inspection=true`；主机处于 `code_integrity_testsign=true`，因此 `kernel_code_suspicious=true` 为测试签名环境告警，不是静态占位 |
 
 ## 5. 关键产物
 
@@ -59,10 +66,15 @@
 - W10 远端构建根目录：`C:\ProgramData\Aegis\w10-build-20260420-163112`
 - W10 注册表回滚验证脚本：`C:\ProgramData\Aegis\w10-build-20260420-163112\registry-rollback-validate.ps1`
 - W10 关键结果：`{"restored_ok":true,"rollback_applied_count":1,"target_key_path":"\\REGISTRY\\MACHINE\\SOFTWARE\\AegisW10Test"}`
+- W11 远端构建根目录：`C:\ProgramData\Aegis\w11-build-20260420-171956`
+- W11 文件保护验证目录：`C:\ProgramData\Aegis\validation\w11-protection-test\protected-dir`
+- W11 阻断事件验证目录：`C:\ProgramData\Aegis\validation\w11-block-event-test\protected-dir`
+- W11 关键结果：`{"ob_callback_registered":true,"stop_process_blocked":true,"file_write_blocked":true,"file_rename_blocked":true,"file_delete_blocked":true,"ssdt_inspection_succeeded":true,"callback_inspection_succeeded":true,"kernel_code_inspection_succeeded":true,"code_integrity_testsign":true}`
 
 ## 6. 结论
 
 - `scripts/windows-runtime-verify.sh` 已可从仓库直接复跑 Windows 真机验收。
 - `192.168.2.218` 已验证通过当前已完成的 Windows 运行时、驱动桥接、网络隔离、响应链、DPAPI 凭据保护与 TPM 观测链。
 - `W10` 已额外验证通过文件 Minifilter 和注册表 callback/rollback 真实链路，`WindowsPlatform` 不再把这两项能力固定为 `false`。
+- `W11` 已额外验证通过 `ObRegisterCallbacks` 进程保护、Minifilter 路径保护与驱动完整性查询；`WindowsPlatform` 不再把 `ObProcess`/`verify_integrity` 维持在审计占位状态。
 - `security_4688` 的验收口径以“日志可读、record_id 可取”为准；`cmd.exe` 临时探针命中率被保留为观察项，不作为失败条件。

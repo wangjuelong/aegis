@@ -14,7 +14,7 @@
 |--------|------|------|
 | `W09` | `done` | 已完成驱动工程、安装链、协议握手与 `driver mode` 严格失败闭环 |
 | `W10` | `done` | 已完成 Minifilter 文件事件、注册表 journal/rollback 真实链路，以及 Rust 平台层接入 |
-| `W11` | `pending` | 保护面与内核完整性检查仍需继续实现 |
+| `W11` | `done` | 已完成 `ObRegisterCallbacks` 进程保护、Minifilter 文件保护与真实完整性回执，真机验证通过 |
 | `W12` | `pending` | AMSI provider / memory signal 仍需继续实现 |
 | `W13` | `pending` | 安装、自检、watchdog、自举链仍需继续实现 |
 | `W14` | `pending` | 正式签名、兼容性矩阵与发布门禁仍需继续实现 |
@@ -31,9 +31,8 @@
 
 ## 2. 当前缺口
 
-- 缺少入仓的 Windows 驱动工程、安装清单、控制面协议与版本协商。
-- 缺少真实文件监控、注册表 journal/回滚、脚本执行阻断、内存信号采集。
-- 缺少真实的进程/文件/注册表保护和回调表、内核代码、ETW 篡改完整性检查。
+- 缺少脚本执行阻断进一步产品化接入与内存信号采集闭环。
+- 缺少安装、自举、自检、watchdog 与失败回滚链。
 - 缺少正式 MSI/驱动打包、驱动签名、ELAM 依赖校验、支持矩阵验收。
 - 测试机 `192.168.2.218` 可用；`192.168.1.4` 当前不可达，不能作为主验收机。
 - 当前仓库没有可用的正式代码签名证书或 `pfx/cer` 资产；正式签名链必须依赖外部凭据注入。
@@ -108,6 +107,13 @@
 
 ### W11: 进程/文件/注册表保护与内核完整性
 
+**状态**
+
+- 已完成，真机主机：`192.168.2.218`
+- 已验证 `ObRegisterCallbacks` 进程保护、Minifilter 路径保护与驱动完整性回执
+- 已验证 `Stop-Process` 被拒绝、受保护目录 `write/rename/delete` 被拒绝，且 Minifilter 记录 `block-create` 阻断事件
+- 代码提交：`1651733`
+
 **目标**
 
 - 用 `ObRegisterCallbacks`、Minifilter、注册表回调实现真实保护面。
@@ -129,8 +135,13 @@
 **关键文件**
 
 - 修改：`crates/aegis-platform/src/windows.rs`
-- 新增：`windows/driver/src/protection_*`
-- 新增：`windows/driver/src/integrity_*`
+- 新增：`scripts/windows-configure-file-protection.ps1`
+- 新增：`scripts/windows-protect-process.ps1`
+- 新增：`scripts/windows-query-driver-integrity.ps1`
+- 修改：`scripts/windows-install-driver.ps1`
+- 修改：`windows/driver/AegisSensorKmod.vcxproj`
+- 修改：`windows/driver/src/aegis_sensor_kmod.c`
+- 修改：`windows/minifilter/src/aegis_file_minifilter.c`
 
 ### W12: 脚本/AMSI/内存信号闭环
 
