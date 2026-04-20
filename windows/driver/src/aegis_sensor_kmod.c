@@ -8,6 +8,85 @@ DRIVER_UNLOAD AegisDriverUnload;
 DRIVER_DISPATCH AegisDriverCreateClose;
 DRIVER_DISPATCH AegisDriverDeviceControl;
 EX_CALLBACK_FUNCTION AegisRegistryCallback;
+OB_PREOP_CALLBACK_STATUS AegisProcessPreOperation(
+    _In_ PVOID registration_context,
+    _In_ POB_PRE_OPERATION_INFORMATION operation_information
+);
+
+#ifndef SystemCodeIntegrityInformation
+#define SystemCodeIntegrityInformation 103UL
+#endif
+
+#ifndef PROCESS_TERMINATE
+#define PROCESS_TERMINATE 0x0001UL
+#endif
+
+#ifndef PROCESS_CREATE_THREAD
+#define PROCESS_CREATE_THREAD 0x0002UL
+#endif
+
+#ifndef PROCESS_SET_SESSIONID
+#define PROCESS_SET_SESSIONID 0x0004UL
+#endif
+
+#ifndef PROCESS_VM_OPERATION
+#define PROCESS_VM_OPERATION 0x0008UL
+#endif
+
+#ifndef PROCESS_VM_READ
+#define PROCESS_VM_READ 0x0010UL
+#endif
+
+#ifndef PROCESS_VM_WRITE
+#define PROCESS_VM_WRITE 0x0020UL
+#endif
+
+#ifndef PROCESS_DUP_HANDLE
+#define PROCESS_DUP_HANDLE 0x0040UL
+#endif
+
+#ifndef PROCESS_CREATE_PROCESS
+#define PROCESS_CREATE_PROCESS 0x0080UL
+#endif
+
+#ifndef PROCESS_SET_QUOTA
+#define PROCESS_SET_QUOTA 0x0100UL
+#endif
+
+#ifndef PROCESS_SET_INFORMATION
+#define PROCESS_SET_INFORMATION 0x0200UL
+#endif
+
+#ifndef PROCESS_SUSPEND_RESUME
+#define PROCESS_SUSPEND_RESUME 0x0800UL
+#endif
+
+#ifndef PROCESS_SET_LIMITED_INFORMATION
+#define PROCESS_SET_LIMITED_INFORMATION 0x2000UL
+#endif
+
+typedef struct _SYSTEM_CODEINTEGRITY_INFORMATION {
+    ULONG Length;
+    ULONG CodeIntegrityOptions;
+} SYSTEM_CODEINTEGRITY_INFORMATION, *PSYSTEM_CODEINTEGRITY_INFORMATION;
+
+NTSYSAPI
+PVOID
+NTAPI
+RtlPcToFileHeader(
+    _In_ PVOID pc_value,
+    _Outptr_ PVOID* base_of_image
+);
+
+NTSYSAPI
+NTSTATUS
+NTAPI
+ZwQuerySystemInformation(
+    _In_ ULONG system_information_class,
+    _Out_writes_bytes_to_opt_(system_information_length, *return_length) PVOID system_information,
+    _In_ ULONG system_information_length,
+    _Out_opt_ PULONG return_length
+);
 
 typedef struct _AEGIS_REGISTRY_VALUE_CAPTURE {
     ULONG ValueType;
@@ -24,6 +103,11 @@ static ULONG gRegistryJournalCount = 0;
 static ULONG gRegistryNextSequence = 1;
 static LARGE_INTEGER gRegistryCallbackCookie;
 static BOOLEAN gRegistryCallbackRegistered = FALSE;
+static KSPIN_LOCK gProtectedProcessLock;
+static ULONG gProtectedProcessIds[AEGIS_PROCESS_PROTECTION_CAPACITY];
+static ULONG gProtectedProcessCount = 0;
+static PVOID gObRegistrationHandle = NULL;
+static BOOLEAN gObCallbackRegistered = FALSE;
 
 static VOID AegisCaptureBytes(
     _Out_writes_bytes_(destination_capacity) PUCHAR destination,
@@ -59,6 +143,32 @@ static VOID AegisJournalPush(
     _In_ const AEGIS_REGISTRY_EVENT_RECORD* record
 );
 
+static BOOLEAN AegisIsProtectedProcessId(
+    _In_ ULONG process_id
+);
+
+static ULONG AegisProtectedProcessCount(VOID);
+
+static NTSTATUS AegisProtectProcessId(
+    _In_ ULONG process_id
+);
+
+static ACCESS_MASK AegisStripProtectedProcessAccess(
+    _In_ ACCESS_MASK desired_access
+);
+
+static VOID AegisPopulateIntegrityResponse(
+    _Out_ PAEGIS_DRIVER_INTEGRITY_RESPONSE response
+);
+
+static BOOLEAN AegisInspectKernelRoutines(
+    _Out_ PBOOLEAN suspicious
+);
+
+static BOOLEAN AegisQueryCodeIntegrityOptions(
+    _Out_ PULONG code_integrity_options
+);
+
 static ULONG AegisJournalOldestSequenceUnlocked(VOID) {
     if (gRegistryJournalCount == 0) {
         return 0;
@@ -73,6 +183,177 @@ static ULONG AegisJournalCurrentSequenceUnlocked(VOID) {
     }
 
     return gRegistryNextSequence - 1;
+}
+
+static BOOLEAN AegisIsProtectedProcessId(
+    _In_ ULONG process_id
+) {
+    KIRQL previous_irql;
+    ULONG index;
+    BOOLEAN found = FALSE;
+
+    KeAcquireSpinLock(&gProtectedProcessLock, &previous_irql);
+    for (index = 0; index < gProtectedProcessCount; index++) {
+        if (gProtectedProcessIds[index] == process_id) {
+            found = TRUE;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&gProtectedProcessLock, previous_irql);
+    return found;
+}
+
+static ULONG AegisProtectedProcessCount(VOID) {
+    KIRQL previous_irql;
+    ULONG count;
+
+    KeAcquireSpinLock(&gProtectedProcessLock, &previous_irql);
+    count = gProtectedProcessCount;
+    KeReleaseSpinLock(&gProtectedProcessLock, previous_irql);
+    return count;
+}
+
+static NTSTATUS AegisProtectProcessId(
+    _In_ ULONG process_id
+) {
+    KIRQL previous_irql;
+    ULONG index;
+    NTSTATUS status = STATUS_SUCCESS;
+
+    if (process_id == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    KeAcquireSpinLock(&gProtectedProcessLock, &previous_irql);
+    for (index = 0; index < gProtectedProcessCount; index++) {
+        if (gProtectedProcessIds[index] == process_id) {
+            KeReleaseSpinLock(&gProtectedProcessLock, previous_irql);
+            return STATUS_SUCCESS;
+        }
+    }
+
+    if (gProtectedProcessCount >= AEGIS_PROCESS_PROTECTION_CAPACITY) {
+        status = STATUS_INSUFFICIENT_RESOURCES;
+    } else {
+        gProtectedProcessIds[gProtectedProcessCount] = process_id;
+        gProtectedProcessCount += 1;
+    }
+    KeReleaseSpinLock(&gProtectedProcessLock, previous_irql);
+
+    return status;
+}
+
+static ACCESS_MASK AegisStripProtectedProcessAccess(
+    _In_ ACCESS_MASK desired_access
+) {
+    const ACCESS_MASK disallowed =
+        PROCESS_TERMINATE |
+        PROCESS_CREATE_THREAD |
+        PROCESS_SET_SESSIONID |
+        PROCESS_VM_OPERATION |
+        PROCESS_VM_READ |
+        PROCESS_VM_WRITE |
+        PROCESS_DUP_HANDLE |
+        PROCESS_CREATE_PROCESS |
+        PROCESS_SET_QUOTA |
+        PROCESS_SET_INFORMATION |
+        PROCESS_SUSPEND_RESUME |
+        PROCESS_SET_LIMITED_INFORMATION |
+        DELETE |
+        WRITE_DAC |
+        WRITE_OWNER;
+
+    return desired_access & ~disallowed;
+}
+
+static BOOLEAN AegisInspectKernelRoutines(
+    _Out_ PBOOLEAN suspicious
+) {
+    static const PCWSTR routine_names[AEGIS_INTEGRITY_ROUTINE_COUNT] = {
+        L"ZwClose",
+        L"ZwOpenProcess",
+        L"ZwTerminateProcess",
+        L"ZwQueryInformationProcess"
+    };
+    UNICODE_STRING routine_name;
+    PVOID expected_image_base = NULL;
+    ULONG index;
+
+    *suspicious = FALSE;
+
+    for (index = 0; index < AEGIS_INTEGRITY_ROUTINE_COUNT; index++) {
+        PVOID routine_address = NULL;
+        PVOID image_base = NULL;
+
+        RtlInitUnicodeString(&routine_name, routine_names[index]);
+        routine_address = MmGetSystemRoutineAddress(&routine_name);
+        if (routine_address == NULL) {
+            return FALSE;
+        }
+
+        if (RtlPcToFileHeader(routine_address, &image_base) == NULL || image_base == NULL) {
+            return FALSE;
+        }
+
+        if (expected_image_base == NULL) {
+            expected_image_base = image_base;
+        } else if (image_base != expected_image_base) {
+            *suspicious = TRUE;
+        }
+    }
+
+    return TRUE;
+}
+
+static BOOLEAN AegisQueryCodeIntegrityOptions(
+    _Out_ PULONG code_integrity_options
+) {
+    SYSTEM_CODEINTEGRITY_INFORMATION code_integrity;
+    NTSTATUS status;
+
+    RtlZeroMemory(&code_integrity, sizeof(code_integrity));
+    code_integrity.Length = sizeof(code_integrity);
+    status = ZwQuerySystemInformation(
+        SystemCodeIntegrityInformation,
+        &code_integrity,
+        sizeof(code_integrity),
+        NULL
+    );
+    if (!NT_SUCCESS(status)) {
+        *code_integrity_options = 0;
+        return FALSE;
+    }
+
+    *code_integrity_options = code_integrity.CodeIntegrityOptions;
+    return TRUE;
+}
+
+static VOID AegisPopulateIntegrityResponse(
+    _Out_ PAEGIS_DRIVER_INTEGRITY_RESPONSE response
+) {
+    BOOLEAN ssdt_suspicious = FALSE;
+    ULONG code_integrity_options = 0;
+
+    RtlZeroMemory(response, sizeof(*response));
+    response->ProtocolVersion = AEGIS_DRIVER_PROTOCOL_VERSION;
+    response->ObCallbackRegistered = gObCallbackRegistered ? 1UL : 0UL;
+    response->ProtectedProcessCount = AegisProtectedProcessCount();
+    response->SsdtInspectionSucceeded =
+        AegisInspectKernelRoutines(&ssdt_suspicious) ? 1UL : 0UL;
+    response->SsdtSuspicious = ssdt_suspicious ? 1UL : 0UL;
+    response->CallbackInspectionSucceeded = 1UL;
+    response->CallbackSuspicious =
+        (gRegistryCallbackRegistered && gObCallbackRegistered) ? 0UL : 1UL;
+    response->KernelCodeInspectionSucceeded =
+        AegisQueryCodeIntegrityOptions(&code_integrity_options) ? 1UL : 0UL;
+    response->CodeIntegrityOptions = code_integrity_options;
+    response->KernelCodeSuspicious =
+        (response->KernelCodeInspectionSucceeded == 0) ||
+        ((code_integrity_options & AEGIS_INTEGRITY_CODEINTEGRITY_OPTION_ENABLED) == 0 &&
+         (code_integrity_options & AEGIS_INTEGRITY_CODEINTEGRITY_OPTION_HVCI_KMCI_ENABLED) == 0) ||
+        ((code_integrity_options & AEGIS_INTEGRITY_CODEINTEGRITY_OPTION_TESTSIGN) != 0)
+            ? 1UL
+            : 0UL;
 }
 
 static VOID AegisCompleteRequest(
@@ -413,6 +694,52 @@ NTSTATUS AegisRegistryCallback(PVOID callback_context, PVOID argument1, PVOID ar
 }
 
 _Use_decl_annotations_
+OB_PREOP_CALLBACK_STATUS AegisProcessPreOperation(
+    PVOID registration_context,
+    POB_PRE_OPERATION_INFORMATION operation_information
+) {
+    ACCESS_MASK* desired_access = NULL;
+    ACCESS_MASK stripped_access;
+    ULONG protected_pid;
+    ULONG current_pid;
+
+    UNREFERENCED_PARAMETER(registration_context);
+
+    if (operation_information == NULL || operation_information->Object == NULL) {
+        return OB_PREOP_SUCCESS;
+    }
+    if (operation_information->KernelHandle) {
+        return OB_PREOP_SUCCESS;
+    }
+    if (operation_information->ObjectType != *PsProcessType) {
+        return OB_PREOP_SUCCESS;
+    }
+
+    protected_pid = HandleToULong(PsGetProcessId((PEPROCESS)operation_information->Object));
+    current_pid = HandleToULong(PsGetCurrentProcessId());
+    if (protected_pid == 0 || protected_pid == current_pid) {
+        return OB_PREOP_SUCCESS;
+    }
+    if (!AegisIsProtectedProcessId(protected_pid)) {
+        return OB_PREOP_SUCCESS;
+    }
+
+    if (operation_information->Operation == OB_OPERATION_HANDLE_CREATE) {
+        desired_access =
+            &operation_information->Parameters->CreateHandleInformation.DesiredAccess;
+    } else if (operation_information->Operation == OB_OPERATION_HANDLE_DUPLICATE) {
+        desired_access =
+            &operation_information->Parameters->DuplicateHandleInformation.DesiredAccess;
+    } else {
+        return OB_PREOP_SUCCESS;
+    }
+
+    stripped_access = AegisStripProtectedProcessAccess(*desired_access);
+    *desired_access = stripped_access;
+    return OB_PREOP_SUCCESS;
+}
+
+_Use_decl_annotations_
 NTSTATUS AegisDriverCreateClose(PDEVICE_OBJECT device_object, PIRP irp) {
     UNREFERENCED_PARAMETER(device_object);
     AegisCompleteRequest(irp, STATUS_SUCCESS, 0);
@@ -459,6 +786,8 @@ NTSTATUS AegisDriverDeviceControl(PDEVICE_OBJECT device_object, PIRP irp) {
             response->OldestSequence = AegisJournalOldestSequenceUnlocked();
             response->CurrentSequence = AegisJournalCurrentSequenceUnlocked();
             ExReleaseFastMutex(&gRegistryJournalLock);
+            response->ObCallbackRegistered = gObCallbackRegistered ? 1UL : 0UL;
+            response->ProtectedProcessCount = AegisProtectedProcessCount();
             status = STATUS_SUCCESS;
             information = sizeof(*response);
         }
@@ -619,6 +948,42 @@ NTSTATUS AegisDriverDeviceControl(PDEVICE_OBJECT device_object, PIRP irp) {
                 }
             }
         }
+    } else if (stack->Parameters.DeviceIoControl.IoControlCode == AEGIS_IOCTL_PROTECT_PROCESS) {
+        PAEGIS_PROCESS_PROTECT_REQUEST request =
+            (PAEGIS_PROCESS_PROTECT_REQUEST)irp->AssociatedIrp.SystemBuffer;
+        PAEGIS_PROCESS_PROTECT_RESPONSE response =
+            (PAEGIS_PROCESS_PROTECT_RESPONSE)irp->AssociatedIrp.SystemBuffer;
+
+        if (request == NULL || response == NULL) {
+            status = STATUS_INVALID_USER_BUFFER;
+        } else if (stack->Parameters.DeviceIoControl.InputBufferLength < sizeof(*request) ||
+                   stack->Parameters.DeviceIoControl.OutputBufferLength < sizeof(*response)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+        } else if (request->ProtocolVersion != AEGIS_DRIVER_PROTOCOL_VERSION) {
+            status = STATUS_REVISION_MISMATCH;
+        } else {
+            status = AegisProtectProcessId(request->ProcessId);
+            if (NT_SUCCESS(status)) {
+                RtlZeroMemory(response, sizeof(*response));
+                response->ProtocolVersion = AEGIS_DRIVER_PROTOCOL_VERSION;
+                response->ObCallbackRegistered = gObCallbackRegistered ? 1UL : 0UL;
+                response->ProtectedProcessCount = AegisProtectedProcessCount();
+                information = sizeof(*response);
+            }
+        }
+    } else if (stack->Parameters.DeviceIoControl.IoControlCode == AEGIS_IOCTL_QUERY_INTEGRITY) {
+        PAEGIS_DRIVER_INTEGRITY_RESPONSE response =
+            (PAEGIS_DRIVER_INTEGRITY_RESPONSE)irp->AssociatedIrp.SystemBuffer;
+
+        if (response == NULL) {
+            status = STATUS_INVALID_USER_BUFFER;
+        } else if (stack->Parameters.DeviceIoControl.OutputBufferLength < sizeof(*response)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+        } else {
+            AegisPopulateIntegrityResponse(response);
+            status = STATUS_SUCCESS;
+            information = sizeof(*response);
+        }
     }
 
     AegisCompleteRequest(irp, status, information);
@@ -629,6 +994,11 @@ _Use_decl_annotations_
 VOID AegisDriverUnload(PDRIVER_OBJECT driver_object) {
     UNICODE_STRING dos_device_name;
 
+    if (gObRegistrationHandle != NULL) {
+        ObUnRegisterCallbacks(gObRegistrationHandle);
+        gObRegistrationHandle = NULL;
+        gObCallbackRegistered = FALSE;
+    }
     if (gRegistryCallbackRegistered) {
         CmUnRegisterCallback(gRegistryCallbackCookie);
         gRegistryCallbackRegistered = FALSE;
@@ -648,16 +1018,22 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver_object, PUNICODE_STRING registry_path
     UNICODE_STRING nt_device_name;
     UNICODE_STRING dos_device_name;
     UNICODE_STRING altitude;
+    UNICODE_STRING ob_altitude;
     PDEVICE_OBJECT device_object = NULL;
+    OB_OPERATION_REGISTRATION operation_registration;
+    OB_CALLBACK_REGISTRATION callback_registration;
     ULONG major_index;
 
     UNREFERENCED_PARAMETER(registry_path);
 
     ExInitializeDriverRuntime(DrvRtPoolNxOptIn);
     ExInitializeFastMutex(&gRegistryJournalLock);
+    KeInitializeSpinLock(&gProtectedProcessLock);
     gRegistryJournalHead = 0;
     gRegistryJournalCount = 0;
     gRegistryNextSequence = 1;
+    gProtectedProcessCount = 0;
+    RtlZeroMemory(gProtectedProcessIds, sizeof(gProtectedProcessIds));
     RtlZeroMemory(gRegistryJournal, sizeof(gRegistryJournal));
 
     for (major_index = 0; major_index <= IRP_MJ_MAXIMUM_FUNCTION; major_index++) {
@@ -704,6 +1080,30 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver_object, PUNICODE_STRING registry_path
         return status;
     }
     gRegistryCallbackRegistered = TRUE;
+
+    RtlZeroMemory(&operation_registration, sizeof(operation_registration));
+    operation_registration.ObjectType = PsProcessType;
+    operation_registration.Operations =
+        OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
+    operation_registration.PreOperation = AegisProcessPreOperation;
+    operation_registration.PostOperation = NULL;
+
+    RtlZeroMemory(&callback_registration, sizeof(callback_registration));
+    RtlInitUnicodeString(&ob_altitude, AEGIS_DRIVER_PROCESS_PROTECTION_ALTITUDE_W);
+    callback_registration.Version = OB_FLT_REGISTRATION_VERSION;
+    callback_registration.OperationRegistrationCount = 1;
+    callback_registration.RegistrationContext = NULL;
+    callback_registration.Altitude = ob_altitude;
+    callback_registration.OperationRegistration = &operation_registration;
+    status = ObRegisterCallbacks(&callback_registration, &gObRegistrationHandle);
+    if (!NT_SUCCESS(status)) {
+        CmUnRegisterCallback(gRegistryCallbackCookie);
+        gRegistryCallbackRegistered = FALSE;
+        IoDeleteSymbolicLink(&dos_device_name);
+        IoDeleteDevice(device_object);
+        return status;
+    }
+    gObCallbackRegistered = TRUE;
 
     device_object->Flags &= ~DO_DEVICE_INITIALIZING;
     return STATUS_SUCCESS;

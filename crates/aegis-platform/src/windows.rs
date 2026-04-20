@@ -27,10 +27,16 @@ const AEGIS_WINDOWS_DRIVER_IOCTL_QUERY_VERSION: u32 = 0x0022_2000;
 const AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME: &str = r"\AegisFileMonitorPort";
 const WINDOWS_QUERY_FILE_EVENTS_SCRIPT: &str =
     include_str!("../../../scripts/windows-query-file-events.ps1");
+const WINDOWS_CONFIGURE_FILE_PROTECTION_SCRIPT: &str =
+    include_str!("../../../scripts/windows-configure-file-protection.ps1");
 const WINDOWS_QUERY_REGISTRY_EVENTS_SCRIPT: &str =
     include_str!("../../../scripts/windows-query-registry-events.ps1");
 const WINDOWS_ROLLBACK_REGISTRY_SCRIPT: &str =
     include_str!("../../../scripts/windows-rollback-registry.ps1");
+const WINDOWS_PROTECT_PROCESS_SCRIPT: &str =
+    include_str!("../../../scripts/windows-protect-process.ps1");
+const WINDOWS_QUERY_DRIVER_INTEGRITY_SCRIPT: &str =
+    include_str!("../../../scripts/windows-query-driver-integrity.ps1");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowsProviderKind {
@@ -209,6 +215,17 @@ struct WindowsHostCapabilities {
     registry_journal_capacity: Option<u32>,
     registry_current_sequence: Option<u32>,
     registry_status_detail: Option<String>,
+    ob_callback_registered: bool,
+    protected_process_count: Option<u32>,
+    protected_file_path_count: Option<u32>,
+    ssdt_inspection_succeeded: bool,
+    ssdt_suspicious: bool,
+    callback_inspection_succeeded: bool,
+    callback_suspicious: bool,
+    kernel_code_inspection_succeeded: bool,
+    kernel_code_suspicious: bool,
+    code_integrity_options: Option<u32>,
+    driver_integrity_detail: Option<String>,
     last_error: Option<String>,
 }
 
@@ -263,6 +280,10 @@ impl WindowsHostCapabilities {
         self.driver_transport_ready() && self.registry_callback_registered
     }
 
+    fn process_protection_ready(&self) -> bool {
+        self.driver_transport_ready() && self.ob_callback_registered
+    }
+
     fn provider_health(&self, provider: WindowsProviderKind, running: bool) -> bool {
         if !running || !self.reachable || !self.running_on_windows {
             return false;
@@ -273,7 +294,7 @@ impl WindowsHostCapabilities {
                 self.any_event_log() && self.has_process_creation_events
             }
             WindowsProviderKind::PsProcess => self.has_process_inventory,
-            WindowsProviderKind::ObProcess => false,
+            WindowsProviderKind::ObProcess => self.process_protection_ready(),
             WindowsProviderKind::MinifilterFile => self.file_monitor_ready(),
             WindowsProviderKind::WfpNetwork => self.has_net_connection,
             WindowsProviderKind::RegistryCallback => self.registry_provider_ready(),
@@ -317,12 +338,15 @@ impl WindowsHostCapabilities {
         ));
         facts.push(self.driver_transport_summary());
         facts.push(format!(
-            "file_monitor={};file_protocol={};file_queue={};file_detail={}",
+            "file_monitor={};file_protocol={};file_queue={};protected_paths={};file_detail={}",
             self.file_monitor_ready(),
             self.file_monitor_protocol_version
                 .map(|value| format!("0x{value:08x}"))
                 .unwrap_or_else(|| "none".to_string()),
             self.file_monitor_queue_capacity
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            self.protected_file_path_count
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".to_string()),
             self.file_monitor_status_detail
@@ -336,6 +360,16 @@ impl WindowsHostCapabilities {
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".to_string()),
             self.registry_status_detail
+                .clone()
+                .unwrap_or_else(|| "-".to_string())
+        ));
+        facts.push(format!(
+            "process_protection={};protected_pids={};driver_integrity={}",
+            self.process_protection_ready(),
+            self.protected_process_count
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            self.driver_integrity_detail
                 .clone()
                 .unwrap_or_else(|| "-".to_string())
         ));
@@ -459,6 +493,8 @@ struct WindowsFileMonitorStatus {
     protocol_version: u32,
     queue_capacity: u32,
     current_sequence: u32,
+    #[serde(default)]
+    protected_path_count: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -478,7 +514,17 @@ struct WindowsFileMonitorQuery {
     current_sequence: u32,
     returned_count: u32,
     overflowed: bool,
+    #[serde(default)]
+    protected_path_count: u32,
     events: Vec<WindowsFileMonitorEvent>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsFileProtectionResponse {
+    protocol_version: u32,
+    protected_path_count: u32,
+    #[serde(default)]
+    resolved_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -517,6 +563,30 @@ struct WindowsRegistryRollbackResponse {
     protocol_version: u32,
     applied_count: u32,
     current_sequence: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsProcessProtectionResponse {
+    protocol_version: u32,
+    ob_callback_registered: bool,
+    protected_process_count: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsDriverIntegrityStatus {
+    protocol_version: u32,
+    ob_callback_registered: bool,
+    protected_process_count: u32,
+    ssdt_inspection_succeeded: bool,
+    ssdt_suspicious: bool,
+    callback_inspection_succeeded: bool,
+    callback_suspicious: bool,
+    kernel_code_inspection_succeeded: bool,
+    kernel_code_suspicious: bool,
+    code_integrity_options: u32,
+    code_integrity_enabled: bool,
+    code_integrity_testsign: bool,
+    code_integrity_kmci_enabled: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -815,43 +885,18 @@ impl WindowsPlatform {
             provider_health: self
                 .providers
                 .iter()
-                .map(|provider| (format!("{provider:?}"), host.provider_health(*provider, running)))
+                .map(|provider| {
+                    (
+                        format!("{provider:?}"),
+                        host.provider_health(*provider, running),
+                    )
+                })
                 .collect(),
             integrity_reports: BTreeMap::from([
-                (
-                    "ssdt".to_string(),
-                    kernel_report(
-                        false,
-                        format!(
-                            "ssdt inspection requires kernel transport and is not implemented; {}",
-                            host.summary()
-                        ),
-                    ),
-                ),
-                (
-                    "callbacks".to_string(),
-                    kernel_report(
-                        false,
-                        format!(
-                            "callback table inspection requires kernel callbacks and is not implemented; {}",
-                            host.summary()
-                        ),
-                    ),
-                ),
-                (
-                    "kernel_code".to_string(),
-                    kernel_report(
-                        false,
-                        format!(
-                            "kernel code integrity inspection requires driver support and is not implemented; {}",
-                            host.summary()
-                        ),
-                    ),
-                ),
-                (
-                    "platform_protection".to_string(),
-                    protection_report(&host),
-                ),
+                ("ssdt".to_string(), ssdt_report(&host)),
+                ("callbacks".to_string(), callback_report(&host)),
+                ("kernel_code".to_string(), kernel_code_report(&host)),
+                ("platform_protection".to_string(), protection_report(&host)),
                 (
                     "driver_transport".to_string(),
                     driver_transport_report(&host),
@@ -1064,7 +1109,9 @@ impl PlatformResponse for WindowsPlatform {
         }
         let resolved_key_path =
             resolve_windows_registry_key_path(self.runner.as_ref(), &target.selector)
-                .with_context(|| format!("resolve windows registry selector {}", target.selector))?;
+                .with_context(|| {
+                    format!("resolve windows registry selector {}", target.selector)
+                })?;
         let rollback = rollback_windows_registry_key(
             self.runner.as_ref(),
             &resolved_key_path,
@@ -1074,9 +1121,13 @@ impl PlatformResponse for WindowsPlatform {
         state.execution.rollback_targets.push(target.clone());
         state.host.registry_current_sequence = Some(rollback.current_sequence);
         state.registry_monitor_cursor = Some(rollback.current_sequence);
-        let artifact_path =
-            write_windows_registry_rollback_artifact(&mut state, target, &resolved_key_path, &rollback)
-                .with_context(|| "write windows registry rollback artifact")?;
+        let artifact_path = write_windows_registry_rollback_artifact(
+            &mut state,
+            target,
+            &resolved_key_path,
+            &rollback,
+        )
+        .with_context(|| "write windows registry rollback artifact")?;
         state.execution.audit_artifacts.push(artifact_path);
         Ok(())
     }
@@ -1198,35 +1249,17 @@ impl PreemptiveBlock for WindowsPlatform {
 impl KernelIntegrity for WindowsPlatform {
     fn check_ssdt_integrity(&self) -> Result<IntegrityReport> {
         let host = self.host_capabilities();
-        Ok(kernel_report(
-            false,
-            format!(
-                "ssdt inspection requires kernel transport and is not implemented; {}",
-                host.summary()
-            ),
-        ))
+        Ok(ssdt_report(&host))
     }
 
     fn check_callback_tables(&self) -> Result<IntegrityReport> {
         let host = self.host_capabilities();
-        Ok(kernel_report(
-            false,
-            format!(
-                "callback table inspection requires kernel transport and is not implemented; {}",
-                host.summary()
-            ),
-        ))
+        Ok(callback_report(&host))
     }
 
     fn check_kernel_code(&self) -> Result<IntegrityReport> {
         let host = self.host_capabilities();
-        Ok(kernel_report(
-            false,
-            format!(
-                "kernel code integrity inspection requires driver support and is not implemented; {}",
-                host.summary()
-            ),
-        ))
+        Ok(kernel_code_report(&host))
     }
 
     fn detect_hidden_processes(&self) -> Result<Vec<SuspiciousProcess>> {
@@ -1274,7 +1307,23 @@ impl KernelIntegrity for WindowsPlatform {
 impl PlatformProtection for WindowsPlatform {
     fn protect_process(&self, pid: u32) -> Result<()> {
         let mut state = self.state.lock().expect("windows state poisoned");
-        state.execution.protected_pids.push(pid);
+        ensure_windows_driver_transport(&state.host, "protect windows process")?;
+        let response =
+            protect_windows_process(self.runner.as_ref(), pid, AEGIS_WINDOWS_DRIVER_SERVICE_NAME)
+                .with_context(|| format!("protect windows process {pid}"))?;
+        if response.protocol_version != AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION {
+            bail!(
+                "process protection protocol mismatch: expected 0x{expected:08x}, got 0x{actual:08x}",
+                expected = AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION,
+                actual = response.protocol_version
+            );
+        }
+
+        state.host.ob_callback_registered = response.ob_callback_registered;
+        state.host.protected_process_count = Some(response.protected_process_count);
+        if !state.execution.protected_pids.contains(&pid) {
+            state.execution.protected_pids.push(pid);
+        }
         record_windows_protection_surface_artifact(&mut state)
             .with_context(|| "write windows protection surface artifact")?;
         Ok(())
@@ -1282,10 +1331,57 @@ impl PlatformProtection for WindowsPlatform {
 
     fn protect_files(&self, paths: &[PathBuf]) -> Result<()> {
         let mut state = self.state.lock().expect("windows state poisoned");
-        state
-            .execution
-            .protected_paths
-            .extend(paths.iter().cloned());
+        ensure_windows_driver_transport(&state.host, "protect windows files")?;
+        if !state.host.file_monitor_ready() {
+            bail!(
+                "protect windows files requires minifilter control port {}; {}",
+                AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
+                state.host.summary()
+            );
+        }
+
+        let mut merged_paths = state.execution.protected_paths.clone();
+        for path in paths {
+            if !merged_paths.iter().any(|existing| existing == path) {
+                merged_paths.push(path.clone());
+            }
+        }
+
+        let clear = clear_windows_file_protection(
+            self.runner.as_ref(),
+            AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
+        )
+        .with_context(|| "clear windows protected file paths before apply")?;
+        if clear.protocol_version != AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION {
+            bail!(
+                "file protection clear protocol mismatch: expected 0x{expected:08x}, got 0x{actual:08x}",
+                expected = AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION,
+                actual = clear.protocol_version
+            );
+        }
+
+        let mut protected_path_count = clear.protected_path_count;
+        for path in &merged_paths {
+            let response = protect_windows_file_path(
+                self.runner.as_ref(),
+                AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
+                path,
+            )
+            .with_context(|| format!("protect windows file path {}", path.display()))?;
+            if response.protocol_version != AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION {
+                bail!(
+                    "file protection protocol mismatch: expected 0x{expected:08x}, got 0x{actual:08x}",
+                    expected = AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION,
+                    actual = response.protocol_version
+                );
+            }
+            protected_path_count = response.protected_path_count;
+        }
+
+        state.execution.protected_paths = merged_paths;
+        state.host.protected_file_path_count = Some(protected_path_count);
+        refresh_windows_driver_surfaces(&mut state.host, self.runner.as_ref())
+            .with_context(|| "refresh windows driver surfaces after protect_files")?;
         record_windows_protection_surface_artifact(&mut state)
             .with_context(|| "write windows protection surface artifact")?;
         Ok(())
@@ -1293,6 +1389,10 @@ impl PlatformProtection for WindowsPlatform {
 
     fn verify_integrity(&self) -> Result<IntegrityReport> {
         let mut state = self.state.lock().expect("windows state poisoned");
+        if state.host.driver_transport_ready() {
+            refresh_windows_driver_surfaces(&mut state.host, self.runner.as_ref())
+                .with_context(|| "refresh windows driver surfaces before verify_integrity")?;
+        }
         let report = protection_report(&state.host);
         let artifact_path = write_windows_integrity_artifact(&mut state)
             .with_context(|| "write windows integrity artifact")?;
@@ -1339,7 +1439,7 @@ impl PlatformRuntime for WindowsPlatform {
             degrade_levels: 3,
             supports_registry: host.registry_provider_ready(),
             supports_amsi: false,
-            supports_etw_integrity: false,
+            supports_etw_integrity: host.driver_transport_ready(),
             supports_bpf_integrity: false,
             supports_container_sensor: false,
         }
@@ -1616,58 +1716,129 @@ $data | ConvertTo-Json -Compress
         registry_journal_capacity: probe.registry_journal_capacity,
         registry_current_sequence: probe.registry_current_sequence,
         registry_status_detail: probe.registry_status_detail,
+        ob_callback_registered: false,
+        protected_process_count: None,
+        protected_file_path_count: None,
+        ssdt_inspection_succeeded: false,
+        ssdt_suspicious: false,
+        callback_inspection_succeeded: false,
+        callback_suspicious: false,
+        kernel_code_inspection_succeeded: false,
+        kernel_code_suspicious: false,
+        code_integrity_options: None,
+        driver_integrity_detail: None,
         last_error: None,
     };
 
     if host.driver_transport_ready() {
-        match query_windows_file_monitor_status(runner, AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME) {
-            Ok(status) => {
-                host.has_file_monitor_port = true;
-                host.file_monitor_protocol_version = Some(status.protocol_version);
-                host.file_monitor_queue_capacity = Some(status.queue_capacity);
-                host.file_monitor_current_sequence = Some(status.current_sequence);
-                host.file_monitor_status_detail = Some(format!(
-                    "port={};protocol=0x{:08x};queue_capacity={};current_sequence={}",
-                    AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
-                    status.protocol_version,
-                    status.queue_capacity,
-                    status.current_sequence
-                ));
-            }
-            Err(error) => {
-                host.has_file_monitor_port = false;
-                host.file_monitor_protocol_version = None;
-                host.file_monitor_queue_capacity = None;
-                host.file_monitor_current_sequence = None;
-                host.file_monitor_status_detail = Some(error.to_string());
-            }
-        }
-
-        match query_windows_registry_monitor_status(runner, AEGIS_WINDOWS_DRIVER_SERVICE_NAME) {
-            Ok(status) => {
-                host.registry_callback_registered = status.registry_callback_registered
-                    && status.protocol_version == AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION;
-                host.registry_journal_capacity = Some(status.journal_capacity);
-                host.registry_current_sequence = Some(status.current_sequence);
-                host.registry_status_detail = Some(format!(
-                    "service={};protocol=0x{:08x};journal_capacity={};current_sequence={};registered={}",
-                    AEGIS_WINDOWS_DRIVER_SERVICE_NAME,
-                    status.protocol_version,
-                    status.journal_capacity,
-                    status.current_sequence,
-                    status.registry_callback_registered
-                ));
-            }
-            Err(error) => {
-                host.registry_callback_registered = false;
-                host.registry_journal_capacity = None;
-                host.registry_current_sequence = None;
-                host.registry_status_detail = Some(error.to_string());
-            }
-        }
+        refresh_windows_driver_surfaces(&mut host, runner)?;
     }
 
     Ok(host)
+}
+
+fn apply_windows_driver_integrity_status(
+    host: &mut WindowsHostCapabilities,
+    integrity: WindowsDriverIntegrityStatus,
+) {
+    host.ob_callback_registered = integrity.ob_callback_registered
+        && integrity.protocol_version == AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION;
+    host.protected_process_count = Some(integrity.protected_process_count);
+    host.ssdt_inspection_succeeded = integrity.ssdt_inspection_succeeded;
+    host.ssdt_suspicious = integrity.ssdt_suspicious;
+    host.callback_inspection_succeeded = integrity.callback_inspection_succeeded;
+    host.callback_suspicious = integrity.callback_suspicious;
+    host.kernel_code_inspection_succeeded = integrity.kernel_code_inspection_succeeded;
+    host.kernel_code_suspicious = integrity.kernel_code_suspicious;
+    host.code_integrity_options = Some(integrity.code_integrity_options);
+    host.driver_integrity_detail = Some(format!(
+        "ob_registered={};protected_pids={};ssdt_ok={};ssdt_suspicious={};callbacks_ok={};callbacks_suspicious={};kernel_code_ok={};kernel_code_suspicious={};code_integrity=0x{:08x};kmci={};testsign={}",
+        integrity.ob_callback_registered,
+        integrity.protected_process_count,
+        integrity.ssdt_inspection_succeeded,
+        integrity.ssdt_suspicious,
+        integrity.callback_inspection_succeeded,
+        integrity.callback_suspicious,
+        integrity.kernel_code_inspection_succeeded,
+        integrity.kernel_code_suspicious,
+        integrity.code_integrity_options,
+        integrity.code_integrity_kmci_enabled,
+        integrity.code_integrity_testsign
+    ));
+}
+
+fn refresh_windows_driver_surfaces(
+    host: &mut WindowsHostCapabilities,
+    runner: &dyn WindowsCommandRunner,
+) -> Result<()> {
+    match query_windows_file_monitor_status(runner, AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME) {
+        Ok(status) => {
+            host.has_file_monitor_port = true;
+            host.file_monitor_protocol_version = Some(status.protocol_version);
+            host.file_monitor_queue_capacity = Some(status.queue_capacity);
+            host.file_monitor_current_sequence = Some(status.current_sequence);
+            host.protected_file_path_count = Some(status.protected_path_count);
+            host.file_monitor_status_detail = Some(format!(
+                "port={};protocol=0x{:08x};queue_capacity={};current_sequence={};protected_paths={}",
+                AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
+                status.protocol_version,
+                status.queue_capacity,
+                status.current_sequence,
+                status.protected_path_count
+            ));
+        }
+        Err(error) => {
+            host.has_file_monitor_port = false;
+            host.file_monitor_protocol_version = None;
+            host.file_monitor_queue_capacity = None;
+            host.file_monitor_current_sequence = None;
+            host.protected_file_path_count = None;
+            host.file_monitor_status_detail = Some(error.to_string());
+        }
+    }
+
+    match query_windows_registry_monitor_status(runner, AEGIS_WINDOWS_DRIVER_SERVICE_NAME) {
+        Ok(status) => {
+            host.registry_callback_registered = status.registry_callback_registered
+                && status.protocol_version == AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION;
+            host.registry_journal_capacity = Some(status.journal_capacity);
+            host.registry_current_sequence = Some(status.current_sequence);
+            host.registry_status_detail = Some(format!(
+                "service={};protocol=0x{:08x};journal_capacity={};current_sequence={};registered={}",
+                AEGIS_WINDOWS_DRIVER_SERVICE_NAME,
+                status.protocol_version,
+                status.journal_capacity,
+                status.current_sequence,
+                status.registry_callback_registered
+            ));
+        }
+        Err(error) => {
+            host.registry_callback_registered = false;
+            host.registry_journal_capacity = None;
+            host.registry_current_sequence = None;
+            host.registry_status_detail = Some(error.to_string());
+        }
+    }
+
+    match query_windows_driver_integrity(runner, AEGIS_WINDOWS_DRIVER_SERVICE_NAME) {
+        Ok(status) => {
+            apply_windows_driver_integrity_status(host, status);
+        }
+        Err(error) => {
+            host.ob_callback_registered = false;
+            host.protected_process_count = None;
+            host.ssdt_inspection_succeeded = false;
+            host.ssdt_suspicious = false;
+            host.callback_inspection_succeeded = false;
+            host.callback_suspicious = false;
+            host.kernel_code_inspection_succeeded = false;
+            host.kernel_code_suspicious = false;
+            host.code_integrity_options = None;
+            host.driver_integrity_detail = Some(error.to_string());
+        }
+    }
+
+    Ok(())
 }
 
 fn ensure_windows_driver_transport(host: &WindowsHostCapabilities, action: &str) -> Result<()> {
@@ -1693,10 +1864,7 @@ fn run_powershell_json<T: DeserializeOwned>(
         .with_context(|| format!("parse powershell json output: {}", raw.trim()))
 }
 
-fn build_embedded_windows_script_invocation(
-    script_body: &str,
-    args: &[(&str, String)],
-) -> String {
+fn build_embedded_windows_script_invocation(script_body: &str, args: &[(&str, String)]) -> String {
     let mut script = format!(
         "$embedded = [scriptblock]::Create(@'\n{}\n'@)\n& $embedded",
         script_body.trim()
@@ -1795,6 +1963,62 @@ fn rollback_windows_registry_key(
     )
 }
 
+fn protect_windows_process(
+    runner: &dyn WindowsCommandRunner,
+    process_id: u32,
+    service_name: &str,
+) -> Result<WindowsProcessProtectionResponse> {
+    run_embedded_powershell_json(
+        runner,
+        WINDOWS_PROTECT_PROCESS_SCRIPT,
+        &[
+            ("ProcessId", process_id.to_string()),
+            ("ServiceName", service_name.to_string()),
+        ],
+    )
+}
+
+fn query_windows_driver_integrity(
+    runner: &dyn WindowsCommandRunner,
+    service_name: &str,
+) -> Result<WindowsDriverIntegrityStatus> {
+    run_embedded_powershell_json(
+        runner,
+        WINDOWS_QUERY_DRIVER_INTEGRITY_SCRIPT,
+        &[("ServiceName", service_name.to_string())],
+    )
+}
+
+fn clear_windows_file_protection(
+    runner: &dyn WindowsCommandRunner,
+    port_name: &str,
+) -> Result<WindowsFileProtectionResponse> {
+    run_embedded_powershell_json(
+        runner,
+        WINDOWS_CONFIGURE_FILE_PROTECTION_SCRIPT,
+        &[
+            ("Mode", "clear".to_string()),
+            ("PortName", port_name.to_string()),
+        ],
+    )
+}
+
+fn protect_windows_file_path(
+    runner: &dyn WindowsCommandRunner,
+    port_name: &str,
+    path: &Path,
+) -> Result<WindowsFileProtectionResponse> {
+    run_embedded_powershell_json(
+        runner,
+        WINDOWS_CONFIGURE_FILE_PROTECTION_SCRIPT,
+        &[
+            ("Mode", "protect".to_string()),
+            ("PortName", port_name.to_string()),
+            ("Path", path.display().to_string()),
+        ],
+    )
+}
+
 fn resolve_windows_registry_key_path(
     runner: &dyn WindowsCommandRunner,
     selector: &str,
@@ -1880,8 +2104,12 @@ fn collect_file_monitor_events(
     runner: &dyn WindowsCommandRunner,
 ) -> Result<()> {
     let last_sequence = state.file_monitor_cursor.unwrap_or(0);
-    let response =
-        query_windows_file_monitor_events(runner, AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME, last_sequence, 256)?;
+    let response = query_windows_file_monitor_events(
+        runner,
+        AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
+        last_sequence,
+        256,
+    )?;
     if response.protocol_version != AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION {
         bail!(
             "file monitor protocol mismatch: expected 0x{expected:08x}, got 0x{actual:08x}",
@@ -1894,12 +2122,14 @@ fn collect_file_monitor_events(
     state.host.file_monitor_protocol_version = Some(response.protocol_version);
     state.host.file_monitor_queue_capacity = Some(response.queue_capacity);
     state.host.file_monitor_current_sequence = Some(response.current_sequence);
+    state.host.protected_file_path_count = Some(response.protected_path_count);
     state.host.file_monitor_status_detail = Some(format!(
-        "port={};current_sequence={};returned_count={};overflowed={}",
+        "port={};current_sequence={};returned_count={};overflowed={};protected_paths={}",
         AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
         response.current_sequence,
         response.returned_count,
-        response.overflowed
+        response.overflowed,
+        response.protected_path_count
     ));
     state.file_monitor_cursor = Some(response.current_sequence);
 
@@ -1921,8 +2151,12 @@ fn collect_registry_monitor_events(
     runner: &dyn WindowsCommandRunner,
 ) -> Result<()> {
     let last_sequence = state.registry_monitor_cursor.unwrap_or(0);
-    let response =
-        query_windows_registry_monitor_events(runner, AEGIS_WINDOWS_DRIVER_SERVICE_NAME, last_sequence, 256)?;
+    let response = query_windows_registry_monitor_events(
+        runner,
+        AEGIS_WINDOWS_DRIVER_SERVICE_NAME,
+        last_sequence,
+        256,
+    )?;
     if response.protocol_version != AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION {
         bail!(
             "registry callback protocol mismatch: expected 0x{expected:08x}, got 0x{actual:08x}",
@@ -2671,27 +2905,9 @@ fn write_windows_block_clear_artifact(
 fn write_windows_integrity_artifact(state: &mut WindowsState) -> Result<PathBuf> {
     let artifact = WindowsIntegrityAuditArtifact {
         verify_integrity: protection_report(&state.host),
-        ssdt: kernel_report(
-            false,
-            format!(
-                "ssdt inspection requires kernel transport and is not implemented; {}",
-                state.host.summary()
-            ),
-        ),
-        callback_tables: kernel_report(
-            false,
-            format!(
-                "callback table inspection requires kernel transport and is not implemented; {}",
-                state.host.summary()
-            ),
-        ),
-        kernel_code: kernel_report(
-            false,
-            format!(
-                "kernel code integrity inspection requires driver support and is not implemented; {}",
-                state.host.summary()
-            ),
-        ),
+        ssdt: ssdt_report(&state.host),
+        callback_tables: callback_report(&state.host),
+        kernel_code: kernel_code_report(&state.host),
         etw_ingest: etw_report(&state.host),
         amsi_script: amsi_report(&state.host),
     };
@@ -3190,24 +3406,137 @@ fn kernel_report(passed: bool, details: impl Into<String>) -> IntegrityReport {
     }
 }
 
+fn ssdt_report(host: &WindowsHostCapabilities) -> IntegrityReport {
+    if !host.reachable {
+        return kernel_report(false, host.summary());
+    }
+    if !host.driver_transport_ready() {
+        return kernel_report(
+            false,
+            format!(
+                "ssdt inspection requires kernel driver transport; {}",
+                host.summary()
+            ),
+        );
+    }
+    if !host.ssdt_inspection_succeeded {
+        return kernel_report(
+            false,
+            format!(
+                "driver could not complete syscall surface inspection; {}",
+                host.summary()
+            ),
+        );
+    }
+
+    kernel_report(
+        !host.ssdt_suspicious,
+        format!(
+            "ssdt_inspection_succeeded={};ssdt_suspicious={};{}",
+            host.ssdt_inspection_succeeded,
+            host.ssdt_suspicious,
+            host.summary()
+        ),
+    )
+}
+
+fn callback_report(host: &WindowsHostCapabilities) -> IntegrityReport {
+    if !host.reachable {
+        return kernel_report(false, host.summary());
+    }
+    if !host.driver_transport_ready() {
+        return kernel_report(
+            false,
+            format!(
+                "callback inspection requires kernel driver transport; {}",
+                host.summary()
+            ),
+        );
+    }
+    if !host.callback_inspection_succeeded {
+        return kernel_report(
+            false,
+            format!(
+                "driver could not complete callback inspection; {}",
+                host.summary()
+            ),
+        );
+    }
+
+    kernel_report(
+        !host.callback_suspicious,
+        format!(
+            "callback_inspection_succeeded={};callback_suspicious={};ob_callback_registered={};registry_callback_registered={};{}",
+            host.callback_inspection_succeeded,
+            host.callback_suspicious,
+            host.ob_callback_registered,
+            host.registry_callback_registered,
+            host.summary()
+        ),
+    )
+}
+
+fn kernel_code_report(host: &WindowsHostCapabilities) -> IntegrityReport {
+    if !host.reachable {
+        return kernel_report(false, host.summary());
+    }
+    if !host.driver_transport_ready() {
+        return kernel_report(
+            false,
+            format!(
+                "kernel code inspection requires kernel driver transport; {}",
+                host.summary()
+            ),
+        );
+    }
+    if !host.kernel_code_inspection_succeeded {
+        return kernel_report(
+            false,
+            format!(
+                "driver could not query system code integrity state; {}",
+                host.summary()
+            ),
+        );
+    }
+
+    kernel_report(
+        !host.kernel_code_suspicious,
+        format!(
+            "kernel_code_inspection_succeeded={};kernel_code_suspicious={};code_integrity_options={};{}",
+            host.kernel_code_inspection_succeeded,
+            host.kernel_code_suspicious,
+            host.code_integrity_options
+                .map(|value| format!("0x{value:08x}"))
+                .unwrap_or_else(|| "none".to_string()),
+            host.summary()
+        ),
+    )
+}
+
 fn protection_report(host: &WindowsHostCapabilities) -> IntegrityReport {
+    let passed = host.process_protection_ready() && host.file_monitor_ready();
     let details = if !host.reachable {
         host.summary()
-    } else if host.driver_transport_ready() {
-        format!(
-            "driver bridge is present, but kernel callbacks / block enforcement are still not implemented; {}",
-            host.summary()
-        )
-    } else {
+    } else if !host.driver_transport_ready() {
         format!(
             "windows protection plane is running without driver transport; {}",
             host.summary()
         )
+    } else {
+        format!(
+            "process_protection_ready={};file_protection_ready={};protected_pids={};protected_paths={};{}",
+            host.process_protection_ready(),
+            host.file_monitor_ready(),
+            host.protected_process_count
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            host.protected_file_path_count
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            host.summary()
+        )
     };
-    IntegrityReport {
-        passed: false,
-        details,
-    }
+    IntegrityReport { passed, details }
 }
 
 fn driver_transport_report(host: &WindowsHostCapabilities) -> IntegrityReport {
@@ -3383,6 +3712,17 @@ mod tests {
             registry_journal_capacity: None,
             registry_current_sequence: None,
             registry_status_detail: None,
+            ob_callback_registered: false,
+            protected_process_count: None,
+            protected_file_path_count: None,
+            ssdt_inspection_succeeded: false,
+            ssdt_suspicious: false,
+            callback_inspection_succeeded: false,
+            callback_suspicious: false,
+            kernel_code_inspection_succeeded: false,
+            kernel_code_suspicious: false,
+            code_integrity_options: None,
+            driver_integrity_detail: None,
             last_error: None,
         }
     }
@@ -3394,9 +3734,8 @@ mod tests {
         host.has_driver_control_device = true;
         host.driver_protocol_version = Some(AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION);
         host.driver_version = Some("1.0.0-test".to_string());
-        host.driver_status_detail = Some(
-            r#"{"protocol_version":65536,"driver_version":"1.0.0-test"}"#.to_string(),
-        );
+        host.driver_status_detail =
+            Some(r#"{"protocol_version":65536,"driver_version":"1.0.0-test"}"#.to_string());
         host
     }
 
@@ -3406,8 +3745,9 @@ mod tests {
         host.file_monitor_protocol_version = Some(AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION);
         host.file_monitor_queue_capacity = Some(256);
         host.file_monitor_current_sequence = Some(1200);
+        host.protected_file_path_count = Some(1);
         host.file_monitor_status_detail = Some(
-            "port=\\AegisFileMonitorPort;protocol=0x00010000;queue_capacity=256;current_sequence=1200"
+            "port=\\AegisFileMonitorPort;protocol=0x00010000;queue_capacity=256;current_sequence=1200;protected_paths=1"
                 .to_string(),
         );
         host.registry_callback_registered = true;
@@ -3415,6 +3755,19 @@ mod tests {
         host.registry_current_sequence = Some(640);
         host.registry_status_detail = Some(
             "service=AegisSensorKmod;protocol=0x00010000;journal_capacity=256;current_sequence=640;registered=True"
+                .to_string(),
+        );
+        host.ob_callback_registered = true;
+        host.protected_process_count = Some(1);
+        host.ssdt_inspection_succeeded = true;
+        host.ssdt_suspicious = false;
+        host.callback_inspection_succeeded = true;
+        host.callback_suspicious = false;
+        host.kernel_code_inspection_succeeded = true;
+        host.kernel_code_suspicious = false;
+        host.code_integrity_options = Some(0x00000401);
+        host.driver_integrity_detail = Some(
+            "ob_registered=true;protected_pids=1;ssdt_ok=true;ssdt_suspicious=false;callbacks_ok=true;callbacks_suspicious=false;kernel_code_ok=true;kernel_code_suspicious=false;code_integrity=0x00000401;kmci=true;testsign=false"
                 .to_string(),
         );
         host
@@ -3644,6 +3997,16 @@ mod tests {
         )
     }
 
+    fn file_status_output(
+        current_sequence: u32,
+        queue_capacity: u32,
+        protected_path_count: u32,
+    ) -> String {
+        format!(
+            r#"{{"port_name":"\\AegisFileMonitorPort","protocol_version":65536,"queue_capacity":{queue_capacity},"current_sequence":{current_sequence},"protected_path_count":{protected_path_count}}}"#
+        )
+    }
+
     fn file_events_output(
         current_sequence: u32,
         queue_capacity: u32,
@@ -3660,9 +4023,40 @@ mod tests {
             })
             .collect::<Vec<_>>();
         format!(
-            r#"{{"port_name":"\\AegisFileMonitorPort","protocol_version":65536,"queue_capacity":{queue_capacity},"oldest_sequence":0,"current_sequence":{current_sequence},"returned_count":{},"overflowed":false,"events":[{}]}}"#,
+            r#"{{"port_name":"\\AegisFileMonitorPort","protocol_version":65536,"queue_capacity":{queue_capacity},"oldest_sequence":0,"current_sequence":{current_sequence},"returned_count":{},"overflowed":false,"protected_path_count":1,"events":[{}]}}"#,
             events.len(),
             rows.join(",")
+        )
+    }
+
+    fn file_protection_output(protected_path_count: u32, resolved_path: Option<&str>) -> String {
+        let resolved_path = resolved_path
+            .map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+            .unwrap_or_else(|| "null".to_string());
+        format!(
+            r#"{{"protocol_version":65536,"protected_path_count":{protected_path_count},"resolved_path":{resolved_path}}}"#
+        )
+    }
+
+    fn registry_status_output(current_sequence: u32, journal_capacity: u32) -> String {
+        format!(
+            r#"{{"service_name":"AegisSensorKmod","protocol_version":65536,"registry_callback_registered":true,"journal_capacity":{journal_capacity},"journal_count":1,"oldest_sequence":1,"current_sequence":{current_sequence}}}"#
+        )
+    }
+
+    fn process_protection_output(protected_process_count: u32) -> String {
+        format!(
+            r#"{{"service_name":"AegisSensorKmod","process_id":4242,"protocol_version":65536,"ob_callback_registered":true,"protected_process_count":{protected_process_count}}}"#
+        )
+    }
+
+    fn driver_integrity_output(
+        protected_process_count: u32,
+        kernel_code_suspicious: bool,
+        code_integrity_options: u32,
+    ) -> String {
+        format!(
+            r#"{{"service_name":"AegisSensorKmod","protocol_version":65536,"ob_callback_registered":true,"protected_process_count":{protected_process_count},"ssdt_inspection_succeeded":true,"ssdt_suspicious":false,"callback_inspection_succeeded":true,"callback_suspicious":false,"kernel_code_inspection_succeeded":true,"kernel_code_suspicious":{kernel_code_suspicious},"code_integrity_options":{code_integrity_options},"code_integrity_enabled":true,"code_integrity_testsign":false,"code_integrity_kmci_enabled":true}}"#
         )
     }
 
@@ -3776,6 +4170,12 @@ mod tests {
             Box::new(QueuedWindowsRunner::new([
                 String::new(),
                 String::new(),
+                process_protection_output(1),
+                file_protection_output(0, None),
+                file_protection_output(1, Some(r"\Device\HarddiskVolume4\temp\payload.exe")),
+                file_status_output(1200, 256, 1),
+                registry_status_output(641, 256),
+                driver_integrity_output(1, false, 0x00000401),
                 quarantine_receipt_output(&quarantine_path, "deadbeef"),
                 artifact_bundle_output(artifact_id, &bundle_path),
                 r#"{"key_path":"\\REGISTRY\\MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"}"#
@@ -3883,7 +4283,10 @@ mod tests {
             })
             .expect("start windows runtime in kernel-driver mode");
 
-        assert_eq!(platform.descriptor().kernel_transport, KernelTransport::Driver);
+        assert_eq!(
+            platform.descriptor().kernel_transport,
+            KernelTransport::Driver
+        );
         let snapshot = platform.health_snapshot();
         assert_eq!(
             snapshot
@@ -4003,7 +4406,8 @@ mod tests {
         assert!(protection_json.contains("Image File Execution Options"));
         let rollback_json = fs::read_to_string(rollback_artifact).expect("read rollback artifact");
         assert!(rollback_json.contains(r"HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"));
-        assert!(rollback_json.contains(r"\\REGISTRY\\MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"));
+        assert!(rollback_json
+            .contains(r"\\REGISTRY\\MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"));
         assert!(rollback_json.contains("\"applied_count\": 1"));
         assert!(rollback_json.contains("C:/temp/payload.exe"));
         let block_artifact = snapshot
@@ -4194,6 +4598,7 @@ mod tests {
         let descriptor = platform.descriptor();
         assert_eq!(descriptor.kernel_transport, KernelTransport::Driver);
         assert!(descriptor.supports_registry);
+        assert!(descriptor.supports_etw_integrity);
         let capabilities = platform.capabilities();
         assert!(capabilities.file);
         assert!(capabilities.registry);
@@ -4205,6 +4610,24 @@ mod tests {
         );
         assert_eq!(
             snapshot.provider_health.get("RegistryCallback").copied(),
+            Some(true)
+        );
+        assert_eq!(
+            snapshot.provider_health.get("ObProcess").copied(),
+            Some(true)
+        );
+        assert_eq!(
+            snapshot
+                .integrity_reports
+                .get("platform_protection")
+                .map(|report| report.passed),
+            Some(true)
+        );
+        assert_eq!(
+            snapshot
+                .integrity_reports
+                .get("ssdt")
+                .map(|report| report.passed),
             Some(true)
         );
     }

@@ -87,6 +87,7 @@
     <Link>
       <AdditionalLibraryDirectories>$(WDKContentRoot)Lib\$(WDKBuildFolder)\km\$(Platform);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>ntoskrnl.lib;BufferOverflowFastFailK.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions>
       <EntryPointSymbol>DriverEntry</EntryPointSymbol>
     </Link>
     <DriverSign>
@@ -101,6 +102,7 @@
     <Link>
       <AdditionalLibraryDirectories>$(WDKContentRoot)Lib\$(WDKBuildFolder)\km\$(Platform);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>ntoskrnl.lib;BufferOverflowFastFailK.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions>
       <EntryPointSymbol>DriverEntry</EntryPointSymbol>
     </Link>
     <DriverSign>

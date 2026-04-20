@@ -74,6 +74,24 @@ function Get-ServiceState {
     }
 }
 
+function Ensure-CertificateInstalled {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CertificatePath
+    )
+
+    $certificate = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($CertificatePath)
+    $thumbprint = $certificate.Thumbprint
+    foreach ($storePath in @("Cert:\LocalMachine\Root", "Cert:\LocalMachine\TrustedPublisher")) {
+        $existing = @(Get-ChildItem -Path $storePath -ErrorAction Stop | Where-Object { $_.Thumbprint -eq $thumbprint })
+        if ($existing.Count -eq 0) {
+            Import-Certificate -FilePath $CertificatePath -CertStoreLocation $storePath -ErrorAction Stop | Out-Null
+        }
+    }
+
+    $thumbprint
+}
+
 function Invoke-DriverQuery {
     [uint32]$GENERIC_READ_WRITE = 3221225472
     [uint32]$FILE_SHARE_READ_WRITE = 3
@@ -124,7 +142,9 @@ function Invoke-DriverQuery {
 
 $driverRoot = Resolve-ExistingPath -Path $DriverRoot -Description "driver root"
 $sysPath = Resolve-ExistingPath -Path (Join-Path $driverRoot "build\$Configuration\$Platform\AegisSensorKmod.sys") -Description "driver sys"
+$certificatePath = Resolve-ExistingPath -Path (Join-Path $driverRoot "build\$Configuration\$Platform\AegisSensorKmod.cer") -Description "driver certificate"
 $serviceBinary = "$env:SystemRoot\System32\drivers\AegisSensorKmod.sys"
+$certificateThumbprint = Ensure-CertificateInstalled -CertificatePath $certificatePath
 
 $existingState = Get-ServiceState -Name $ServiceName
 if ($null -ne $existingState) {
@@ -160,5 +180,7 @@ $query = Invoke-DriverQuery
     service_name = $ServiceName
     service_state = $serviceState
     service_binary = $serviceBinary
+    certificate_path = $certificatePath
+    certificate_thumbprint = $certificateThumbprint
     driver_query = $query
 } | ConvertTo-Json -Depth 5 -Compress

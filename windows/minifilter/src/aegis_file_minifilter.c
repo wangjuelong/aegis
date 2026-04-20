@@ -11,6 +11,9 @@ AEGIS_FILE_EVENT_RECORD gFileJournal[AEGIS_FILE_MINIFILTER_QUEUE_CAPACITY];
 ULONG gFileJournalHead = 0;
 ULONG gFileJournalCount = 0;
 ULONG gFileNextSequence = 1;
+FAST_MUTEX gProtectedPathLock;
+WCHAR gProtectedPaths[AEGIS_FILE_PROTECTED_PATH_CAPACITY][AEGIS_FILE_MAX_PATH_CHARS];
+ULONG gProtectedPathCount = 0;
 
 static VOID AegisFileJournalPush(_In_ const AEGIS_FILE_EVENT_RECORD* record);
 static VOID AegisCopyUnicodeString(
@@ -21,6 +24,16 @@ static VOID AegisCopyUnicodeString(
 static VOID AegisRecordFileEvent(
     _In_ PCWSTR operation,
     _Inout_ PFLT_CALLBACK_DATA data
+);
+static ULONG AegisProtectedPathCountUnlocked(VOID);
+static VOID AegisClearProtectedPaths(VOID);
+static NTSTATUS AegisAddProtectedPath(_In_ PCWSTR path);
+static BOOLEAN AegisPathMatchesProtectedPrefix(_In_ PCUNICODE_STRING path);
+static BOOLEAN AegisCreateHasWriteIntent(_In_ PFLT_CALLBACK_DATA Data);
+static BOOLEAN AegisIsProtectedFileOperation(_In_ PFLT_CALLBACK_DATA Data);
+static FLT_PREOP_CALLBACK_STATUS AegisDenyFileOperation(
+    _In_ PCWSTR operation,
+    _Inout_ PFLT_CALLBACK_DATA Data
 );
 
 NTSTATUS
@@ -113,6 +126,10 @@ static ULONG AegisFileJournalCurrentSequenceUnlocked(VOID) {
     return gFileNextSequence - 1;
 }
 
+static ULONG AegisProtectedPathCountUnlocked(VOID) {
+    return gProtectedPathCount;
+}
+
 static VOID AegisCopyUnicodeString(
     _Out_writes_(destination_count) PWCHAR destination,
     _In_ SIZE_T destination_count,
@@ -190,6 +207,175 @@ static VOID AegisRecordFileEvent(
     AegisFileJournalPush(&record);
 }
 
+static VOID AegisClearProtectedPaths(VOID) {
+    ExAcquireFastMutex(&gProtectedPathLock);
+    RtlZeroMemory(gProtectedPaths, sizeof(gProtectedPaths));
+    gProtectedPathCount = 0;
+    ExReleaseFastMutex(&gProtectedPathLock);
+}
+
+static NTSTATUS AegisAddProtectedPath(_In_ PCWSTR path) {
+    UNICODE_STRING candidate;
+    SIZE_T path_length = 0;
+    ULONG index;
+    NTSTATUS status = STATUS_SUCCESS;
+
+    if (path == NULL || path[0] == UNICODE_NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    status = RtlStringCchLengthW(path, AEGIS_FILE_MAX_PATH_CHARS, &path_length);
+    if (!NT_SUCCESS(status) || path_length == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    RtlInitUnicodeString(&candidate, path);
+    ExAcquireFastMutex(&gProtectedPathLock);
+    for (index = 0; index < gProtectedPathCount; index++) {
+        UNICODE_STRING existing;
+        RtlInitUnicodeString(&existing, gProtectedPaths[index]);
+        if (RtlEqualUnicodeString(&existing, &candidate, TRUE)) {
+            ExReleaseFastMutex(&gProtectedPathLock);
+            return STATUS_SUCCESS;
+        }
+    }
+
+    if (gProtectedPathCount >= AEGIS_FILE_PROTECTED_PATH_CAPACITY) {
+        status = STATUS_INSUFFICIENT_RESOURCES;
+    } else {
+        RtlZeroMemory(
+            gProtectedPaths[gProtectedPathCount],
+            sizeof(gProtectedPaths[gProtectedPathCount])
+        );
+        status = RtlStringCchCopyW(
+            gProtectedPaths[gProtectedPathCount],
+            RTL_NUMBER_OF(gProtectedPaths[gProtectedPathCount]),
+            path
+        );
+        if (NT_SUCCESS(status)) {
+            gProtectedPathCount += 1;
+        }
+    }
+    ExReleaseFastMutex(&gProtectedPathLock);
+    return status;
+}
+
+static BOOLEAN AegisPathMatchesProtectedPrefix(_In_ PCUNICODE_STRING path) {
+    ULONG index;
+    BOOLEAN matched = FALSE;
+
+    if (path == NULL || path->Buffer == NULL || path->Length == 0) {
+        return FALSE;
+    }
+
+    ExAcquireFastMutex(&gProtectedPathLock);
+    for (index = 0; index < gProtectedPathCount; index++) {
+        UNICODE_STRING protected_path;
+        SIZE_T protected_chars;
+
+        RtlInitUnicodeString(&protected_path, gProtectedPaths[index]);
+        if (protected_path.Length == 0) {
+            continue;
+        }
+        if (!RtlPrefixUnicodeString(&protected_path, path, TRUE)) {
+            continue;
+        }
+
+        protected_chars = protected_path.Length / sizeof(WCHAR);
+        if (path->Length == protected_path.Length ||
+            protected_path.Buffer[protected_chars - 1] == L'\\' ||
+            path->Buffer[protected_chars] == L'\\') {
+            matched = TRUE;
+            break;
+        }
+    }
+    ExReleaseFastMutex(&gProtectedPathLock);
+
+    return matched;
+}
+
+static BOOLEAN AegisCreateHasWriteIntent(_In_ PFLT_CALLBACK_DATA Data) {
+    ACCESS_MASK desired_access = 0;
+    ULONG create_disposition;
+    ULONG create_options;
+
+    if (Data->Iopb->Parameters.Create.SecurityContext != NULL) {
+        desired_access = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+    }
+
+    if ((desired_access &
+         (FILE_WRITE_DATA |
+          FILE_APPEND_DATA |
+          FILE_WRITE_ATTRIBUTES |
+          FILE_WRITE_EA |
+          DELETE |
+          WRITE_DAC |
+          WRITE_OWNER)) != 0) {
+        return TRUE;
+    }
+
+    create_disposition = (Data->Iopb->Parameters.Create.Options >> 24) & 0x000000ff;
+    create_options = Data->Iopb->Parameters.Create.Options & 0x00ffffff;
+    if ((create_options & FILE_DELETE_ON_CLOSE) != 0) {
+        return TRUE;
+    }
+
+    switch (create_disposition) {
+        case FILE_SUPERSEDE:
+        case FILE_CREATE:
+        case FILE_OPEN_IF:
+        case FILE_OVERWRITE:
+        case FILE_OVERWRITE_IF:
+            return TRUE;
+        default:
+            return FALSE;
+    }
+}
+
+static BOOLEAN AegisIsProtectedFileOperation(_In_ PFLT_CALLBACK_DATA Data) {
+    PFLT_FILE_NAME_INFORMATION file_name_info = NULL;
+    UNICODE_STRING resolved_path = {0};
+    WCHAR resolved_buffer[AEGIS_FILE_MAX_PATH_CHARS];
+    BOOLEAN is_protected = FALSE;
+
+    RtlZeroMemory(resolved_buffer, sizeof(resolved_buffer));
+    if (NT_SUCCESS(FltGetFileNameInformation(
+            Data,
+            FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
+            &file_name_info))) {
+        FltParseFileNameInformation(file_name_info);
+        AegisCopyUnicodeString(
+            resolved_buffer,
+            RTL_NUMBER_OF(resolved_buffer),
+            &file_name_info->Name
+        );
+        FltReleaseFileNameInformation(file_name_info);
+    } else if (Data->Iopb->TargetFileObject != NULL) {
+        AegisCopyUnicodeString(
+            resolved_buffer,
+            RTL_NUMBER_OF(resolved_buffer),
+            &Data->Iopb->TargetFileObject->FileName
+        );
+    }
+
+    if (resolved_buffer[0] == UNICODE_NULL) {
+        return FALSE;
+    }
+
+    RtlInitUnicodeString(&resolved_path, resolved_buffer);
+    is_protected = AegisPathMatchesProtectedPrefix(&resolved_path);
+    return is_protected;
+}
+
+static FLT_PREOP_CALLBACK_STATUS AegisDenyFileOperation(
+    _In_ PCWSTR operation,
+    _Inout_ PFLT_CALLBACK_DATA Data
+) {
+    AegisRecordFileEvent(operation, Data);
+    Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+    Data->IoStatus.Information = 0;
+    return FLT_PREOP_COMPLETE;
+}
+
 NTSTATUS
 AegisFilePortConnect(
     _In_ PFLT_PORT ClientPort,
@@ -229,68 +415,117 @@ AegisFilePortMessage(
     _Out_ PULONG ReturnOutputBufferLength
 ) {
     PAEGIS_FILE_QUERY_REQUEST request = (PAEGIS_FILE_QUERY_REQUEST)InputBuffer;
-    PAEGIS_FILE_QUERY_RESPONSE response = (PAEGIS_FILE_QUERY_RESPONSE)OutputBuffer;
-    ULONG max_from_buffer;
-    ULONG requested_max;
-    ULONG response_index = 0;
-    ULONG journal_index;
-    ULONG available_bytes;
+    ULONG protocol_version;
+    ULONG command;
 
     UNREFERENCED_PARAMETER(PortCookie);
 
     *ReturnOutputBufferLength = 0;
-    if (request == NULL || response == NULL) {
+    if (InputBuffer == NULL || OutputBuffer == NULL) {
         return STATUS_INVALID_USER_BUFFER;
     }
-    if (InputBufferLength < sizeof(*request) || OutputBufferLength < sizeof(*response)) {
+    if (InputBufferLength < (sizeof(ULONG) * 2)) {
         return STATUS_BUFFER_TOO_SMALL;
     }
-    if (request->ProtocolVersion != AEGIS_FILE_MINIFILTER_PROTOCOL_VERSION) {
+    protocol_version = ((PULONG)InputBuffer)[0];
+    command = ((PULONG)InputBuffer)[1];
+    if (protocol_version != AEGIS_FILE_MINIFILTER_PROTOCOL_VERSION) {
         return STATUS_REVISION_MISMATCH;
     }
 
-    RtlZeroMemory(response, sizeof(*response));
-    response->ProtocolVersion = AEGIS_FILE_MINIFILTER_PROTOCOL_VERSION;
-    response->QueueCapacity = AEGIS_FILE_MINIFILTER_QUEUE_CAPACITY;
+    if (command == AEGIS_FILE_COMMAND_QUERY_STATUS ||
+        command == AEGIS_FILE_COMMAND_QUERY_EVENTS) {
+        PAEGIS_FILE_QUERY_RESPONSE response = (PAEGIS_FILE_QUERY_RESPONSE)OutputBuffer;
+        ULONG max_from_buffer;
+        ULONG requested_max;
+        ULONG response_index = 0;
+        ULONG journal_index;
+        ULONG available_bytes;
 
-    ExAcquireFastMutex(&gFileJournalLock);
-    response->OldestSequence = AegisFileJournalOldestSequenceUnlocked();
-    response->CurrentSequence = AegisFileJournalCurrentSequenceUnlocked();
-    if (request->LastSequence != 0 &&
-        response->OldestSequence != 0 &&
-        request->LastSequence + 1 < response->OldestSequence) {
-        response->Overflowed = 1;
-    }
-
-    if (request->Command == AEGIS_FILE_COMMAND_QUERY_EVENTS) {
-        available_bytes = OutputBufferLength - sizeof(*response);
-        max_from_buffer = available_bytes / sizeof(AEGIS_FILE_EVENT_RECORD);
-        requested_max = request->MaxEntries;
-        if (requested_max == 0 || requested_max > max_from_buffer) {
-            requested_max = max_from_buffer;
+        if (InputBufferLength < sizeof(*request) || OutputBufferLength < sizeof(*response)) {
+            return STATUS_BUFFER_TOO_SMALL;
         }
 
-        for (journal_index = 0; journal_index < gFileJournalCount; journal_index++) {
-            ULONG slot =
-                (gFileJournalHead + journal_index) % AEGIS_FILE_MINIFILTER_QUEUE_CAPACITY;
-            if (gFileJournal[slot].Sequence <= request->LastSequence) {
-                continue;
-            }
-            if (response_index >= requested_max) {
-                break;
+        RtlZeroMemory(response, sizeof(*response));
+        response->ProtocolVersion = AEGIS_FILE_MINIFILTER_PROTOCOL_VERSION;
+        response->QueueCapacity = AEGIS_FILE_MINIFILTER_QUEUE_CAPACITY;
+
+        ExAcquireFastMutex(&gFileJournalLock);
+        response->OldestSequence = AegisFileJournalOldestSequenceUnlocked();
+        response->CurrentSequence = AegisFileJournalCurrentSequenceUnlocked();
+        if (request->LastSequence != 0 &&
+            response->OldestSequence != 0 &&
+            request->LastSequence + 1 < response->OldestSequence) {
+            response->Overflowed = 1;
+        }
+        ExAcquireFastMutex(&gProtectedPathLock);
+        response->ProtectedPathCount = AegisProtectedPathCountUnlocked();
+        ExReleaseFastMutex(&gProtectedPathLock);
+
+        if (command == AEGIS_FILE_COMMAND_QUERY_EVENTS) {
+            available_bytes = OutputBufferLength - sizeof(*response);
+            max_from_buffer = available_bytes / sizeof(AEGIS_FILE_EVENT_RECORD);
+            requested_max = request->MaxEntries;
+            if (requested_max == 0 || requested_max > max_from_buffer) {
+                requested_max = max_from_buffer;
             }
 
-            ((PAEGIS_FILE_EVENT_RECORD)(response + 1))[response_index] = gFileJournal[slot];
-            response_index += 1;
+            for (journal_index = 0; journal_index < gFileJournalCount; journal_index++) {
+                ULONG slot =
+                    (gFileJournalHead + journal_index) % AEGIS_FILE_MINIFILTER_QUEUE_CAPACITY;
+                if (gFileJournal[slot].Sequence <= request->LastSequence) {
+                    continue;
+                }
+                if (response_index >= requested_max) {
+                    break;
+                }
+
+                ((PAEGIS_FILE_EVENT_RECORD)(response + 1))[response_index] = gFileJournal[slot];
+                response_index += 1;
+            }
         }
+
+        response->ReturnedCount = response_index;
+        ExReleaseFastMutex(&gFileJournalLock);
+
+        *ReturnOutputBufferLength =
+            sizeof(*response) + (response_index * sizeof(AEGIS_FILE_EVENT_RECORD));
+        return STATUS_SUCCESS;
     }
 
-    response->ReturnedCount = response_index;
-    ExReleaseFastMutex(&gFileJournalLock);
+    if (command == AEGIS_FILE_COMMAND_PROTECT_PATH ||
+        command == AEGIS_FILE_COMMAND_CLEAR_PROTECTED_PATHS) {
+        PAEGIS_FILE_PROTECTION_REQUEST protection_request =
+            (PAEGIS_FILE_PROTECTION_REQUEST)InputBuffer;
+        PAEGIS_FILE_PROTECTION_RESPONSE protection_response =
+            (PAEGIS_FILE_PROTECTION_RESPONSE)OutputBuffer;
+        NTSTATUS status = STATUS_SUCCESS;
 
-    *ReturnOutputBufferLength =
-        sizeof(*response) + (response_index * sizeof(AEGIS_FILE_EVENT_RECORD));
-    return STATUS_SUCCESS;
+        if (InputBufferLength < sizeof(*protection_request) ||
+            OutputBufferLength < sizeof(*protection_response)) {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+
+        if (command == AEGIS_FILE_COMMAND_PROTECT_PATH) {
+            status = AegisAddProtectedPath(protection_request->Path);
+        } else {
+            AegisClearProtectedPaths();
+        }
+
+        if (!NT_SUCCESS(status)) {
+            return status;
+        }
+
+        RtlZeroMemory(protection_response, sizeof(*protection_response));
+        protection_response->ProtocolVersion = AEGIS_FILE_MINIFILTER_PROTOCOL_VERSION;
+        ExAcquireFastMutex(&gProtectedPathLock);
+        protection_response->ProtectedPathCount = AegisProtectedPathCountUnlocked();
+        ExReleaseFastMutex(&gProtectedPathLock);
+        *ReturnOutputBufferLength = sizeof(*protection_response);
+        return STATUS_SUCCESS;
+    }
+
+    return STATUS_INVALID_DEVICE_REQUEST;
 }
 
 FLT_PREOP_CALLBACK_STATUS
@@ -301,6 +536,10 @@ AegisFilePreCreate(
 ) {
     UNREFERENCED_PARAMETER(FltObjects);
     UNREFERENCED_PARAMETER(CompletionContext);
+
+    if (AegisCreateHasWriteIntent(Data) && AegisIsProtectedFileOperation(Data)) {
+        return AegisDenyFileOperation(L"block-create", Data);
+    }
 
     AegisRecordFileEvent(L"open", Data);
     return FLT_PREOP_SUCCESS_NO_CALLBACK;
@@ -314,6 +553,10 @@ AegisFilePreWrite(
 ) {
     UNREFERENCED_PARAMETER(FltObjects);
     UNREFERENCED_PARAMETER(CompletionContext);
+
+    if (AegisIsProtectedFileOperation(Data)) {
+        return AegisDenyFileOperation(L"block-write", Data);
+    }
 
     AegisRecordFileEvent(L"write", Data);
     return FLT_PREOP_SUCCESS_NO_CALLBACK;
@@ -332,9 +575,15 @@ AegisFilePreSetInformation(
 
     info_class = Data->Iopb->Parameters.SetFileInformation.FileInformationClass;
     if (info_class == FileRenameInformation || info_class == FileRenameInformationEx) {
+        if (AegisIsProtectedFileOperation(Data)) {
+            return AegisDenyFileOperation(L"block-rename", Data);
+        }
         AegisRecordFileEvent(L"rename", Data);
     } else if (info_class == FileDispositionInformation ||
                info_class == FileDispositionInformationEx) {
+        if (AegisIsProtectedFileOperation(Data)) {
+            return AegisDenyFileOperation(L"block-delete", Data);
+        }
         AegisRecordFileEvent(L"delete", Data);
     }
 
@@ -376,10 +625,13 @@ DriverEntry(
     UNREFERENCED_PARAMETER(RegistryPath);
 
     ExInitializeFastMutex(&gFileJournalLock);
+    ExInitializeFastMutex(&gProtectedPathLock);
     gFileJournalHead = 0;
     gFileJournalCount = 0;
     gFileNextSequence = 1;
+    gProtectedPathCount = 0;
     RtlZeroMemory(gFileJournal, sizeof(gFileJournal));
+    RtlZeroMemory(gProtectedPaths, sizeof(gProtectedPaths));
 
     status = FltRegisterFilter(DriverObject, &FilterRegistration, &gFilterHandle);
     if (!NT_SUCCESS(status)) {
