@@ -464,6 +464,7 @@ impl WindowsDeviceSnapshot {
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 struct WindowsProtectionSurfaceArtifact {
+    protected_pids: Vec<u32>,
     protected_paths: Vec<String>,
     registry_protection_surface: Vec<String>,
 }
@@ -473,6 +474,37 @@ struct WindowsRegistryRollbackArtifact {
     selector: String,
     protected_paths: Vec<String>,
     registry_protection_surface: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsFirewallBlockReceipt {
+    rule_group: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct WindowsBlockAuditArtifact {
+    kind: String,
+    target: String,
+    ttl_secs: u64,
+    enforced: bool,
+    enforcement_plane: String,
+    firewall_rule_group: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct WindowsBlockClearArtifact {
+    cleared_block_count: usize,
+    cleared_rule_groups: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct WindowsIntegrityAuditArtifact {
+    verify_integrity: IntegrityReport,
+    ssdt: IntegrityReport,
+    callback_tables: IntegrityReport,
+    kernel_code: IntegrityReport,
+    etw_ingest: IntegrityReport,
+    amsi_script: IntegrityReport,
 }
 
 struct WindowsState {
@@ -490,6 +522,7 @@ struct WindowsState {
     known_devices: BTreeMap<String, WindowsDeviceSnapshot>,
     firewall_backup_path: Option<String>,
     firewall_rule_group: Option<String>,
+    block_rule_groups: Vec<String>,
 }
 
 pub struct WindowsPlatform {
@@ -544,6 +577,7 @@ impl WindowsPlatform {
                 known_devices: BTreeMap::new(),
                 firewall_backup_path: None,
                 firewall_rule_group: None,
+                block_rule_groups: Vec::new(),
             }),
         }
     }
@@ -840,52 +874,97 @@ impl PlatformResponse for WindowsPlatform {
 
 impl PreemptiveBlock for WindowsPlatform {
     fn block_hash(&self, hash: &str, ttl: Duration) -> Result<()> {
-        push_block(
-            &mut self.state.lock().expect("windows state poisoned").execution,
+        let mut state = self.state.lock().expect("windows state poisoned");
+        push_block(&mut state.execution, "hash", hash.to_string(), ttl);
+        let artifact_path = write_windows_block_artifact(
+            &mut state,
             "hash",
             hash.to_string(),
             ttl,
-        );
+            false,
+            "userspace-ledger",
+            None,
+        )?;
+        state.execution.audit_artifacts.push(artifact_path);
         Ok(())
     }
 
     fn block_pid(&self, pid: u32, ttl: Duration) -> Result<()> {
-        push_block(
-            &mut self.state.lock().expect("windows state poisoned").execution,
+        let mut state = self.state.lock().expect("windows state poisoned");
+        push_block(&mut state.execution, "pid", pid.to_string(), ttl);
+        let artifact_path = write_windows_block_artifact(
+            &mut state,
             "pid",
             pid.to_string(),
             ttl,
-        );
+            false,
+            "userspace-ledger",
+            None,
+        )?;
+        state.execution.audit_artifacts.push(artifact_path);
         Ok(())
     }
 
     fn block_path(&self, path: &Path, ttl: Duration) -> Result<()> {
-        push_block(
-            &mut self.state.lock().expect("windows state poisoned").execution,
+        let mut state = self.state.lock().expect("windows state poisoned");
+        let target = path.display().to_string();
+        push_block(&mut state.execution, "path", target.clone(), ttl);
+        let artifact_path = write_windows_block_artifact(
+            &mut state,
             "path",
-            path.display().to_string(),
+            target,
             ttl,
-        );
+            false,
+            "userspace-ledger",
+            None,
+        )?;
+        state.execution.audit_artifacts.push(artifact_path);
         Ok(())
     }
 
     fn block_network(&self, target: &NetworkTarget, ttl: Duration) -> Result<()> {
-        push_block(
-            &mut self.state.lock().expect("windows state poisoned").execution,
+        let mut state = self.state.lock().expect("windows state poisoned");
+        ensure_windows_response_host(&state.host, "apply windows network block")?;
+        if !state.host.has_firewall {
+            bail!(
+                "apply windows network block requires firewall capability: {}",
+                state.host.summary()
+            );
+        }
+        let target_value = target.value.clone();
+        let receipt = apply_windows_firewall_block(&mut state, self.runner.as_ref(), &target_value)
+            .with_context(|| format!("apply windows network block {}", target_value))?;
+        state.block_rule_groups.push(receipt.rule_group.clone());
+        push_block(&mut state.execution, "network", target_value.clone(), ttl);
+        let artifact_path = write_windows_block_artifact(
+            &mut state,
             "network",
-            target.value.clone(),
+            target_value,
             ttl,
-        );
+            true,
+            "windows-firewall",
+            Some(receipt.rule_group),
+        )?;
+        state.execution.audit_artifacts.push(artifact_path);
         Ok(())
     }
 
     fn clear_all_blocks(&self) -> Result<()> {
-        self.state
-            .lock()
-            .expect("windows state poisoned")
-            .execution
-            .active_blocks
-            .clear();
+        let mut state = self.state.lock().expect("windows state poisoned");
+        let cleared_rule_groups = state.block_rule_groups.clone();
+        if !cleared_rule_groups.is_empty() {
+            clear_windows_firewall_blocks(&mut state, self.runner.as_ref(), &cleared_rule_groups)
+                .with_context(|| "clear windows firewall block rules")?;
+        }
+        let cleared_block_count = state.execution.active_blocks.len();
+        state.execution.active_blocks.clear();
+        state.block_rule_groups.clear();
+        let artifact_path = write_windows_block_clear_artifact(
+            &mut state,
+            cleared_block_count,
+            cleared_rule_groups,
+        )?;
+        state.execution.audit_artifacts.push(artifact_path);
         Ok(())
     }
 }
@@ -968,12 +1047,10 @@ impl KernelIntegrity for WindowsPlatform {
 
 impl PlatformProtection for WindowsPlatform {
     fn protect_process(&self, pid: u32) -> Result<()> {
-        self.state
-            .lock()
-            .expect("windows state poisoned")
-            .execution
-            .protected_pids
-            .push(pid);
+        let mut state = self.state.lock().expect("windows state poisoned");
+        state.execution.protected_pids.push(pid);
+        record_windows_protection_surface_artifact(&mut state)
+            .with_context(|| "write windows protection surface artifact")?;
         Ok(())
     }
 
@@ -983,15 +1060,18 @@ impl PlatformProtection for WindowsPlatform {
             .execution
             .protected_paths
             .extend(paths.iter().cloned());
-        let artifact_path = write_windows_protection_surface_artifact(&mut state)
+        record_windows_protection_surface_artifact(&mut state)
             .with_context(|| "write windows protection surface artifact")?;
-        state.execution.audit_artifacts.push(artifact_path);
         Ok(())
     }
 
     fn verify_integrity(&self) -> Result<IntegrityReport> {
-        let host = self.host_capabilities();
-        Ok(protection_report(&host))
+        let mut state = self.state.lock().expect("windows state poisoned");
+        let report = protection_report(&state.host);
+        let artifact_path = write_windows_integrity_artifact(&mut state)
+            .with_context(|| "write windows integrity artifact")?;
+        state.execution.audit_artifacts.push(artifact_path);
+        Ok(report)
     }
 
     fn check_etw_integrity(&self) -> Result<EtwStatus> {
@@ -1775,6 +1855,7 @@ const WINDOWS_REGISTRY_PROTECTION_SURFACE: [&str; 5] = [
 
 fn write_windows_protection_surface_artifact(state: &mut WindowsState) -> Result<PathBuf> {
     let artifact = WindowsProtectionSurfaceArtifact {
+        protected_pids: state.execution.protected_pids.clone(),
         protected_paths: state
             .execution
             .protected_paths
@@ -1798,6 +1879,14 @@ fn write_windows_protection_surface_artifact(state: &mut WindowsState) -> Result
     Ok(path)
 }
 
+fn record_windows_protection_surface_artifact(state: &mut WindowsState) -> Result<()> {
+    let artifact_path = write_windows_protection_surface_artifact(state)?;
+    if !state.execution.audit_artifacts.contains(&artifact_path) {
+        state.execution.audit_artifacts.push(artifact_path);
+    }
+    Ok(())
+}
+
 fn write_windows_registry_rollback_artifact(
     state: &mut WindowsState,
     target: &RollbackTarget,
@@ -1819,6 +1908,95 @@ fn write_windows_registry_rollback_artifact(
         .base_dir
         .join("registry")
         .join(format!("rollback-{}.json", Uuid::now_v7().simple()));
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_vec_pretty(&artifact)?;
+    fs::write(&path, json)?;
+    Ok(path)
+}
+
+fn write_windows_block_artifact(
+    state: &mut WindowsState,
+    kind: &str,
+    target: String,
+    ttl: Duration,
+    enforced: bool,
+    enforcement_plane: &str,
+    firewall_rule_group: Option<String>,
+) -> Result<PathBuf> {
+    let artifact = WindowsBlockAuditArtifact {
+        kind: kind.to_string(),
+        target,
+        ttl_secs: ttl.as_secs(),
+        enforced,
+        enforcement_plane: enforcement_plane.to_string(),
+        firewall_rule_group,
+    };
+    let path = state
+        .base_dir
+        .join("blocks")
+        .join(format!("block-{}.json", Uuid::now_v7().simple()));
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_vec_pretty(&artifact)?;
+    fs::write(&path, json)?;
+    Ok(path)
+}
+
+fn write_windows_block_clear_artifact(
+    state: &mut WindowsState,
+    cleared_block_count: usize,
+    cleared_rule_groups: Vec<String>,
+) -> Result<PathBuf> {
+    let artifact = WindowsBlockClearArtifact {
+        cleared_block_count,
+        cleared_rule_groups,
+    };
+    let path = state
+        .base_dir
+        .join("blocks")
+        .join(format!("clear-{}.json", Uuid::now_v7().simple()));
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_vec_pretty(&artifact)?;
+    fs::write(&path, json)?;
+    Ok(path)
+}
+
+fn write_windows_integrity_artifact(state: &mut WindowsState) -> Result<PathBuf> {
+    let artifact = WindowsIntegrityAuditArtifact {
+        verify_integrity: protection_report(&state.host),
+        ssdt: kernel_report(
+            false,
+            format!(
+                "ssdt inspection requires kernel transport and is not implemented; {}",
+                state.host.summary()
+            ),
+        ),
+        callback_tables: kernel_report(
+            false,
+            format!(
+                "callback table inspection requires kernel transport and is not implemented; {}",
+                state.host.summary()
+            ),
+        ),
+        kernel_code: kernel_report(
+            false,
+            format!(
+                "kernel code integrity inspection requires driver support and is not implemented; {}",
+                state.host.summary()
+            ),
+        ),
+        etw_ingest: etw_report(&state.host),
+        amsi_script: amsi_report(&state.host),
+    };
+    let path = state
+        .base_dir
+        .join("integrity")
+        .join(format!("integrity-{}.json", Uuid::now_v7().simple()));
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1870,6 +2048,71 @@ fn build_windows_release_script(rule_group: &str, backup_path: &str) -> String {
         "    Set-NetFirewallProfile -Profile $profile.Name -Enabled ([bool]$profile.Enabled) -DefaultInboundAction $profile.DefaultInboundAction -DefaultOutboundAction $profile.DefaultOutboundAction".to_string(),
         "}".to_string(),
         "Remove-Item -LiteralPath $backupPath -Force".to_string(),
+    ]
+    .join("\n")
+}
+
+fn apply_windows_firewall_block(
+    state: &mut WindowsState,
+    runner: &dyn WindowsCommandRunner,
+    target: &str,
+) -> Result<WindowsFirewallBlockReceipt> {
+    let rule_group = format!("AegisBlock-{}", Uuid::now_v7().simple());
+    let script = build_windows_network_block_script(&rule_group, target);
+    write_windows_response_script(
+        &mut *state,
+        &format!("block-network-{rule_group}.ps1"),
+        &script,
+    )?;
+    run_powershell_json(runner, &script)
+}
+
+fn clear_windows_firewall_blocks(
+    state: &mut WindowsState,
+    runner: &dyn WindowsCommandRunner,
+    rule_groups: &[String],
+) -> Result<()> {
+    let script = build_windows_clear_block_script(rule_groups);
+    write_windows_response_script(
+        &mut *state,
+        &format!("block-clear-{}.ps1", Uuid::now_v7().simple()),
+        &script,
+    )?;
+    runner.run_powershell(&script)?;
+    Ok(())
+}
+
+fn build_windows_network_block_script(rule_group: &str, target: &str) -> String {
+    [
+        format!("$ruleGroup = '{}'", escape_windows_ps_string(rule_group)),
+        format!("$remoteAddress = '{}'", escape_windows_ps_string(target)),
+        "Get-NetFirewallRule -Group $ruleGroup -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue | Out-Null".to_string(),
+        "New-NetFirewallRule -DisplayName ($ruleGroup + '-OutboundBlock') -Group $ruleGroup -Direction Outbound -Action Block -RemoteAddress $remoteAddress | Out-Null".to_string(),
+        "[ordered]@{".to_string(),
+        "    rule_group = $ruleGroup".to_string(),
+        "} | ConvertTo-Json -Compress".to_string(),
+    ]
+    .join("\n")
+}
+
+fn build_windows_clear_block_script(rule_groups: &[String]) -> String {
+    let groups = if rule_groups.is_empty() {
+        "@()".to_string()
+    } else {
+        format!(
+            "@({})",
+            rule_groups
+                .iter()
+                .map(|group| format!("'{}'", escape_windows_ps_string(group)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    [
+        format!("$ruleGroups = {groups}"),
+        "foreach ($ruleGroup in $ruleGroups) {".to_string(),
+        "    Get-NetFirewallRule -Group $ruleGroup -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue | Out-Null".to_string(),
+        "}".to_string(),
     ]
     .join("\n")
 }
@@ -2597,6 +2840,13 @@ mod tests {
         )
     }
 
+    fn firewall_block_output(rule_group: &str) -> String {
+        format!(
+            r#"{{"rule_group":"{}"}}"#,
+            rule_group.replace('\\', "\\\\").replace('"', "\\\"")
+        )
+    }
+
     fn quarantine_receipt_output(vault_path: &Path, sha256: &str) -> String {
         format!(
             r#"{{"vault_path":"{}","sha256":"{}"}}"#,
@@ -2698,6 +2948,16 @@ mod tests {
                     r"C:\ProgramData\Aegis\firewall\backup.json",
                     "AegisIsolation-test",
                 ),
+                String::new(),
+            ])),
+            healthy_host(),
+        )
+    }
+
+    fn platform_with_probe_for_blocks() -> WindowsPlatform {
+        WindowsPlatform::with_runner_for_test(
+            Box::new(QueuedWindowsRunner::new([
+                firewall_block_output("AegisBlock-test"),
                 String::new(),
             ])),
             healthy_host(),
@@ -2816,7 +3076,7 @@ mod tests {
             snapshot.rollback_targets[0].selector,
             r"HKLM\Software\Microsoft\Windows\CurrentVersion\Run"
         );
-        assert_eq!(snapshot.audit_artifacts.len(), 2);
+        assert_eq!(snapshot.audit_artifacts.len(), 3);
         let protection_artifact = snapshot
             .audit_artifacts
             .iter()
@@ -2843,6 +3103,19 @@ mod tests {
         let rollback_json = fs::read_to_string(rollback_artifact).expect("read rollback artifact");
         assert!(rollback_json.contains(r"HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"));
         assert!(rollback_json.contains("C:/temp/payload.exe"));
+        let block_artifact = snapshot
+            .audit_artifacts
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .map(|value| value.starts_with("block-"))
+                    .unwrap_or(false)
+            })
+            .expect("block artifact should exist");
+        let block_json = fs::read_to_string(block_artifact).expect("read block artifact");
+        assert!(block_json.contains("\"kind\": \"hash\""));
+        assert!(block_json.contains("deadbeef"));
         assert!(!snapshot.network_isolation_active);
         assert_eq!(
             snapshot
@@ -2852,6 +3125,66 @@ mod tests {
                 .map(|lease| lease.ttl_secs),
             Some(90)
         );
+    }
+
+    #[test]
+    fn windows_block_and_integrity_artifacts_are_materialized() {
+        let platform = platform_with_probe_for_blocks();
+        platform
+            .block_network(
+                &aegis_model::NetworkTarget {
+                    value: "10.0.0.9".to_string(),
+                },
+                Duration::from_secs(120),
+            )
+            .expect("block network should create firewall rule");
+        let integrity = platform.verify_integrity().expect("verify integrity");
+        assert!(!integrity.passed);
+        platform.clear_all_blocks().expect("clear all blocks");
+
+        let snapshot = platform.execution_snapshot();
+        assert!(snapshot.active_blocks.is_empty());
+        let block_artifact = snapshot
+            .audit_artifacts
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .map(|value| value.starts_with("block-"))
+                    .unwrap_or(false)
+            })
+            .expect("network block artifact should exist");
+        let block_json = fs::read_to_string(block_artifact).expect("read network block artifact");
+        assert!(block_json.contains("\"kind\": \"network\""));
+        assert!(block_json.contains("\"enforced\": true"));
+        assert!(block_json.contains("AegisBlock-test"));
+        let integrity_artifact = snapshot
+            .audit_artifacts
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .map(|value| value.starts_with("integrity-"))
+                    .unwrap_or(false)
+            })
+            .expect("integrity artifact should exist");
+        let integrity_json =
+            fs::read_to_string(integrity_artifact).expect("read integrity artifact");
+        assert!(integrity_json.contains("\"verify_integrity\""));
+        assert!(integrity_json.contains("\"etw_ingest\""));
+        let clear_artifact = snapshot
+            .audit_artifacts
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .map(|value| value.starts_with("clear-"))
+                    .unwrap_or(false)
+            })
+            .expect("block clear artifact should exist");
+        let clear_json = fs::read_to_string(clear_artifact).expect("read clear artifact");
+        assert!(clear_json.contains("\"cleared_block_count\": 1"));
+        assert!(clear_json.contains("AegisBlock-test"));
     }
 
     #[test]
