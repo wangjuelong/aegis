@@ -172,6 +172,7 @@ struct WindowsHostCapabilities {
     has_wmi_log: bool,
     has_task_scheduler_log: bool,
     has_sysmon_log: bool,
+    has_process_creation_events: bool,
     has_net_connection: bool,
     has_firewall: bool,
     has_registry_cli: bool,
@@ -193,7 +194,9 @@ impl WindowsHostCapabilities {
         }
 
         match provider {
-            WindowsProviderKind::EtwProcess => self.any_event_log(),
+            WindowsProviderKind::EtwProcess => {
+                self.any_event_log() && self.has_process_creation_events
+            }
             WindowsProviderKind::PsProcess => self.has_process_inventory,
             WindowsProviderKind::ObProcess => false,
             WindowsProviderKind::MinifilterFile => false,
@@ -226,6 +229,10 @@ impl WindowsHostCapabilities {
         facts.push(format!("admin={}", self.is_admin));
         facts.push(format!("process_inventory={}", self.has_process_inventory));
         facts.push(format!("event_logs={}", self.any_event_log()));
+        facts.push(format!(
+            "process_creation_audit={}",
+            self.has_process_creation_events
+        ));
         facts.join(", ")
     }
 }
@@ -243,6 +250,7 @@ struct WindowsCapabilityProbe {
     has_wmi_log: bool,
     has_task_scheduler_log: bool,
     has_sysmon_log: bool,
+    has_process_creation_events: bool,
     has_net_connection: bool,
     has_firewall: bool,
     has_registry_cli: bool,
@@ -279,6 +287,31 @@ struct WindowsTasklistSnapshot {
     image_name: String,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsProcessAuditCursor {
+    record_id: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsSecurityProcessEvent {
+    record_id: u64,
+    #[serde(default)]
+    process_name: Option<String>,
+    #[serde(default)]
+    command_line: Option<String>,
+}
+
+impl WindowsSecurityProcessEvent {
+    fn subject(&self) -> String {
+        truncate_subject(&format!(
+            "record_id={};process={};cmdline={}",
+            self.record_id,
+            self.process_name.as_deref().unwrap_or("-"),
+            self.command_line.as_deref().unwrap_or("-")
+        ))
+    }
+}
+
 struct WindowsState {
     base_dir: PathBuf,
     pending_events: VecDeque<Vec<u8>>,
@@ -286,6 +319,7 @@ struct WindowsState {
     host: WindowsHostCapabilities,
     host_capabilities_pinned: bool,
     known_processes: BTreeMap<u32, WindowsProcessSnapshot>,
+    security_process_cursor: Option<u64>,
 }
 
 pub struct WindowsPlatform {
@@ -301,7 +335,10 @@ impl Default for WindowsPlatform {
 }
 
 impl WindowsPlatform {
-    fn new_with_runner(runner: Box<dyn WindowsCommandRunner>, host_capabilities_pinned: bool) -> Self {
+    fn new_with_runner(
+        runner: Box<dyn WindowsCommandRunner>,
+        host_capabilities_pinned: bool,
+    ) -> Self {
         let execution_mode = runner.mode_name().to_string();
         Self {
             providers: vec![
@@ -329,6 +366,7 @@ impl WindowsPlatform {
                 },
                 host_capabilities_pinned,
                 known_processes: BTreeMap::new(),
+                security_process_cursor: None,
             }),
         }
     }
@@ -339,11 +377,7 @@ impl WindowsPlatform {
         host: WindowsHostCapabilities,
     ) -> Self {
         let platform = Self::new_with_runner(runner, true);
-        platform
-            .state
-            .lock()
-            .expect("windows state poisoned")
-            .host = host;
+        platform.state.lock().expect("windows state poisoned").host = host;
         platform
     }
 
@@ -434,6 +468,12 @@ impl PlatformSensor for WindowsPlatform {
                 .with_context(|| "snapshot initial windows process inventory")?;
         } else {
             state.known_processes.clear();
+        }
+        if state.host.has_process_creation_events {
+            state.security_process_cursor = latest_process_audit_record_id(self.runner.as_ref())
+                .with_context(|| "snapshot initial windows process audit cursor")?;
+        } else {
+            state.security_process_cursor = None;
         }
         state.execution.running = true;
         Ok(())
@@ -713,7 +753,10 @@ impl PlatformProtection for WindowsPlatform {
     fn check_etw_integrity(&self) -> Result<EtwStatus> {
         let host = self.host_capabilities();
         Ok(EtwStatus {
-            healthy: host.reachable && host.running_on_windows && host.any_event_log(),
+            healthy: host.reachable
+                && host.running_on_windows
+                && host.any_event_log()
+                && host.has_process_creation_events,
         })
     }
 
@@ -764,6 +807,13 @@ $hasLog = {
     }
 }
 
+$hasProcessCreationEvents = $false
+try {
+    $hasProcessCreationEvents = (Get-WinEvent -FilterHashtable @{ LogName='Security'; Id=4688 } -MaxEvents 1 -ErrorAction Stop | Select-Object -First 1) -ne $null
+} catch {
+    $hasProcessCreationEvents = $false
+}
+
 $data = [ordered]@{
     computer_name = $env:COMPUTERNAME
     user_name = (whoami)
@@ -774,6 +824,7 @@ $data = [ordered]@{
     has_wmi_log = & $hasLog 'Microsoft-Windows-WMI-Activity/Operational'
     has_task_scheduler_log = & $hasLog 'Microsoft-Windows-TaskScheduler/Operational'
     has_sysmon_log = & $hasLog 'Microsoft-Windows-Sysmon/Operational'
+    has_process_creation_events = $hasProcessCreationEvents
     has_net_connection = (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) -ne $null
     has_firewall = ((Get-Command Get-NetFirewallRule -ErrorAction SilentlyContinue) -ne $null) -and ((Get-Command netsh.exe -ErrorAction SilentlyContinue) -ne $null)
     has_registry_cli = (Get-Command reg.exe -ErrorAction SilentlyContinue) -ne $null
@@ -796,6 +847,7 @@ $data | ConvertTo-Json -Compress
         has_wmi_log: probe.has_wmi_log,
         has_task_scheduler_log: probe.has_task_scheduler_log,
         has_sysmon_log: probe.has_sysmon_log,
+        has_process_creation_events: probe.has_process_creation_events,
         has_net_connection: probe.has_net_connection,
         has_firewall: probe.has_firewall,
         has_registry_cli: probe.has_registry_cli,
@@ -819,7 +871,25 @@ fn collect_live_windows_events(
     if state.host.has_process_inventory {
         collect_process_delta_events(state, runner)?;
     }
+    if state.host.has_process_creation_events {
+        collect_security_process_audit_events(state, runner)?;
+    }
     Ok(())
+}
+
+fn latest_process_audit_record_id(runner: &dyn WindowsCommandRunner) -> Result<Option<u64>> {
+    let script = r#"
+$event = Get-WinEvent -FilterHashtable @{ LogName='Security'; Id=4688 } -MaxEvents 1 -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($null -eq $event) {
+    'null'
+} else {
+    [ordered]@{
+        record_id = [uint64]$event.RecordId
+    } | ConvertTo-Json -Compress
+}
+"#;
+    let cursor: Option<WindowsProcessAuditCursor> = run_powershell_json(runner, script)?;
+    Ok(cursor.map(|value| value.record_id))
 }
 
 fn collect_process_delta_events(
@@ -857,6 +927,32 @@ fn collect_process_delta_events(
     Ok(())
 }
 
+fn collect_security_process_audit_events(
+    state: &mut WindowsState,
+    runner: &dyn WindowsCommandRunner,
+) -> Result<()> {
+    let Some(after_record_id) = state.security_process_cursor else {
+        state.security_process_cursor = latest_process_audit_record_id(runner)?;
+        return Ok(());
+    };
+
+    let events = snapshot_security_process_events_after(runner, after_record_id)?;
+    if let Some(last) = events.last() {
+        state.security_process_cursor = Some(last.record_id);
+    }
+    for event in events {
+        state.pending_events.push_back(
+            WindowsEventStub {
+                provider: WindowsProviderKind::EtwProcess,
+                operation: "process-audit".to_string(),
+                subject: event.subject(),
+            }
+            .encode(),
+        );
+    }
+    Ok(())
+}
+
 fn snapshot_process_inventory(
     runner: &dyn WindowsCommandRunner,
 ) -> Result<BTreeMap<u32, WindowsProcessSnapshot>> {
@@ -881,6 +977,39 @@ $rows | ConvertTo-Json -Compress
         .into_iter()
         .map(|process| (process.process_id, process))
         .collect())
+}
+
+fn snapshot_security_process_events_after(
+    runner: &dyn WindowsCommandRunner,
+    after_record_id: u64,
+) -> Result<Vec<WindowsSecurityProcessEvent>> {
+    let script = format!(
+        r#"
+$afterRecordId = [uint64]{after_record_id}
+$rows = @(
+    Get-WinEvent -FilterHashtable @{{ LogName='Security'; Id=4688 }} -ErrorAction SilentlyContinue |
+        Where-Object {{ [uint64]$_.RecordId -gt $afterRecordId }} |
+        Sort-Object RecordId |
+        ForEach-Object {{
+            $xml = [xml]$_.ToXml()
+            $eventData = @{{}}
+            foreach ($item in $xml.Event.EventData.Data) {{
+                if ($item.Name) {{
+                    $eventData[$item.Name] = [string]$item.'#text'
+                }}
+            }}
+            [ordered]@{{
+                record_id = [uint64]$_.RecordId
+                process_name = $eventData['NewProcessName']
+                command_line = $eventData['ProcessCommandLine']
+            }}
+        }}
+)
+
+$rows | ConvertTo-Json -Compress
+"#
+    );
+    run_powershell_json(runner, &script)
 }
 
 fn snapshot_tasklist_inventory(
@@ -1135,6 +1264,7 @@ mod tests {
             has_wmi_log: true,
             has_task_scheduler_log: true,
             has_sysmon_log: false,
+            has_process_creation_events: true,
             has_net_connection: true,
             has_firewall: true,
             has_registry_cli: true,
@@ -1143,7 +1273,29 @@ mod tests {
     }
 
     fn probe_output() -> String {
-        r#"{"computer_name":"DESKTOP-TLASHJG","user_name":"desktop-tlashjg\\lamba","is_admin":true,"has_process_inventory":true,"has_security_log":true,"has_powershell_log":true,"has_wmi_log":true,"has_task_scheduler_log":true,"has_sysmon_log":false,"has_net_connection":true,"has_firewall":true,"has_registry_cli":true}"#.to_string()
+        r#"{"computer_name":"DESKTOP-TLASHJG","user_name":"desktop-tlashjg\\lamba","is_admin":true,"has_process_inventory":true,"has_security_log":true,"has_powershell_log":true,"has_wmi_log":true,"has_task_scheduler_log":true,"has_sysmon_log":false,"has_process_creation_events":true,"has_net_connection":true,"has_firewall":true,"has_registry_cli":true}"#.to_string()
+    }
+
+    fn audit_cursor_output(record_id: u64) -> String {
+        format!(r#"{{"record_id":{record_id}}}"#)
+    }
+
+    fn security_process_event_output(entries: &[(u64, Option<&str>, Option<&str>)]) -> String {
+        let rows = entries
+            .iter()
+            .map(|(record_id, process_name, command_line)| {
+                let process_name = process_name
+                    .map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+                    .unwrap_or_else(|| "null".to_string());
+                let command_line = command_line
+                    .map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+                    .unwrap_or_else(|| "null".to_string());
+                format!(
+                    "{{\"record_id\":{record_id},\"process_name\":{process_name},\"command_line\":{command_line}}}"
+                )
+            })
+            .collect::<Vec<_>>();
+        format!("[{}]", rows.join(","))
     }
 
     fn process_output(processes: &[(&str, u32, u32, Option<&str>)]) -> String {
@@ -1178,8 +1330,21 @@ mod tests {
     fn platform_with_probe_and_processes(
         processes: impl IntoIterator<Item = String>,
     ) -> WindowsPlatform {
-        let mut responses = vec![probe_output()];
-        responses.extend(processes);
+        let processes = processes.into_iter().collect::<Vec<_>>();
+        assert!(
+            !processes.is_empty(),
+            "platform_with_probe_and_processes requires at least one process snapshot"
+        );
+
+        let mut responses = vec![
+            probe_output(),
+            processes[0].clone(),
+            audit_cursor_output(900),
+        ];
+        for snapshot in processes.into_iter().skip(1) {
+            responses.push(snapshot);
+            responses.push(security_process_event_output(&[]));
+        }
         WindowsPlatform::new_with_runner(Box::new(QueuedWindowsRunner::new(responses)), false)
     }
 
@@ -1223,8 +1388,7 @@ mod tests {
     #[test]
     fn windows_baseline_polls_injected_events() {
         let baseline = process_output(&[("System", 4, 0, None)]);
-        let mut platform =
-            platform_with_probe_and_processes([baseline.clone(), baseline]);
+        let mut platform = platform_with_probe_and_processes([baseline.clone(), baseline]);
         platform
             .start(&SensorConfig {
                 profile: "windows".to_string(),
@@ -1303,9 +1467,8 @@ mod tests {
 
     #[test]
     fn windows_health_snapshot_reports_real_host_probe_state() {
-        let mut platform = platform_with_probe_and_processes([process_output(&[
-            ("System", 4, 0, None),
-        ])]);
+        let mut platform =
+            platform_with_probe_and_processes([process_output(&[("System", 4, 0, None)])]);
         platform
             .start(&SensorConfig {
                 profile: "windows".to_string(),
@@ -1408,5 +1571,67 @@ mod tests {
         assert_eq!(suspicious.len(), 2);
         assert!(suspicious.iter().any(|entry| entry.pid == 500));
         assert!(suspicious.iter().any(|entry| entry.pid == 600));
+    }
+
+    #[test]
+    fn windows_poll_events_emits_security_process_audit_delta_once() {
+        let mut platform = WindowsPlatform::new_with_runner(
+            Box::new(QueuedWindowsRunner::new([
+                probe_output(),
+                process_output(&[("System", 4, 0, None)]),
+                audit_cursor_output(100),
+                process_output(&[("System", 4, 0, None)]),
+                security_process_event_output(&[(
+                    101,
+                    Some("C:\\Windows\\System32\\cmd.exe"),
+                    Some("cmd.exe /c whoami"),
+                )]),
+                process_output(&[("System", 4, 0, None)]),
+                security_process_event_output(&[]),
+            ])),
+            false,
+        );
+        platform
+            .start(&SensorConfig {
+                profile: "windows".to_string(),
+                queue_capacity: 1024,
+            })
+            .expect("start windows runtime");
+
+        let mut first_buffer = EventBuffer::default();
+        let first_drained = platform
+            .poll_events(&mut first_buffer)
+            .expect("poll security audit events");
+
+        assert_eq!(first_drained, 1);
+        let first_event = String::from_utf8(first_buffer.records[0].clone()).expect("event utf8");
+        assert!(first_event.contains("EtwProcess"));
+        assert!(first_event.contains("process-audit"));
+        assert!(first_event.contains("cmd.exe"));
+
+        let mut second_buffer = EventBuffer::default();
+        let second_drained = platform
+            .poll_events(&mut second_buffer)
+            .expect("poll security audit events again");
+
+        assert_eq!(second_drained, 0);
+        assert!(second_buffer.records.is_empty());
+    }
+
+    #[test]
+    fn windows_etw_integrity_requires_process_creation_audit() {
+        let mut host = healthy_host();
+        host.has_process_creation_events = false;
+        let platform = WindowsPlatform::with_runner_for_test(
+            Box::new(QueuedWindowsRunner::new(Vec::<String>::new())),
+            host,
+        );
+
+        assert!(
+            !platform
+                .check_etw_integrity()
+                .expect("etw integrity")
+                .healthy
+        );
     }
 }
