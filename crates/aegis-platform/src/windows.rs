@@ -176,6 +176,10 @@ struct WindowsHostCapabilities {
     has_net_connection: bool,
     has_firewall: bool,
     has_registry_cli: bool,
+    has_named_pipe_inventory: bool,
+    has_module_inventory: bool,
+    has_vss_inventory: bool,
+    has_device_inventory: bool,
     last_error: Option<String>,
 }
 
@@ -204,10 +208,10 @@ impl WindowsHostCapabilities {
             WindowsProviderKind::RegistryCallback => false,
             WindowsProviderKind::AmsiScript => false,
             WindowsProviderKind::MemorySensor => false,
-            WindowsProviderKind::IpcSensor => false,
-            WindowsProviderKind::ModuleLoadSensor => false,
-            WindowsProviderKind::SnapshotProtection => false,
-            WindowsProviderKind::DeviceControl => false,
+            WindowsProviderKind::IpcSensor => self.has_named_pipe_inventory,
+            WindowsProviderKind::ModuleLoadSensor => self.has_module_inventory,
+            WindowsProviderKind::SnapshotProtection => self.has_vss_inventory,
+            WindowsProviderKind::DeviceControl => self.has_device_inventory,
         }
     }
 
@@ -254,6 +258,10 @@ struct WindowsCapabilityProbe {
     has_net_connection: bool,
     has_firewall: bool,
     has_registry_cli: bool,
+    has_named_pipe_inventory: bool,
+    has_module_inventory: bool,
+    has_vss_inventory: bool,
+    has_device_inventory: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -369,6 +377,80 @@ struct WindowsFirewallIsolationReceipt {
     rule_group: String,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsNamedPipeSnapshot {
+    pipe_name: String,
+}
+
+impl WindowsNamedPipeSnapshot {
+    fn subject(&self) -> String {
+        truncate_subject(&format!("pipe={}", self.pipe_name))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsModuleSnapshot {
+    process_id: u32,
+    process_name: String,
+    module_path: String,
+}
+
+impl WindowsModuleSnapshot {
+    fn key(&self) -> String {
+        format!(
+            "{}|{}|{}",
+            self.process_id, self.process_name, self.module_path
+        )
+    }
+
+    fn subject(&self) -> String {
+        truncate_subject(&format!(
+            "pid={};process={};module={}",
+            self.process_id, self.process_name, self.module_path
+        ))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsVssSnapshot {
+    snapshot_id: String,
+    #[serde(default)]
+    volume_name: Option<String>,
+}
+
+impl WindowsVssSnapshot {
+    fn subject(&self) -> String {
+        truncate_subject(&format!(
+            "snapshot_id={};volume={}",
+            self.snapshot_id,
+            self.volume_name.as_deref().unwrap_or("-")
+        ))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsDeviceSnapshot {
+    instance_id: String,
+    #[serde(default)]
+    class: Option<String>,
+    #[serde(default)]
+    friendly_name: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+impl WindowsDeviceSnapshot {
+    fn subject(&self) -> String {
+        truncate_subject(&format!(
+            "instance_id={};class={};friendly_name={};status={}",
+            self.instance_id,
+            self.class.as_deref().unwrap_or("-"),
+            self.friendly_name.as_deref().unwrap_or("-"),
+            self.status.as_deref().unwrap_or("-")
+        ))
+    }
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 struct WindowsProtectionSurfaceArtifact {
     protected_paths: Vec<String>,
@@ -391,6 +473,10 @@ struct WindowsState {
     known_processes: BTreeMap<u32, WindowsProcessSnapshot>,
     security_process_cursor: Option<u64>,
     known_connections: BTreeMap<String, WindowsNetworkConnection>,
+    known_named_pipes: BTreeMap<String, WindowsNamedPipeSnapshot>,
+    known_modules: BTreeMap<String, WindowsModuleSnapshot>,
+    known_vss_snapshots: BTreeMap<String, WindowsVssSnapshot>,
+    known_devices: BTreeMap<String, WindowsDeviceSnapshot>,
     firewall_backup_path: Option<String>,
     firewall_rule_group: Option<String>,
 }
@@ -441,6 +527,10 @@ impl WindowsPlatform {
                 known_processes: BTreeMap::new(),
                 security_process_cursor: None,
                 known_connections: BTreeMap::new(),
+                known_named_pipes: BTreeMap::new(),
+                known_modules: BTreeMap::new(),
+                known_vss_snapshots: BTreeMap::new(),
+                known_devices: BTreeMap::new(),
                 firewall_backup_path: None,
                 firewall_rule_group: None,
             }),
@@ -556,6 +646,30 @@ impl PlatformSensor for WindowsPlatform {
                 .with_context(|| "snapshot initial windows network inventory")?;
         } else {
             state.known_connections.clear();
+        }
+        if state.host.has_named_pipe_inventory {
+            state.known_named_pipes = snapshot_named_pipe_inventory(self.runner.as_ref())
+                .with_context(|| "snapshot initial windows named pipe inventory")?;
+        } else {
+            state.known_named_pipes.clear();
+        }
+        if state.host.has_module_inventory {
+            state.known_modules = snapshot_module_inventory(self.runner.as_ref())
+                .with_context(|| "snapshot initial windows module inventory")?;
+        } else {
+            state.known_modules.clear();
+        }
+        if state.host.has_vss_inventory {
+            state.known_vss_snapshots = snapshot_vss_inventory(self.runner.as_ref())
+                .with_context(|| "snapshot initial windows vss inventory")?;
+        } else {
+            state.known_vss_snapshots.clear();
+        }
+        if state.host.has_device_inventory {
+            state.known_devices = snapshot_device_inventory(self.runner.as_ref())
+                .with_context(|| "snapshot initial windows device inventory")?;
+        } else {
+            state.known_devices.clear();
         }
         state.execution.running = true;
         Ok(())
@@ -908,6 +1022,47 @@ try {
     $hasProcessCreationEvents = $false
 }
 
+$hasNamedPipeInventory = $false
+try {
+    $null = Get-ChildItem -Path '\\.\pipe\' -ErrorAction Stop | Select-Object -First 1
+    $hasNamedPipeInventory = $true
+} catch {
+    $hasNamedPipeInventory = $false
+}
+
+$hasModuleInventory = $false
+if ((Get-Command Get-Process -ErrorAction SilentlyContinue) -ne $null) {
+    try {
+        $probeProcess = Get-Process -ErrorAction Stop | Where-Object { $_.Path } | Select-Object -First 1
+        if ($null -ne $probeProcess) {
+            $null = $probeProcess.Modules | Select-Object -First 1
+            $hasModuleInventory = $true
+        }
+    } catch {
+        $hasModuleInventory = $false
+    }
+}
+
+$hasVssInventory = $false
+if ((Get-Command Get-CimInstance -ErrorAction SilentlyContinue) -ne $null) {
+    try {
+        $null = Get-CimInstance Win32_ShadowCopy -ErrorAction Stop | Select-Object -First 1
+        $hasVssInventory = $true
+    } catch {
+        $hasVssInventory = $false
+    }
+}
+
+$hasDeviceInventory = $false
+if ((Get-Command Get-PnpDevice -ErrorAction SilentlyContinue) -ne $null) {
+    try {
+        $null = Get-PnpDevice -ErrorAction Stop | Select-Object -First 1
+        $hasDeviceInventory = $true
+    } catch {
+        $hasDeviceInventory = $false
+    }
+}
+
 $data = [ordered]@{
     computer_name = $env:COMPUTERNAME
     user_name = (whoami)
@@ -922,6 +1077,10 @@ $data = [ordered]@{
     has_net_connection = (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) -ne $null
     has_firewall = ((Get-Command Get-NetFirewallRule -ErrorAction SilentlyContinue) -ne $null) -and ((Get-Command netsh.exe -ErrorAction SilentlyContinue) -ne $null)
     has_registry_cli = (Get-Command reg.exe -ErrorAction SilentlyContinue) -ne $null
+    has_named_pipe_inventory = $hasNamedPipeInventory
+    has_module_inventory = $hasModuleInventory
+    has_vss_inventory = $hasVssInventory
+    has_device_inventory = $hasDeviceInventory
 }
 
 $data | ConvertTo-Json -Compress
@@ -945,6 +1104,10 @@ $data | ConvertTo-Json -Compress
         has_net_connection: probe.has_net_connection,
         has_firewall: probe.has_firewall,
         has_registry_cli: probe.has_registry_cli,
+        has_named_pipe_inventory: probe.has_named_pipe_inventory,
+        has_module_inventory: probe.has_module_inventory,
+        has_vss_inventory: probe.has_vss_inventory,
+        has_device_inventory: probe.has_device_inventory,
         last_error: None,
     })
 }
@@ -970,6 +1133,18 @@ fn collect_live_windows_events(
     }
     if state.host.has_net_connection {
         collect_network_delta_events(state, runner)?;
+    }
+    if state.host.has_named_pipe_inventory {
+        collect_named_pipe_events(state, runner)?;
+    }
+    if state.host.has_module_inventory {
+        collect_module_events(state, runner)?;
+    }
+    if state.host.has_vss_inventory {
+        collect_vss_events(state, runner)?;
+    }
+    if state.host.has_device_inventory {
+        collect_device_events(state, runner)?;
     }
     Ok(())
 }
@@ -1085,6 +1260,143 @@ fn collect_network_delta_events(
     Ok(())
 }
 
+fn collect_named_pipe_events(
+    state: &mut WindowsState,
+    runner: &dyn WindowsCommandRunner,
+) -> Result<()> {
+    let current = snapshot_named_pipe_inventory(runner)?;
+    for (key, pipe) in &current {
+        if !state.known_named_pipes.contains_key(key) {
+            state.pending_events.push_back(
+                WindowsEventStub {
+                    provider: WindowsProviderKind::IpcSensor,
+                    operation: "pipe-visible".to_string(),
+                    subject: pipe.subject(),
+                }
+                .encode(),
+            );
+        }
+    }
+
+    for (key, pipe) in &state.known_named_pipes {
+        if !current.contains_key(key) {
+            state.pending_events.push_back(
+                WindowsEventStub {
+                    provider: WindowsProviderKind::IpcSensor,
+                    operation: "pipe-gone".to_string(),
+                    subject: pipe.subject(),
+                }
+                .encode(),
+            );
+        }
+    }
+
+    state.known_named_pipes = current;
+    Ok(())
+}
+
+fn collect_module_events(
+    state: &mut WindowsState,
+    runner: &dyn WindowsCommandRunner,
+) -> Result<()> {
+    let current = snapshot_module_inventory(runner)?;
+    for (key, module) in &current {
+        if !state.known_modules.contains_key(key) {
+            state.pending_events.push_back(
+                WindowsEventStub {
+                    provider: WindowsProviderKind::ModuleLoadSensor,
+                    operation: "module-visible".to_string(),
+                    subject: module.subject(),
+                }
+                .encode(),
+            );
+        }
+    }
+
+    for (key, module) in &state.known_modules {
+        if !current.contains_key(key) {
+            state.pending_events.push_back(
+                WindowsEventStub {
+                    provider: WindowsProviderKind::ModuleLoadSensor,
+                    operation: "module-gone".to_string(),
+                    subject: module.subject(),
+                }
+                .encode(),
+            );
+        }
+    }
+
+    state.known_modules = current;
+    Ok(())
+}
+
+fn collect_vss_events(state: &mut WindowsState, runner: &dyn WindowsCommandRunner) -> Result<()> {
+    let current = snapshot_vss_inventory(runner)?;
+    for (key, snapshot) in &current {
+        if !state.known_vss_snapshots.contains_key(key) {
+            state.pending_events.push_back(
+                WindowsEventStub {
+                    provider: WindowsProviderKind::SnapshotProtection,
+                    operation: "shadow-visible".to_string(),
+                    subject: snapshot.subject(),
+                }
+                .encode(),
+            );
+        }
+    }
+
+    for (key, snapshot) in &state.known_vss_snapshots {
+        if !current.contains_key(key) {
+            state.pending_events.push_back(
+                WindowsEventStub {
+                    provider: WindowsProviderKind::SnapshotProtection,
+                    operation: "shadow-gone".to_string(),
+                    subject: snapshot.subject(),
+                }
+                .encode(),
+            );
+        }
+    }
+
+    state.known_vss_snapshots = current;
+    Ok(())
+}
+
+fn collect_device_events(
+    state: &mut WindowsState,
+    runner: &dyn WindowsCommandRunner,
+) -> Result<()> {
+    let current = snapshot_device_inventory(runner)?;
+    for (key, device) in &current {
+        if !state.known_devices.contains_key(key) {
+            state.pending_events.push_back(
+                WindowsEventStub {
+                    provider: WindowsProviderKind::DeviceControl,
+                    operation: "device-visible".to_string(),
+                    subject: device.subject(),
+                }
+                .encode(),
+            );
+        }
+    }
+
+    for (key, device) in &state.known_devices {
+        if !current.contains_key(key) {
+            state.pending_events.push_back(
+                WindowsEventStub {
+                    provider: WindowsProviderKind::DeviceControl,
+                    operation: "device-gone".to_string(),
+                    subject: device.subject(),
+                }
+                .encode(),
+            );
+        }
+    }
+
+    state.known_devices = current;
+    Ok(())
+}
+
 fn snapshot_process_inventory(
     runner: &dyn WindowsCommandRunner,
 ) -> Result<BTreeMap<u32, WindowsProcessSnapshot>> {
@@ -1193,6 +1505,116 @@ $rows | ConvertTo-Json -Compress
     Ok(rows
         .into_iter()
         .map(|connection| (connection.key(), connection))
+        .collect())
+}
+
+fn snapshot_named_pipe_inventory(
+    runner: &dyn WindowsCommandRunner,
+) -> Result<BTreeMap<String, WindowsNamedPipeSnapshot>> {
+    let script = r#"
+$rows = @(
+    Get-ChildItem -Path '\\.\pipe\' -ErrorAction Stop |
+        Sort-Object Name |
+        ForEach-Object {
+            [ordered]@{
+                pipe_name = ('\\.\pipe\' + [string]$_.Name)
+            }
+        }
+)
+
+@($rows) | ConvertTo-Json -Compress
+"#;
+    let rows: Vec<WindowsNamedPipeSnapshot> = run_powershell_json(runner, script)?;
+    Ok(rows
+        .into_iter()
+        .map(|pipe| (pipe.pipe_name.clone(), pipe))
+        .collect())
+}
+
+fn snapshot_module_inventory(
+    runner: &dyn WindowsCommandRunner,
+) -> Result<BTreeMap<String, WindowsModuleSnapshot>> {
+    let script = r#"
+$rows = @(
+    Get-Process -ErrorAction Stop |
+        Sort-Object Id |
+        ForEach-Object {
+            $process = $_
+            try {
+                @(
+                    $process.Modules |
+                        Where-Object { $_.FileName } |
+                        Sort-Object FileName |
+                        ForEach-Object {
+                            [ordered]@{
+                                process_id = [uint32]$process.Id
+                                process_name = [string]$process.ProcessName
+                                module_path = [string]$_.FileName
+                            }
+                        }
+                )
+            } catch {
+                @()
+            }
+        }
+)
+
+@($rows) | ConvertTo-Json -Compress
+"#;
+    let rows: Vec<WindowsModuleSnapshot> = run_powershell_json(runner, script)?;
+    Ok(rows
+        .into_iter()
+        .map(|module| (module.key(), module))
+        .collect())
+}
+
+fn snapshot_vss_inventory(
+    runner: &dyn WindowsCommandRunner,
+) -> Result<BTreeMap<String, WindowsVssSnapshot>> {
+    let script = r#"
+$rows = @(
+    Get-CimInstance Win32_ShadowCopy -ErrorAction Stop |
+        Sort-Object ID |
+        ForEach-Object {
+            [ordered]@{
+                snapshot_id = [string]$_.ID
+                volume_name = if ($_.VolumeName) { [string]$_.VolumeName } else { $null }
+            }
+        }
+)
+
+@($rows) | ConvertTo-Json -Compress
+"#;
+    let rows: Vec<WindowsVssSnapshot> = run_powershell_json(runner, script)?;
+    Ok(rows
+        .into_iter()
+        .map(|snapshot| (snapshot.snapshot_id.clone(), snapshot))
+        .collect())
+}
+
+fn snapshot_device_inventory(
+    runner: &dyn WindowsCommandRunner,
+) -> Result<BTreeMap<String, WindowsDeviceSnapshot>> {
+    let script = r#"
+$rows = @(
+    Get-PnpDevice -ErrorAction Stop |
+        Sort-Object InstanceId |
+        ForEach-Object {
+            [ordered]@{
+                instance_id = [string]$_.InstanceId
+                class = if ($_.Class) { [string]$_.Class } else { $null }
+                friendly_name = if ($_.FriendlyName) { [string]$_.FriendlyName } else { $null }
+                status = if ($_.Status) { [string]$_.Status } else { $null }
+            }
+        }
+)
+
+@($rows) | ConvertTo-Json -Compress
+"#;
+    let rows: Vec<WindowsDeviceSnapshot> = run_powershell_json(runner, script)?;
+    Ok(rows
+        .into_iter()
+        .map(|device| (device.instance_id.clone(), device))
         .collect())
 }
 
@@ -1612,12 +2034,35 @@ mod tests {
             has_net_connection: true,
             has_firewall: true,
             has_registry_cli: true,
+            has_named_pipe_inventory: false,
+            has_module_inventory: false,
+            has_vss_inventory: false,
+            has_device_inventory: false,
             last_error: None,
         }
     }
 
     fn probe_output() -> String {
-        r#"{"computer_name":"DESKTOP-TLASHJG","user_name":"desktop-tlashjg\\lamba","is_admin":true,"has_process_inventory":true,"has_security_log":true,"has_powershell_log":true,"has_wmi_log":true,"has_task_scheduler_log":true,"has_sysmon_log":false,"has_process_creation_events":true,"has_net_connection":true,"has_firewall":true,"has_registry_cli":true}"#.to_string()
+        probe_output_with_assets(false, false, false, false)
+    }
+
+    fn probe_output_with_assets(
+        has_named_pipe_inventory: bool,
+        has_module_inventory: bool,
+        has_vss_inventory: bool,
+        has_device_inventory: bool,
+    ) -> String {
+        format!(
+            concat!(
+                r#"{{"computer_name":"DESKTOP-TLASHJG","user_name":"desktop-tlashjg\\lamba","is_admin":true,"#,
+                r#""has_process_inventory":true,"has_security_log":true,"has_powershell_log":true,"#,
+                r#""has_wmi_log":true,"has_task_scheduler_log":true,"has_sysmon_log":false,"#,
+                r#""has_process_creation_events":true,"has_net_connection":true,"has_firewall":true,"#,
+                r#""has_registry_cli":true,"has_named_pipe_inventory":{},"has_module_inventory":{},"#,
+                r#""has_vss_inventory":{},"has_device_inventory":{}}}"#
+            ),
+            has_named_pipe_inventory, has_module_inventory, has_vss_inventory, has_device_inventory
+        )
     }
 
     fn audit_cursor_output(record_id: u64) -> String {
@@ -1688,6 +2133,73 @@ mod tests {
                     )
                 },
             )
+            .collect::<Vec<_>>();
+        format!("[{}]", rows.join(","))
+    }
+
+    fn named_pipe_output(entries: &[&str]) -> String {
+        let rows = entries
+            .iter()
+            .map(|pipe_name| {
+                format!(
+                    "{{\"pipe_name\":\"{}\"}}",
+                    pipe_name.replace('\\', "\\\\").replace('"', "\\\"")
+                )
+            })
+            .collect::<Vec<_>>();
+        format!("[{}]", rows.join(","))
+    }
+
+    fn module_output(entries: &[(u32, &str, &str)]) -> String {
+        let rows = entries
+            .iter()
+            .map(|(process_id, process_name, module_path)| {
+                format!(
+                    "{{\"process_id\":{process_id},\"process_name\":\"{}\",\"module_path\":\"{}\"}}",
+                    process_name.replace('\\', "\\\\").replace('"', "\\\""),
+                    module_path.replace('\\', "\\\\").replace('"', "\\\"")
+                )
+            })
+            .collect::<Vec<_>>();
+        format!("[{}]", rows.join(","))
+    }
+
+    fn vss_output(entries: &[(&str, Option<&str>)]) -> String {
+        let rows = entries
+            .iter()
+            .map(|(snapshot_id, volume_name)| {
+                let volume_name = volume_name
+                    .map(|value| {
+                        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+                    })
+                    .unwrap_or_else(|| "null".to_string());
+                format!(
+                    "{{\"snapshot_id\":\"{}\",\"volume_name\":{volume_name}}}",
+                    snapshot_id.replace('\\', "\\\\").replace('"', "\\\"")
+                )
+            })
+            .collect::<Vec<_>>();
+        format!("[{}]", rows.join(","))
+    }
+
+    fn device_output(entries: &[(&str, Option<&str>, Option<&str>, Option<&str>)]) -> String {
+        let rows = entries
+            .iter()
+            .map(|(instance_id, class, friendly_name, status)| {
+                let class = class
+                    .map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+                    .unwrap_or_else(|| "null".to_string());
+                let friendly_name = friendly_name
+                    .map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+                    .unwrap_or_else(|| "null".to_string());
+                let status = status
+                    .map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+                    .unwrap_or_else(|| "null".to_string());
+                format!(
+                    "{{\"instance_id\":\"{}\",\"class\":{class},\"friendly_name\":{friendly_name},\"status\":{status}}}",
+                    instance_id.replace('\\', "\\\\").replace('"', "\\\"")
+                )
+            })
             .collect::<Vec<_>>();
         format!("[{}]", rows.join(","))
     }
@@ -2133,6 +2645,119 @@ mod tests {
         assert!(event.contains("network-open"));
         assert!(event.contains("udp"));
         assert!(event.contains("5353"));
+    }
+
+    #[test]
+    fn windows_asset_visibility_tracks_named_pipe_module_vss_and_device_deltas() {
+        let mut platform = WindowsPlatform::new_with_runner(
+            Box::new(QueuedWindowsRunner::new([
+                probe_output_with_assets(true, true, true, true),
+                process_output(&[("System", 4, 0, None)]),
+                audit_cursor_output(300),
+                network_output(&[]),
+                named_pipe_output(&[r"\\.\pipe\svcctl"]),
+                module_output(&[(4, "System", r"C:\Windows\System32\ntdll.dll")]),
+                vss_output(&[(
+                    r"{11111111-1111-1111-1111-111111111111}",
+                    Some(r"\\?\Volume{aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa}\"),
+                )]),
+                device_output(&[(
+                    r"USB\VID_0781&PID_5581\000000000001",
+                    Some("USB"),
+                    Some("SanDisk USB"),
+                    Some("OK"),
+                )]),
+                process_output(&[("System", 4, 0, None)]),
+                security_process_event_output(&[]),
+                network_output(&[]),
+                named_pipe_output(&[r"\\.\pipe\svcctl", r"\\.\pipe\msagent_1234"]),
+                module_output(&[
+                    (4, "System", r"C:\Windows\System32\ntdll.dll"),
+                    (4242, "powershell", r"C:\Temp\evil.dll"),
+                ]),
+                vss_output(&[
+                    (
+                        r"{11111111-1111-1111-1111-111111111111}",
+                        Some(r"\\?\Volume{aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa}\"),
+                    ),
+                    (
+                        r"{22222222-2222-2222-2222-222222222222}",
+                        Some(r"\\?\Volume{bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb}\"),
+                    ),
+                ]),
+                device_output(&[
+                    (
+                        r"USB\VID_0781&PID_5581\000000000001",
+                        Some("USB"),
+                        Some("SanDisk USB"),
+                        Some("OK"),
+                    ),
+                    (
+                        r"USB\VID_1D6B&PID_0002\000000000002",
+                        Some("USB"),
+                        Some("YubiKey"),
+                        Some("OK"),
+                    ),
+                ]),
+            ])),
+            false,
+        );
+        platform
+            .start(&SensorConfig {
+                profile: "windows".to_string(),
+                queue_capacity: 1024,
+            })
+            .expect("start windows runtime");
+
+        let snapshot = platform.health_snapshot();
+        assert_eq!(
+            snapshot.provider_health.get("IpcSensor").copied(),
+            Some(true)
+        );
+        assert_eq!(
+            snapshot.provider_health.get("ModuleLoadSensor").copied(),
+            Some(true)
+        );
+        assert_eq!(
+            snapshot.provider_health.get("SnapshotProtection").copied(),
+            Some(true)
+        );
+        assert_eq!(
+            snapshot.provider_health.get("DeviceControl").copied(),
+            Some(true)
+        );
+
+        let mut buffer = EventBuffer::default();
+        let drained = platform
+            .poll_events(&mut buffer)
+            .expect("poll asset visibility events");
+
+        assert_eq!(drained, 4);
+        let events = buffer
+            .records
+            .iter()
+            .map(|record| String::from_utf8(record.clone()).expect("event utf8"))
+            .collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            event.contains("IpcSensor")
+                && event.contains("pipe-visible")
+                && event.contains(r"\\.\pipe\msagent_1234")
+        }));
+        assert!(events.iter().any(|event| {
+            event.contains("ModuleLoadSensor")
+                && event.contains("module-visible")
+                && event.contains(r"C:\Temp\evil.dll")
+        }));
+        assert!(events.iter().any(|event| {
+            event.contains("SnapshotProtection")
+                && event.contains("shadow-visible")
+                && event.contains(r"{22222222-2222-2222-2222-222222222222}")
+        }));
+        assert!(events.iter().any(|event| {
+            event.contains("DeviceControl")
+                && event.contains("device-visible")
+                && event.contains("YubiKey")
+        }));
     }
 
     #[test]
