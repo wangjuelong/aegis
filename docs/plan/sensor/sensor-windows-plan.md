@@ -40,7 +40,7 @@ Windows 平台目标覆盖：
 - `W07.1` 已完成：仓库已新增 `scripts/windows-runtime-verify.sh` / `scripts/windows-runtime-verify.ps1` 真机验收脚本，并在 `192.168.2.218` 跑通完整矩阵；详细结果见 `docs/plan/sensor/sensor-windows-validation-matrix.md`。
 - `W08.1` 已完成：`aegis-core` 已接入 Windows 专用 DPAPI 主密钥与回滚锚点实现，诊断状态会输出 `provider_detail`、Windows TPM 可用性与回滚锚点状态；并已在 `192.168.2.218` 实测拿到 `tpm_present=true`、`tpm_ready=true` 和 DPAPI machine/user scope 往返成功结果。
 - 当前仓库在本轮计划范围内已经完成“真实能力、真实失败、真实工件”的 Windows 运行时闭环。
-- 当前剩余缺口集中在 Windows 签名、兼容性验证与发布工程化，而不是运行时继续伪造状态或伪造成功。
+- 但这不等于 Windows 最终系统级交付已经完成。当前仍缺少真实 Windows 驱动、真实文件/注册表/脚本/内存系统采集、自保护/完整性强制执行，以及正式签名、兼容性验证与发布工程化。
 
 ## 5. Windows 研发计划与状态
 
@@ -90,6 +90,17 @@ Windows 平台目标覆盖：
 10. `W07.1` `done`
 11. `W08.1`
 
+### 5.4 后续不妥协系统级研发计划
+
+| 工作包 | 目标 | 状态 | 设计约束 | 完成判定 |
+|--------|------|------|----------|----------|
+| W09 | Windows 驱动工程、安装链与用户态桥接 | todo | 不允许继续声明 `KernelTransport::Driver` 但实际只依赖 PowerShell/SSH；缺驱动必须显式失败 | 已入仓可构建驱动工程、安装/卸载脚本、版本协商与严格失败逻辑，`192.168.2.218` 可完成驱动加载和握手验收 |
+| W10 | 文件与注册表系统采集链 | todo | 不允许继续把 `file/registry=false` 或把 rollback 只做成 JSON 工件 | 已完成 Minifilter 文件事件、注册表 journal/回滚、真实事件上报与真机回滚闭环 |
+| W11 | 进程/文件/注册表保护与内核完整性 | todo | 不允许继续把保护面仅落成工件；`check_ssdt_integrity`/`check_callback_tables`/`check_kernel_code` 不得再返回 `not implemented` | 已完成真实保护执行链和完整性检查，真机可验证阻断与检测结果 |
+| W12 | 脚本/AMSI/内存信号闭环 | todo | 不允许继续把 `AmsiScript`/`MemorySensor` 固定为未实现；脚本能力不能只停留在日志健康面 | 已完成 AMSI provider、脚本阻断/告警链、内存信号数据面与真机验收 |
+| W13 | 打包、看门狗、自举与发布前自检 | todo | 不允许继续把系统级交付等同于单个 `powershell.exe` 运行时；安装链必须显式校验驱动/服务/依赖 | 已完成 MSI/安装链、watchdog 首启自检、失败回滚与发布前验收脚本 |
+| W14 | 正式签名、兼容性矩阵与发布验证 | todo | 不允许把自签名或未验签产物标记为正式发布；无签名凭据必须严格失败 | 已完成代码签名/驱动签名/验签流水线、支持矩阵与正式发布验收记录 |
+
 ## 6. Windows 完成判定
 
 当前可以诚实判定为：
@@ -107,6 +118,7 @@ Windows 平台目标覆盖：
 - Windows 真机验收、兼容性矩阵与验收脚本：`done`
 - Windows 凭据存储、DPAPI/TPM 根信任与回滚锚点：`done`
 - Windows 真实系统级交付：`doing`
+- Windows 驱动、系统采集、自保护、正式签名与发布验证：`todo`
 
 因此，本文件中的平台状态应保持：
 
@@ -122,12 +134,13 @@ Windows 平台目标覆盖：
 - `W06.2 = done`
 - `W07.1 = done`
 - `W08.1 = done`
+- `W09-W14 = todo`
 
 ## 7. Windows 后续执行顺序
 
 Windows 专项的最终目标不变：
 
 1. 先把运行时改成“真实能力、真实失败、真实工件”
-2. 再把进程/网络/注册表/脚本/取证链路逐步从骨架替换为真实主机交付
-3. 再补齐真实 Windows 主机上的签名、兼容性与发布前验收
-4. 本轮范围内的 Windows 正式密钥保护、回滚锚点与硬件根信任已收口
+2. 再补齐真正的 Windows 驱动工程、文件/注册表/脚本/内存系统采集与保护链
+3. 再补齐真实 Windows 主机上的安装、自举、签名、兼容性与发布前验收
+4. 本轮范围内的 Windows 正式密钥保护、回滚锚点与硬件根信任已收口，但不代表系统级交付完成
