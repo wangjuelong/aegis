@@ -56,7 +56,7 @@ Windows 平台目标覆盖：
 | W03.3 | ETW/审计能力健康检查与进程审计事件链 | done | 不允许把 ETW/AMSI 健康固定为 `true`；必须根据日志/审计策略实测结果判断 | 已完成 Security 4688 可用性探测、启动游标初始化、增量审计事件轮询与 `EtwProcess` 健康状态收口，并已在真实 Windows 主机验证 JSON 查询结果 |
 | W04.1 | 真实网络基线、连接增量与隔离执行链 | done | 不允许只改内存快照；必须生成并执行真实 Windows 防火墙/网络隔离命令 | 已完成 TCP/UDP 基线与增量事件、WfpNetwork 健康面与真实防火墙隔离/释放执行链，并已在真实 Windows 主机验证网络枚举 JSON 输出 |
 | W04.2 | 注册表回滚与保护清单落盘 | done | 不允许只把 rollback 目标塞进快照；必须生成可审计的注册表回滚/保护清单 | 已完成保护清单与回滚清单 JSON 工件落盘，执行快照可回看真实工件路径，并覆盖受保护路径、回滚目标和注册表保护面 |
-| W05.1 | Named Pipe / DLL / VSS / Device 资产可见性 | todo | 不允许 provider 名义存在但永远返回健康；必须对每类 provider 给出真实“已实现/未实现/主机不可用”状态 | 至少完成资产枚举与健康探测，未实现的实时回调必须明确标为不健康而不是伪完成 |
+| W05.1 | Named Pipe / DLL / VSS / Device 资产可见性 | done | 不允许 provider 名义存在但永远返回健康；必须对每类 provider 给出真实“已实现/未实现/主机不可用”状态 | 已完成四类 provider 的真实能力探测、启动基线与差分事件；并在 `192.168.2.218` 实测拿到四类能力均为 `true` 的探测 JSON，以及命名管道、模块、VSS、PnP 设备枚举样本 |
 | W05.2 | AMSI / 脚本 / ETW 篡改健康面 | todo | 不允许把 `check_amsi_integrity()` 固定返回健康；必须根据 Defender/AMSI/审计实际状态给出结论 | 能报告 AMSI 可用性、PowerShell ScriptBlock 日志可用性、ETW 日志读取状态 |
 | W06.1 | 真实进程终止、挂起、隔离、取证执行链 | todo | 不允许继续只改内存；必须执行真实 Windows 命令并在失败时返回错误 | `suspend_process/kill_process/kill_ppl_process/quarantine_file/collect_forensics` 能执行真实动作或诚实失败 |
 | W06.2 | 预防性阻断与保护面审计 | todo | 不允许只记录 block lease；必须把阻断/保护面结果写成工件用于复盘 | hash/path/network block、受保护 PID/路径和完整性验证结果可形成真实审计工件 |
@@ -79,7 +79,7 @@ Windows 平台目标覆盖：
 3. `W03.3` `done`
 4. `W04.1` `done`
 5. `W04.2` `done`
-6. `W05.1`
+6. `W05.1` `done`
 7. `W05.2`
 8. `W06.1`
 9. `W06.2`
@@ -96,6 +96,7 @@ Windows 平台目标覆盖：
 - Windows 真实 ETW/审计健康检查与进程审计事件链：`done`
 - Windows 真实网络基线、连接增量与隔离执行链：`done`
 - Windows 注册表回滚与保护审计工件：`done`
+- Windows Named Pipe / DLL / VSS / Device 资产可见性：`done`
 - Windows 真实系统级交付：`doing`
 
 因此，本文件中的平台状态应保持：
@@ -106,7 +107,8 @@ Windows 平台目标覆盖：
 - `W03.3 = done`
 - `W04.1 = done`
 - `W04.2 = done`
-- `W05.1-W08.1 = todo`，进入实施后逐项更新为 `doing/done`
+- `W05.1 = done`
+- `W05.2-W08.1 = todo`，进入实施后逐项更新为 `doing/done`
 
 ## 7. Windows 后续执行顺序
 
