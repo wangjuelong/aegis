@@ -21,6 +21,7 @@ pub const UPDATE_ARTIFACT_KIND: &str = "artifact";
 pub const UPDATE_ROLLBACK_KIND: &str = "rollback";
 pub const DEVELOPMENT_UPDATE_SIGNING_KEY_ID: &str = "update-k1";
 pub const DEVELOPMENT_UPDATE_SIGNING_KEY_BYTES: [u8; 32] = [21u8; 32];
+pub const WINDOWS_INSTALL_MANIFEST_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpgradeArtifact {
@@ -597,6 +598,14 @@ pub struct WatchdogRuntimeSnapshot {
     pub agent_heartbeat: AgentSupervisorHeartbeat,
     pub watchdog_heartbeat: WatchdogHeartbeat,
     pub alerts: Vec<WatchdogAlert>,
+    #[serde(default)]
+    pub bootstrap_report: Option<BootstrapCheckReport>,
+    #[serde(default)]
+    pub bootstrap_passed: bool,
+    #[serde(default)]
+    pub update_phase: UpdatePhase,
+    #[serde(default)]
+    pub rollback_ready: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -698,6 +707,155 @@ impl UpdateVerificationSnapshot {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowsInstallComponentKind {
+    #[default]
+    Binary,
+    Script,
+    Driver,
+    Metadata,
+}
+
+fn default_required_component() -> bool {
+    true
+}
+
+fn path_is_windows_absolute(path: &Path) -> bool {
+    let raw = path.to_string_lossy();
+    let bytes = raw.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WindowsInstallComponent {
+    pub name: String,
+    #[serde(default)]
+    pub kind: WindowsInstallComponentKind,
+    pub source_relative_path: PathBuf,
+    pub install_relative_path: PathBuf,
+    #[serde(default = "default_required_component")]
+    pub required: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WindowsReleaseDependency {
+    pub name: String,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub install_relative_path: Option<PathBuf>,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WindowsInstallManifest {
+    pub schema_version: u32,
+    pub bundle_channel: String,
+    pub install_root: PathBuf,
+    pub state_root: PathBuf,
+    pub driver_service_name: String,
+    #[serde(default)]
+    pub components: Vec<WindowsInstallComponent>,
+    #[serde(default)]
+    pub release_dependencies: Vec<WindowsReleaseDependency>,
+}
+
+impl WindowsInstallManifest {
+    pub fn from_json_str(raw: &str) -> Result<Self> {
+        let manifest = serde_json::from_str::<Self>(raw)?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    pub fn load_from_file(path: &Path) -> Result<Self> {
+        let raw = fs::read_to_string(path)?;
+        Self::from_json_str(&raw)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != WINDOWS_INSTALL_MANIFEST_SCHEMA_VERSION {
+            bail!(
+                "unsupported windows install manifest schema version: {}",
+                self.schema_version
+            );
+        }
+        if self.bundle_channel.trim().is_empty() {
+            bail!("windows install manifest bundle_channel is required");
+        }
+        if self.driver_service_name.trim().is_empty() {
+            bail!("windows install manifest driver_service_name is required");
+        }
+        if self.components.is_empty() {
+            bail!("windows install manifest must include at least one component");
+        }
+
+        let mut names = HashMap::new();
+        for component in &self.components {
+            if component.name.trim().is_empty() {
+                bail!("windows install component name is required");
+            }
+            if component.source_relative_path.as_os_str().is_empty() {
+                bail!("windows install component source_relative_path is required");
+            }
+            if component.install_relative_path.as_os_str().is_empty() {
+                bail!("windows install component install_relative_path is required");
+            }
+            if component.source_relative_path.is_absolute()
+                || path_is_windows_absolute(&component.source_relative_path)
+            {
+                bail!(
+                    "windows install component source_relative_path must be relative: {}",
+                    component.source_relative_path.display()
+                );
+            }
+            if component.install_relative_path.is_absolute()
+                || path_is_windows_absolute(&component.install_relative_path)
+            {
+                bail!(
+                    "windows install component install_relative_path must be relative: {}",
+                    component.install_relative_path.display()
+                );
+            }
+            if names
+                .insert(
+                    component.name.clone(),
+                    component.install_relative_path.clone(),
+                )
+                .is_some()
+            {
+                bail!("duplicate windows install component: {}", component.name);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BootstrapCheckItem {
+    pub name: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BootstrapCheckReport {
+    pub observed_at_ms: i64,
+    pub install_root: PathBuf,
+    pub state_root: PathBuf,
+    pub config_path: PathBuf,
+    pub manifest_path: PathBuf,
+    #[serde(default)]
+    pub runtime_bridge_socket: Option<PathBuf>,
+    pub items: Vec<BootstrapCheckItem>,
+    pub approved: bool,
+}
+
 pub struct RuntimeStateStore;
 
 impl RuntimeStateStore {
@@ -711,6 +869,10 @@ impl RuntimeStateStore {
 
     pub fn update_snapshot_path(config: &AgentConfig) -> PathBuf {
         config.storage.state_root.join("update-state.json")
+    }
+
+    pub fn bootstrap_report_path(config: &AgentConfig) -> PathBuf {
+        config.storage.state_root.join("bootstrap-check.json")
     }
 
     pub fn staged_update_manifest_path(config: &AgentConfig) -> PathBuf {
@@ -756,6 +918,37 @@ impl RuntimeStateStore {
 
     pub fn load_update_snapshot(config: &AgentConfig) -> Result<UpdateVerificationSnapshot> {
         read_json(&Self::update_snapshot_path(config))
+    }
+
+    pub fn persist_bootstrap_report(
+        config: &AgentConfig,
+        report: &BootstrapCheckReport,
+    ) -> Result<()> {
+        write_json(Self::bootstrap_report_path(config), report)
+    }
+
+    pub fn load_bootstrap_report(config: &AgentConfig) -> Result<BootstrapCheckReport> {
+        read_json(&Self::bootstrap_report_path(config))
+    }
+
+    pub fn refresh_agent_runtime_status(
+        config: &AgentConfig,
+        sent_at_ms: i64,
+        active_update_id: Option<String>,
+        communication: CommunicationRuntimeStatus,
+        resources: AgentHealth,
+    ) -> Result<AgentRuntimeSnapshot> {
+        let mut snapshot = Self::load_agent_snapshot(config)?;
+        snapshot.captured_at_ms = sent_at_ms;
+        snapshot.supervisor_heartbeat.sent_at_ms = sent_at_ms;
+        snapshot.supervisor_heartbeat.active_update_id = active_update_id;
+        snapshot.communication = communication;
+        snapshot.resources = resources;
+        if let Some(runtime_bridge) = snapshot.runtime_bridge.as_mut() {
+            runtime_bridge.last_runtime_heartbeat_ms = Some(sent_at_ms);
+        }
+        Self::persist_agent_snapshot(config, &snapshot)?;
+        Ok(snapshot)
     }
 }
 
@@ -838,13 +1031,13 @@ impl AgentRuntimeSnapshot {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentRuntimeSnapshot, CanaryGateDecision, CanaryGateThresholds, CanaryObservation,
-        DiagnoseCertificateStatus, DiagnoseCollector, DiagnoseConnectionStatus,
-        DiagnoseKeyProtectionStatus, DiagnoseReplayStatus, DiagnoseSensorStatus, DiagnoseWalStatus,
-        HotUpdateManifestVerifier, RolloutGateEvaluator, RuntimeStateStore, UpdatePhase,
-        UpdateVerificationSnapshot, UpgradeArtifact, UpgradePlanner, WatchdogLinkMonitor,
-        WatchdogRuntimeSnapshot, DEVELOPMENT_UPDATE_SIGNING_KEY_BYTES,
-        DEVELOPMENT_UPDATE_SIGNING_KEY_ID,
+        AgentRuntimeSnapshot, BootstrapCheckItem, BootstrapCheckReport, CanaryGateDecision,
+        CanaryGateThresholds, CanaryObservation, DiagnoseCertificateStatus, DiagnoseCollector,
+        DiagnoseConnectionStatus, DiagnoseKeyProtectionStatus, DiagnoseReplayStatus,
+        DiagnoseSensorStatus, DiagnoseWalStatus, HotUpdateManifestVerifier, RolloutGateEvaluator,
+        RuntimeStateStore, UpdatePhase, UpdateVerificationSnapshot, UpgradeArtifact,
+        UpgradePlanner, WatchdogLinkMonitor, WatchdogRuntimeSnapshot, WindowsInstallManifest,
+        DEVELOPMENT_UPDATE_SIGNING_KEY_BYTES, DEVELOPMENT_UPDATE_SIGNING_KEY_ID,
     };
     use crate::config::AgentConfig;
     use crate::health::HealthReporter;
@@ -1175,6 +1368,26 @@ mod tests {
             RuntimeStateStore::load_agent_snapshot(&config).expect("load agent snapshot");
         assert_eq!(restored_agent, agent_snapshot);
 
+        let bootstrap_report = BootstrapCheckReport {
+            observed_at_ms: 1_713_000_300_500,
+            install_root: PathBuf::from("C:/Program Files/Aegis"),
+            state_root: state_root.clone(),
+            config_path: state_root.join("agent.toml"),
+            manifest_path: PathBuf::from("C:/Program Files/Aegis/manifest.json"),
+            runtime_bridge_socket: Some(state_root.join("runtime-bridge-agent-a.sock")),
+            items: vec![BootstrapCheckItem {
+                name: "runtime_bootstrap".to_string(),
+                ok: true,
+                detail: "runtime bridge ready".to_string(),
+            }],
+            approved: true,
+        };
+        RuntimeStateStore::persist_bootstrap_report(&config, &bootstrap_report)
+            .expect("persist bootstrap report");
+        let restored_bootstrap =
+            RuntimeStateStore::load_bootstrap_report(&config).expect("load bootstrap report");
+        assert_eq!(restored_bootstrap, bootstrap_report);
+
         let watchdog_snapshot = WatchdogRuntimeSnapshot {
             observed_at_ms: 1_713_000_301_000,
             agent_heartbeat: restored_agent.supervisor_heartbeat.clone(),
@@ -1187,6 +1400,10 @@ mod tests {
                 sent_at_ms: 1_713_000_301_000,
             },
             alerts: vec![],
+            bootstrap_report: Some(restored_bootstrap.clone()),
+            bootstrap_passed: true,
+            update_phase: UpdatePhase::Ready,
+            rollback_ready: false,
         };
         RuntimeStateStore::persist_watchdog_snapshot(&config, &watchdog_snapshot)
             .expect("persist watchdog snapshot");
@@ -1227,6 +1444,153 @@ mod tests {
             "https://control-plane.example"
         );
         assert!(bundle.watchdog.is_none());
+
+        std::fs::remove_dir_all(state_root).ok();
+    }
+
+    #[test]
+    fn windows_install_manifest_requires_relative_component_paths() {
+        let manifest = r#"
+        {
+          "schema_version": 1,
+          "bundle_channel": "development",
+          "install_root": "C:\\Program Files\\Aegis",
+          "state_root": "C:\\ProgramData\\Aegis\\state",
+          "driver_service_name": "AegisSensorKmod",
+          "components": [
+            {
+              "name": "agentd",
+              "kind": "binary",
+              "source_relative_path": "bin/aegis-agentd.exe",
+              "install_relative_path": "bin/aegis-agentd.exe",
+              "required": true
+            }
+          ]
+        }
+        "#;
+
+        let parsed = WindowsInstallManifest::from_json_str(manifest).expect("parse manifest");
+        assert_eq!(parsed.bundle_channel, "development");
+        assert_eq!(parsed.components.len(), 1);
+
+        let invalid = r#"
+        {
+          "schema_version": 1,
+          "bundle_channel": "development",
+          "install_root": "C:\\Program Files\\Aegis",
+          "state_root": "C:\\ProgramData\\Aegis\\state",
+          "driver_service_name": "AegisSensorKmod",
+          "components": [
+            {
+              "name": "agentd",
+              "kind": "binary",
+              "source_relative_path": "C:/payload/aegis-agentd.exe",
+              "install_relative_path": "bin/aegis-agentd.exe",
+              "required": true
+            }
+          ]
+        }
+        "#;
+
+        let error = WindowsInstallManifest::from_json_str(invalid).expect_err("reject absolute");
+        assert!(error.to_string().contains("must be relative"));
+    }
+
+    #[test]
+    fn refresh_agent_runtime_status_updates_heartbeat_and_runtime_bridge() {
+        let mut config = AgentConfig::default();
+        let state_root = temp_state_root("runtime-refresh");
+        config.storage.state_root = state_root.clone();
+
+        let mut snapshot = AgentRuntimeSnapshot {
+            captured_at_ms: 1_713_000_300_000,
+            supervisor_heartbeat: AgentSupervisorHeartbeat {
+                tenant_id: "tenant-a".to_string(),
+                agent_id: "agent-a".to_string(),
+                plugin_count: 2,
+                degraded_plugins: 1,
+                active_update_id: None,
+                sent_at_ms: 1_713_000_300_000,
+            },
+            connection: DiagnoseConnectionStatus {
+                control_plane_url: "https://control-plane.example".to_string(),
+                reachable: true,
+            },
+            certificates: DiagnoseCertificateStatus {
+                device_certificate_loaded: true,
+                last_rotation_succeeded: true,
+            },
+            sensors: DiagnoseSensorStatus {
+                enabled_sensors: vec!["process".to_string()],
+                unhealthy_sensors: vec![],
+            },
+            communication: CommunicationRuntimeStatus {
+                active_channel: CommunicationChannelKind::Grpc,
+                degraded: false,
+                fallback_chain: vec![CommunicationChannelKind::Grpc],
+                last_success_ms: Some(1_713_000_299_000),
+                channels: vec![],
+            },
+            engine_versions: BTreeMap::new(),
+            ring_buffer_utilization_ratio: 0.0,
+            wal: DiagnoseWalStatus {
+                telemetry_segments: 0,
+                forensic_root: state_root.join("forensics"),
+                completeness: TelemetryIntegrity::Full,
+                encrypted: true,
+                key_version: 1,
+                quarantined_segments: 0,
+            },
+            key_protection: DiagnoseKeyProtectionStatus::default(),
+            replay: DiagnoseReplayStatus::default(),
+            update: UpdateVerificationSnapshot::new("0.1.0", 1_713_000_300_000)
+                .to_diagnose_status(),
+            resources: health(),
+            runtime_bridge: Some(RuntimeBridgeStatus {
+                control_socket_path: Some(state_root.join("runtime.sock").display().to_string()),
+                buffered_events: 0,
+                emitted_batches: 0,
+                last_runtime_heartbeat_ms: None,
+                last_connector_cursor: None,
+            }),
+            plugin_status: vec![],
+            self_protection_posture: ProtectionPosture::Normal,
+        };
+        RuntimeStateStore::persist_agent_snapshot(&config, &snapshot)
+            .expect("persist agent snapshot");
+
+        let next_health = health();
+        let next_communication = CommunicationRuntimeStatus {
+            active_channel: CommunicationChannelKind::WebSocket,
+            degraded: false,
+            fallback_chain: vec![
+                CommunicationChannelKind::Grpc,
+                CommunicationChannelKind::WebSocket,
+            ],
+            last_success_ms: Some(1_713_000_305_000),
+            channels: vec![],
+        };
+        let refreshed = RuntimeStateStore::refresh_agent_runtime_status(
+            &config,
+            1_713_000_305_000,
+            Some("artifact-99".to_string()),
+            next_communication.clone(),
+            next_health.clone(),
+        )
+        .expect("refresh runtime snapshot");
+
+        snapshot.captured_at_ms = 1_713_000_305_000;
+        snapshot.supervisor_heartbeat.sent_at_ms = 1_713_000_305_000;
+        snapshot.supervisor_heartbeat.active_update_id = Some("artifact-99".to_string());
+        snapshot.communication = next_communication;
+        snapshot.resources = next_health;
+        snapshot
+            .runtime_bridge
+            .as_mut()
+            .expect("runtime bridge")
+            .last_runtime_heartbeat_ms = Some(1_713_000_305_000);
+
+        assert_eq!(refreshed, snapshot);
 
         std::fs::remove_dir_all(state_root).ok();
     }

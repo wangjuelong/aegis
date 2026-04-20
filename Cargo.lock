@@ -128,6 +128,7 @@ dependencies = [
  "aegis-core",
  "aegis-model",
  "anyhow",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]

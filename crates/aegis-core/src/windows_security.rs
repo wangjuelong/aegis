@@ -2,6 +2,8 @@
 
 use crate::config::{AgentConfig, SecurityConfig};
 use anyhow::{bail, Context, Result};
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use getrandom::fill as getrandom_fill;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
@@ -9,14 +11,16 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 #[cfg(windows)]
+use anyhow::anyhow;
+#[cfg(windows)]
 use std::process::Command;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::LocalFree;
 #[cfg(windows)]
 use windows_sys::Win32::Security::Cryptography::{
     CryptProtectData, CryptUnprotectData, CRYPTPROTECT_LOCAL_MACHINE, CRYPTPROTECT_UI_FORBIDDEN,
-    DATA_BLOB,
+    CRYPT_INTEGER_BLOB,
 };
-#[cfg(windows)]
-use windows_sys::Win32::System::Memory::LocalFree;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct WindowsTpmRuntime {
@@ -49,7 +53,7 @@ struct WindowsDpapiBlob {
     ciphertext_b64: String,
 }
 
-pub(crate) fn detect_windows_tpm_runtime(security: &SecurityConfig) -> WindowsTpmRuntime {
+pub(crate) fn detect_windows_tpm_runtime(_security: &SecurityConfig) -> WindowsTpmRuntime {
     #[cfg(windows)]
     {
         match probe_windows_tpm_runtime() {
@@ -64,7 +68,7 @@ pub(crate) fn detect_windows_tpm_runtime(security: &SecurityConfig) -> WindowsTp
 
     #[cfg(not(windows))]
     {
-        if security.windows_tpm_required {
+        if _security.windows_tpm_required {
             WindowsTpmRuntime {
                 present: false,
                 ready: false,
@@ -292,7 +296,7 @@ fn encrypt_dpapi_blob(
         let blob = WindowsDpapiBlob {
             machine_scope: security.windows_dpapi_machine_scope,
             purpose: purpose.to_string(),
-            ciphertext_b64: base64::encode(ciphertext),
+            ciphertext_b64: BASE64_STANDARD.encode(ciphertext),
         };
 
         if let Some(parent) = path.parent() {
@@ -335,7 +339,8 @@ fn decrypt_dpapi_blob(
         }
 
         let entropy = load_or_initialize_windows_dpapi_entropy(entropy_root)?;
-        let ciphertext = base64::decode(&blob.ciphertext_b64)
+        let ciphertext = BASE64_STANDARD
+            .decode(&blob.ciphertext_b64)
             .with_context(|| format!("decode windows dpapi ciphertext {}", path.display()))?;
         dpapi_unprotect(&ciphertext, &entropy)
     }
@@ -348,16 +353,16 @@ fn dpapi_protect(
     machine_scope: bool,
     purpose: &str,
 ) -> Result<Vec<u8>> {
-    let mut input_blob = DATA_BLOB {
+    let mut input_blob = CRYPT_INTEGER_BLOB {
         cbData: plaintext.len() as u32,
         pbData: plaintext.as_ptr() as *mut u8,
     };
     let mut entropy_bytes = entropy.to_vec();
-    let mut entropy_blob = DATA_BLOB {
+    let mut entropy_blob = CRYPT_INTEGER_BLOB {
         cbData: entropy_bytes.len() as u32,
         pbData: entropy_bytes.as_mut_ptr(),
     };
-    let mut output_blob = DATA_BLOB {
+    let mut output_blob = CRYPT_INTEGER_BLOB {
         cbData: 0,
         pbData: std::ptr::null_mut(),
     };
@@ -391,23 +396,23 @@ fn dpapi_protect(
         std::slice::from_raw_parts(output_blob.pbData, output_blob.cbData as usize).to_vec()
     };
     unsafe {
-        LocalFree(output_blob.pbData as isize);
+        LocalFree(output_blob.pbData.cast());
     }
     Ok(ciphertext)
 }
 
 #[cfg(windows)]
 fn dpapi_unprotect(ciphertext: &[u8], entropy: &[u8]) -> Result<Vec<u8>> {
-    let mut input_blob = DATA_BLOB {
+    let mut input_blob = CRYPT_INTEGER_BLOB {
         cbData: ciphertext.len() as u32,
         pbData: ciphertext.as_ptr() as *mut u8,
     };
     let mut entropy_bytes = entropy.to_vec();
-    let mut entropy_blob = DATA_BLOB {
+    let mut entropy_blob = CRYPT_INTEGER_BLOB {
         cbData: entropy_bytes.len() as u32,
         pbData: entropy_bytes.as_mut_ptr(),
     };
-    let mut output_blob = DATA_BLOB {
+    let mut output_blob = CRYPT_INTEGER_BLOB {
         cbData: 0,
         pbData: std::ptr::null_mut(),
     };
@@ -436,9 +441,9 @@ fn dpapi_unprotect(ciphertext: &[u8], entropy: &[u8]) -> Result<Vec<u8>> {
     };
     unsafe {
         if !description_ptr.is_null() {
-            LocalFree(description_ptr as isize);
+            LocalFree(description_ptr.cast());
         }
-        LocalFree(output_blob.pbData as isize);
+        LocalFree(output_blob.pbData.cast());
     }
     Ok(plaintext)
 }

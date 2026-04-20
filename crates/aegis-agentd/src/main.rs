@@ -9,49 +9,98 @@ use aegis_core::self_protection::{
 };
 use aegis_core::transport_drivers::TransportAgentContext;
 use aegis_core::upgrade::{
-    AgentRuntimeSnapshot, DiagnoseCertificateStatus, DiagnoseCollector, DiagnoseConnectionStatus,
-    DiagnoseKeyProtectionStatus, DiagnoseReplayStatus, DiagnoseSensorStatus, DiagnoseWalStatus,
-    RuntimeStateStore, UpdateVerificationSnapshot,
+    AgentRuntimeSnapshot, BootstrapCheckItem, BootstrapCheckReport, DiagnoseCertificateStatus,
+    DiagnoseCollector, DiagnoseConnectionStatus, DiagnoseKeyProtectionStatus, DiagnoseReplayStatus,
+    DiagnoseSensorStatus, DiagnoseWalStatus, RuntimeStateStore, UpdateVerificationSnapshot,
+    WindowsInstallManifest,
 };
 use aegis_core::wal::{PendingBatchStore, ReplayLane};
 use aegis_model::{
     AgentSupervisorHeartbeat, LineageCounters, PluginHealthStatus, RuntimeBridgeStatus,
     RuntimeHealthSignals, TelemetryIntegrity,
 };
-use anyhow::Result;
+use anyhow::{bail, Result};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum AgentMode {
+    #[default]
+    Run,
+    Diagnose,
+    WriteDefaultConfig,
+    BootstrapCheck,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CliArgs {
+    mode: AgentMode,
+    state_root: Option<PathBuf>,
+    config_path: Option<PathBuf>,
+    install_root: Option<PathBuf>,
+    manifest_path: Option<PathBuf>,
+    control_plane_url: Option<String>,
+    agent_id: Option<String>,
+    tenant_id: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    if std::env::args().any(|arg| arg == "--diagnose") {
-        let config = load_runtime_config()?;
-        let persisted_runtime_bridge = RuntimeStateStore::load_agent_snapshot(&config)
-            .ok()
-            .and_then(|snapshot| snapshot.runtime_bridge);
-        let runtime_bridge = match persisted_runtime_bridge {
-            Some(runtime_bridge) => runtime_bridge,
-            None => {
-                Orchestrator::new(config.clone())
-                    .bootstrap()?
-                    .summary
-                    .runtime_bridge
+    let cli = parse_args()?;
+
+    match cli.mode {
+        AgentMode::Diagnose => {
+            let config = load_runtime_config(cli.state_root.clone(), cli.config_path.clone())?;
+            let persisted_runtime_bridge = RuntimeStateStore::load_agent_snapshot(&config)
+                .ok()
+                .and_then(|snapshot| snapshot.runtime_bridge);
+            let runtime_bridge = match persisted_runtime_bridge {
+                Some(runtime_bridge) => runtime_bridge,
+                None => {
+                    Orchestrator::new(config.clone())
+                        .bootstrap()?
+                        .summary
+                        .runtime_bridge
+                }
+            };
+            let snapshot = build_agent_runtime_snapshot(&config, Some(runtime_bridge));
+            RuntimeStateStore::persist_agent_snapshot(&config, &snapshot)?;
+            let mut bundle = snapshot.to_diagnose_bundle();
+            bundle.watchdog = RuntimeStateStore::load_watchdog_snapshot(&config).ok();
+            println!("{}", DiagnoseCollector::to_json(&bundle)?);
+            return Ok(());
+        }
+        AgentMode::WriteDefaultConfig => {
+            let config = write_default_config(&cli)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "config_path": config.storage.config_path,
+                    "state_root": config.storage.state_root,
+                    "agent_id": config.agent_id,
+                    "tenant_id": config.tenant_id,
+                    "control_plane_url": config.control_plane_url,
+                }))?
+            );
+            return Ok(());
+        }
+        AgentMode::BootstrapCheck => {
+            let report = run_bootstrap_check(&cli)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            if !report.approved {
+                bail!("bootstrap check failed");
             }
-        };
-        let snapshot = build_agent_runtime_snapshot(&config, Some(runtime_bridge));
-        RuntimeStateStore::persist_agent_snapshot(&config, &snapshot)?;
-        let mut bundle = snapshot.to_diagnose_bundle();
-        bundle.watchdog = RuntimeStateStore::load_watchdog_snapshot(&config).ok();
-        println!("{}", DiagnoseCollector::to_json(&bundle)?);
-        return Ok(());
+            return Ok(());
+        }
+        AgentMode::Run => {}
     }
 
     tracing_subscriber::fmt().with_env_filter("info").init();
 
-    let config = load_runtime_config()?;
+    let config = load_runtime_config(cli.state_root.clone(), cli.config_path.clone())?;
     let shutdown_grace_period = config.shutdown_grace_period();
     let orchestrator = Orchestrator::new(config.clone());
     let artifacts = orchestrator.bootstrap()?;
@@ -81,8 +130,55 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn load_runtime_config() -> Result<AppConfig> {
-    let root_override = if let Ok(state_root) = std::env::var("AEGIS_STATE_ROOT") {
+fn parse_args() -> Result<CliArgs> {
+    let mut args = CliArgs::default();
+    let mut iter = std::env::args().skip(1);
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--diagnose" => set_mode(&mut args.mode, AgentMode::Diagnose)?,
+            "--write-default-config" => set_mode(&mut args.mode, AgentMode::WriteDefaultConfig)?,
+            "--bootstrap-check" => set_mode(&mut args.mode, AgentMode::BootstrapCheck)?,
+            "--state-root" => {
+                args.state_root = Some(PathBuf::from(next_arg(&mut iter, "--state-root")?))
+            }
+            "--config" => args.config_path = Some(PathBuf::from(next_arg(&mut iter, "--config")?)),
+            "--install-root" => {
+                args.install_root = Some(PathBuf::from(next_arg(&mut iter, "--install-root")?))
+            }
+            "--manifest" => {
+                args.manifest_path = Some(PathBuf::from(next_arg(&mut iter, "--manifest")?))
+            }
+            "--control-plane-url" => {
+                args.control_plane_url = Some(next_arg(&mut iter, "--control-plane-url")?)
+            }
+            "--agent-id" => args.agent_id = Some(next_arg(&mut iter, "--agent-id")?),
+            "--tenant-id" => args.tenant_id = Some(next_arg(&mut iter, "--tenant-id")?),
+            other => bail!("unsupported argument: {other}"),
+        }
+    }
+    Ok(args)
+}
+
+fn set_mode(target: &mut AgentMode, next: AgentMode) -> Result<()> {
+    if *target != AgentMode::Run {
+        bail!("multiple agent modes requested");
+    }
+    *target = next;
+    Ok(())
+}
+
+fn next_arg(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<String> {
+    iter.next()
+        .ok_or_else(|| anyhow::anyhow!("missing value for {flag}"))
+}
+
+fn load_runtime_config(
+    explicit_state_root: Option<PathBuf>,
+    explicit_config_path: Option<PathBuf>,
+) -> Result<AppConfig> {
+    let root_override = if let Some(state_root) = explicit_state_root {
+        Some(state_root)
+    } else if let Ok(state_root) = std::env::var("AEGIS_STATE_ROOT") {
         Some(PathBuf::from(state_root))
     } else {
         let default = AppConfig::default();
@@ -98,9 +194,11 @@ fn load_runtime_config() -> Result<AppConfig> {
         None => AppConfig::default(),
     };
 
-    let explicit_config_path = std::env::var("AEGIS_CONFIG").ok().map(PathBuf::from);
-    let candidate_path =
-        explicit_config_path.unwrap_or_else(|| bootstrap.storage.config_path.clone());
+    let config_path_override =
+        explicit_config_path.or_else(|| std::env::var("AEGIS_CONFIG").ok().map(PathBuf::from));
+    let candidate_path = config_path_override
+        .clone()
+        .unwrap_or_else(|| bootstrap.storage.config_path.clone());
     let mut config = if candidate_path.exists() {
         AppConfig::load_from_file(&candidate_path)?
     } else {
@@ -108,10 +206,198 @@ fn load_runtime_config() -> Result<AppConfig> {
     };
 
     if let Some(state_root) = root_override {
-        config = config.with_state_root(state_root);
+        config = config.with_state_root(state_root.clone());
+        if let Some(config_path) = config_path_override.clone() {
+            config.storage.config_path = config_path;
+        }
     }
 
     Ok(config)
+}
+
+fn write_default_config(cli: &CliArgs) -> Result<AppConfig> {
+    let mut config = AppConfig::default();
+    if let Some(state_root) = cli.state_root.clone() {
+        config = config.with_state_root(state_root);
+    } else if !state_root_writable(&config.storage.state_root) {
+        config = config.with_state_root(std::env::current_dir()?.join("target/aegis-dev/state"));
+    }
+
+    if let Some(config_path) = cli.config_path.clone() {
+        config.storage.config_path = config_path;
+    }
+    if let Some(control_plane_url) = &cli.control_plane_url {
+        config.control_plane_url = control_plane_url.clone();
+    }
+    if let Some(agent_id) = &cli.agent_id {
+        config.agent_id = agent_id.clone();
+    }
+    if let Some(tenant_id) = &cli.tenant_id {
+        config.tenant_id = tenant_id.clone();
+    }
+
+    ensure_storage_layout(&config)?;
+    let serialized = config.to_toml_string()?;
+    if let Some(parent) = config.storage.config_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&config.storage.config_path, serialized)?;
+    Ok(config)
+}
+
+fn ensure_storage_layout(config: &AppConfig) -> Result<()> {
+    fs::create_dir_all(&config.storage.state_root)?;
+    fs::create_dir_all(&config.storage.ring_buffer_path)?;
+    fs::create_dir_all(&config.storage.spill_path)?;
+    fs::create_dir_all(&config.storage.forensic_path)?;
+    Ok(())
+}
+
+fn run_bootstrap_check(cli: &CliArgs) -> Result<BootstrapCheckReport> {
+    let config = load_runtime_config(cli.state_root.clone(), cli.config_path.clone())?;
+    let manifest_path = cli
+        .manifest_path
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("--manifest is required for --bootstrap-check"))?;
+    let manifest = WindowsInstallManifest::load_from_file(&manifest_path)?;
+    let install_root = cli
+        .install_root
+        .clone()
+        .unwrap_or_else(|| manifest.install_root.clone());
+    let observed_at_ms = now_unix_ms();
+    let mut items = Vec::new();
+
+    push_check(
+        &mut items,
+        "state_root_writable",
+        state_root_writable(&config.storage.state_root),
+        format!("state root {}", config.storage.state_root.display()),
+    );
+    push_check(
+        &mut items,
+        "config_file_present",
+        config.storage.config_path.exists(),
+        format!("config path {}", config.storage.config_path.display()),
+    );
+    push_check(
+        &mut items,
+        "manifest_state_root_match",
+        manifest.state_root == config.storage.state_root,
+        format!(
+            "manifest={} runtime={}",
+            manifest.state_root.display(),
+            config.storage.state_root.display()
+        ),
+    );
+    push_check(
+        &mut items,
+        "manifest_install_root_match",
+        manifest.install_root == install_root,
+        format!(
+            "manifest={} runtime={}",
+            manifest.install_root.display(),
+            install_root.display()
+        ),
+    );
+
+    for component in &manifest.components {
+        let installed_path = install_root.join(&component.install_relative_path);
+        push_check(
+            &mut items,
+            format!("component:{}", component.name),
+            !component.required || installed_path.exists(),
+            format!("{}", installed_path.display()),
+        );
+    }
+
+    for dependency in &manifest.release_dependencies {
+        let (ok, detail) = match (&dependency.install_relative_path, dependency.required) {
+            (Some(relative_path), true) => {
+                let candidate = install_root.join(relative_path);
+                (candidate.exists(), candidate.display().to_string())
+            }
+            (Some(relative_path), false) => (
+                true,
+                format!(
+                    "not enforced for {} bundle: {}",
+                    manifest.bundle_channel,
+                    install_root.join(relative_path).display()
+                ),
+            ),
+            (None, true) => (
+                false,
+                dependency
+                    .detail
+                    .clone()
+                    .unwrap_or_else(|| "required dependency evidence is missing".to_string()),
+            ),
+            (None, false) => (
+                true,
+                dependency
+                    .detail
+                    .clone()
+                    .unwrap_or_else(|| "dependency is informational".to_string()),
+            ),
+        };
+        push_check(
+            &mut items,
+            format!("dependency:{}", dependency.name),
+            ok,
+            detail,
+        );
+    }
+
+    let bootstrap = Orchestrator::new(config.clone()).bootstrap();
+    let runtime_bridge_socket = match &bootstrap {
+        Ok(artifacts) => artifacts
+            .summary
+            .runtime_bridge
+            .control_socket_path
+            .as_ref()
+            .map(PathBuf::from),
+        Err(_) => None,
+    };
+    push_check(
+        &mut items,
+        "runtime_bootstrap",
+        bootstrap.is_ok(),
+        runtime_bridge_socket
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "orchestrator bootstrap failed".to_string()),
+    );
+
+    if let Ok(artifacts) = bootstrap {
+        let snapshot =
+            build_agent_runtime_snapshot(&config, Some(artifacts.summary.runtime_bridge));
+        RuntimeStateStore::persist_agent_snapshot(&config, &snapshot)?;
+    }
+
+    let report = BootstrapCheckReport {
+        observed_at_ms,
+        install_root,
+        state_root: config.storage.state_root.clone(),
+        config_path: config.storage.config_path.clone(),
+        manifest_path,
+        runtime_bridge_socket,
+        approved: items.iter().all(|item| item.ok),
+        items,
+    };
+    RuntimeStateStore::persist_bootstrap_report(&config, &report)?;
+    Ok(report)
+}
+
+fn push_check(
+    items: &mut Vec<BootstrapCheckItem>,
+    name: impl Into<String>,
+    ok: bool,
+    detail: impl Into<String>,
+) {
+    items.push(BootstrapCheckItem {
+        name: name.into(),
+        ok,
+        detail: detail.into(),
+    });
 }
 
 fn state_root_writable(path: &Path) -> bool {

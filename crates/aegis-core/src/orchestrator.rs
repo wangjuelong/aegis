@@ -1997,6 +1997,7 @@ async fn health_reporter_task(
                 }
             }
             _ = ticker.tick() => {
+                let observed_at_ms = now_unix_ms();
                 let communication = comms_runtime
                     .lock()
                     .expect("comms runtime poisoned")
@@ -2021,6 +2022,19 @@ async fn health_reporter_task(
                         bpf_integrity_pass: true,
                     },
                 );
+                let active_update_id = update_state
+                    .lock()
+                    .expect("update state poisoned")
+                    .active_update_id();
+                if let Err(error) = RuntimeStateStore::refresh_agent_runtime_status(
+                    &config,
+                    observed_at_ms,
+                    active_update_id,
+                    communication.clone(),
+                    health.clone(),
+                ) {
+                    debug!(%error, "health-reporter failed to refresh runtime snapshot");
+                }
                 let heartbeat = HeartbeatBuilder::build(
                     config.tenant_id.clone(),
                     config.agent_id.clone(),
@@ -2032,7 +2046,7 @@ async fn health_reporter_task(
                 let send_result = comms_runtime
                     .lock()
                     .expect("comms runtime poisoned")
-                    .send_heartbeat(&heartbeat, now_unix_ms());
+                    .send_heartbeat(&heartbeat, observed_at_ms);
                 match send_result {
                     Ok((channel, response)) => {
                         if let Err(error) = apply_heartbeat_update_feedback(

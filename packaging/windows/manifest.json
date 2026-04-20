@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "bundle_channel": "development",
+  "install_root": "C:\\Program Files\\Aegis",
+  "state_root": "C:\\ProgramData\\Aegis\\state",
+  "driver_service_name": "AegisSensorKmod",
+  "components": [
+    {
+      "name": "agentd",
+      "kind": "binary",
+      "source_relative_path": "bin/aegis-agentd.exe",
+      "install_relative_path": "bin/aegis-agentd.exe",
+      "required": true
+    },
+    {
+      "name": "watchdog",
+      "kind": "binary",
+      "source_relative_path": "bin/aegis-watchdog.exe",
+      "install_relative_path": "bin/aegis-watchdog.exe",
+      "required": true
+    },
+    {
+      "name": "updater",
+      "kind": "binary",
+      "source_relative_path": "bin/aegis-updater.exe",
+      "install_relative_path": "bin/aegis-updater.exe",
+      "required": true
+    },
+    {
+      "name": "driver_tree",
+      "kind": "driver",
+      "source_relative_path": "driver",
+      "install_relative_path": "driver",
+      "required": true
+    },
+    {
+      "name": "driver_install_script",
+      "kind": "script",
+      "source_relative_path": "scripts/windows-install-driver.ps1",
+      "install_relative_path": "scripts/windows-install-driver.ps1",
+      "required": true
+    },
+    {
+      "name": "driver_uninstall_script",
+      "kind": "script",
+      "source_relative_path": "scripts/windows-uninstall-driver.ps1",
+      "install_relative_path": "scripts/windows-uninstall-driver.ps1",
+      "required": true
+    }
+  ],
+  "release_dependencies": [
+    {
+      "name": "trusted_bundle_signature",
+      "required": false,
+      "install_relative_path": "metadata/signed-release.json",
+      "detail": "正式发布包必须携带代码签名与验签结果"
+    },
+    {
+      "name": "elam_approval",
+      "required": false,
+      "install_relative_path": "metadata/elam-approved.txt",
+      "detail": "正式发布包必须携带 ELAM 依赖批准记录"
+    },
+    {
+      "name": "watchdog_ppl_approval",
+      "required": false,
+      "install_relative_path": "metadata/ppl-approved.txt",
+      "detail": "正式发布包必须携带 watchdog PPL 依赖批准记录"
+    }
+  ]
+}
