@@ -12,6 +12,9 @@ REMOTE_SCRIPT_PATH="${SCRIPT_DIR}/windows-runtime-verify.ps1"
 BUILD_SCRIPT_PATH="${SCRIPT_DIR}/windows-build-driver.ps1"
 INSTALL_SCRIPT_PATH="${SCRIPT_DIR}/windows-install-driver.ps1"
 UNINSTALL_SCRIPT_PATH="${SCRIPT_DIR}/windows-uninstall-driver.ps1"
+AMSI_SCAN_SCRIPT_PATH="${SCRIPT_DIR}/windows-scan-script-with-amsi.ps1"
+SCRIPT_EVENT_QUERY_PATH="${SCRIPT_DIR}/windows-query-script-events.ps1"
+MEMORY_SNAPSHOT_SCRIPT_PATH="${SCRIPT_DIR}/windows-query-memory-snapshot.ps1"
 DRIVER_SOURCE_DIR="${REPO_ROOT}/windows/driver"
 
 REMOTE_PAYLOAD_ID="windows-runtime-verify-$(date +%Y%m%d-%H%M%S)"
@@ -31,9 +34,15 @@ if [[ ! -f "$REMOTE_SCRIPT_PATH" ]]; then
   echo "missing powershell validation script: $REMOTE_SCRIPT_PATH" >&2
   exit 1
 fi
-for path in "$BUILD_SCRIPT_PATH" "$INSTALL_SCRIPT_PATH" "$UNINSTALL_SCRIPT_PATH"; do
+for path in \
+  "$BUILD_SCRIPT_PATH" \
+  "$INSTALL_SCRIPT_PATH" \
+  "$UNINSTALL_SCRIPT_PATH" \
+  "$AMSI_SCAN_SCRIPT_PATH" \
+  "$SCRIPT_EVENT_QUERY_PATH" \
+  "$MEMORY_SNAPSHOT_SCRIPT_PATH"; do
   if [[ ! -f "$path" ]]; then
-    echo "missing driver helper script: $path" >&2
+    echo "missing validation helper script: $path" >&2
     exit 1
   fi
 done
@@ -52,6 +61,9 @@ sshpass -p "$PASSWORD" scp -r "${SSH_OPTS[@]}" \
   "$BUILD_SCRIPT_PATH" \
   "$INSTALL_SCRIPT_PATH" \
   "$UNINSTALL_SCRIPT_PATH" \
+  "$AMSI_SCAN_SCRIPT_PATH" \
+  "$SCRIPT_EVENT_QUERY_PATH" \
+  "$MEMORY_SNAPSHOT_SCRIPT_PATH" \
   "$DRIVER_SOURCE_DIR" \
   "$USER_NAME@$HOST:${REMOTE_PAYLOAD_POSIX}/" >/dev/null
 

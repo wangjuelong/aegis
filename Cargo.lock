@@ -40,6 +40,7 @@ version = "0.1.0"
 dependencies = [
  "aegis-model",
  "aegis-platform",
+ "aegis-script",
  "anyhow",
  "axum",
  "base64",
@@ -89,12 +90,20 @@ name = "aegis-platform"
 version = "0.1.0"
 dependencies = [
  "aegis-model",
+ "aegis-script",
  "anyhow",
  "base64",
  "serde",
  "serde_json",
  "sha2",
  "uuid",
+]
+
+[[package]]
+name = "aegis-script"
+version = "0.1.0"
+dependencies = [
+ "base64",
 ]
 
 [[package]]

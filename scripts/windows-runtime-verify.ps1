@@ -3,6 +3,9 @@ param(
     [string]$BuildScriptPath = (Join-Path $PSScriptRoot "windows-build-driver.ps1"),
     [string]$InstallScriptPath = (Join-Path $PSScriptRoot "windows-install-driver.ps1"),
     [string]$UninstallScriptPath = (Join-Path $PSScriptRoot "windows-uninstall-driver.ps1"),
+    [string]$AmsiScanScriptPath = (Join-Path $PSScriptRoot "windows-scan-script-with-amsi.ps1"),
+    [string]$ScriptEventQueryPath = (Join-Path $PSScriptRoot "windows-query-script-events.ps1"),
+    [string]$MemorySnapshotScriptPath = (Join-Path $PSScriptRoot "windows-query-memory-snapshot.ps1"),
     [string]$DriverServiceName = "AegisSensorKmod"
 )
 
@@ -129,6 +132,67 @@ function Get-ScriptBlockLoggingEnabled {
     } catch {
         return $false
     }
+}
+
+function Get-ScriptBlockLoggingState {
+    try {
+        $policy = Get-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging" -Name "EnableScriptBlockLogging" -ErrorAction Stop
+        return [ordered]@{
+            exists = $true
+            value = [int]$policy.EnableScriptBlockLogging
+        }
+    } catch {
+        return [ordered]@{
+            exists = $false
+            value = $null
+        }
+    }
+}
+
+function Set-ScriptBlockLoggingEnabled {
+    param(
+        [Parameter(Mandatory = $true)]
+        [bool]$Enabled
+    )
+
+    $keyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging"
+    New-Item -ItemType Directory -Path $keyPath -Force | Out-Null
+    if ($Enabled) {
+        New-ItemProperty -Path $keyPath -Name "EnableScriptBlockLogging" -PropertyType DWord -Value 1 -Force | Out-Null
+    } else {
+        Remove-ItemProperty -Path $keyPath -Name "EnableScriptBlockLogging" -ErrorAction SilentlyContinue
+    }
+}
+
+function Restore-ScriptBlockLoggingState {
+    param(
+        [Parameter(Mandatory = $true)]
+        $State
+    )
+
+    $keyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging"
+    if ($State.exists) {
+        New-Item -ItemType Directory -Path $keyPath -Force | Out-Null
+        New-ItemProperty -Path $keyPath -Name "EnableScriptBlockLogging" -PropertyType DWord -Value ([int]$State.value) -Force | Out-Null
+    } else {
+        Remove-ItemProperty -Path $keyPath -Name "EnableScriptBlockLogging" -ErrorAction SilentlyContinue
+        $item = Get-Item -LiteralPath $keyPath -ErrorAction SilentlyContinue
+        if ($null -ne $item -and $item.Property.Count -eq 0) {
+            Remove-Item -LiteralPath $keyPath -Force
+        }
+    }
+}
+
+function Get-LatestScriptBlockRecordId {
+    $event = Get-WinEvent -FilterHashtable @{
+        LogName = "Microsoft-Windows-PowerShell/Operational"
+        Id = 4104
+    } -MaxEvents 1 -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $event) {
+        return [uint64]0
+    }
+
+    [uint64]$event.RecordId
 }
 
 function Get-EventDataMap {
@@ -475,11 +539,108 @@ Invoke-ValidationStep -Name "device_inventory" -Body {
 }
 
 Invoke-ValidationStep -Name "amsi_surface" -Body {
-    $amsiDll = Join-Path $env:WINDIR "System32\amsi.dll"
+    $resolvedAmsiScript = Resolve-ExistingPath -Path $AmsiScanScriptPath -Description "amsi scan script"
+    $status = Invoke-JsonScript -ScriptPath $resolvedAmsiScript -Arguments @{
+        Mode = "status"
+    }
+
     [ordered]@{
-        has_amsi_runtime = (Test-Path -LiteralPath $amsiDll) -and ($null -ne [Ref].Assembly.GetType("System.Management.Automation.AmsiUtils"))
+        has_amsi_runtime = [bool]$status.has_amsi_runtime
+        scan_interface_ready = [bool]$status.scan_interface_ready
+        session_opened = [bool]$status.session_opened
+        amsi_result = [uint32]$status.amsi_result
         has_powershell_operational_log = (Get-WinEvent -ListLog "Microsoft-Windows-PowerShell/Operational" -ErrorAction Stop) -ne $null
         has_script_block_logging = Get-ScriptBlockLoggingEnabled
+    }
+}
+
+Invoke-ValidationStep -Name "script_surface_roundtrip" -Body {
+    $resolvedAmsiScript = Resolve-ExistingPath -Path $AmsiScanScriptPath -Description "amsi scan script"
+    $resolvedScriptEventQuery = Resolve-ExistingPath -Path $ScriptEventQueryPath -Description "script event query script"
+    $previousState = Get-ScriptBlockLoggingState
+    $beforeRecordId = Get-LatestScriptBlockRecordId
+
+    try {
+        Set-ScriptBlockLoggingEnabled -Enabled $true
+        Start-Sleep -Milliseconds 300
+
+        $allowScript = "Write-Output 'Aegis script surface allow'"
+        $allowResult = Invoke-JsonScript -ScriptPath $resolvedAmsiScript -Arguments @{
+            Mode = "execute"
+            ContentName = "AegisAllow.ps1"
+            ScriptContentBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($allowScript))
+        }
+        if (-not [bool]$allowResult.executed) {
+            throw "expected benign script to execute"
+        }
+
+        $scriptEvents = @()
+        $matched = @()
+        $deadline = (Get-Date).AddSeconds(10)
+        do {
+            Start-Sleep -Milliseconds 500
+            $scriptEvents = @(
+                Invoke-JsonScript -ScriptPath $resolvedScriptEventQuery -Arguments @{
+                    AfterRecordId = [string]$beforeRecordId
+                    MaxEntries = "256"
+                }
+            )
+            $matched = @($scriptEvents | Where-Object { $_.script_text -like "*Aegis script surface allow*" })
+            if ($matched.Count -gt 0) {
+                break
+            }
+        } while ((Get-Date) -lt $deadline)
+        if ($matched.Count -lt 1) {
+            throw "no script block logging event captured for benign script"
+        }
+
+        # Build the official AMSI test sample at runtime so the verifier itself is not signature-blocked on upload.
+        $blockScript = -join ((@(
+            65,77,83,73,32,84,101,115,116,32,83,97,109,112,108,101,58,32,
+            55,101,55,50,99,51,99,101,45,56,54,49,98,45,52,51,51,57,45,56,55,52,48,45,48,97,99,49,52,56,52,99,49,51,56,54
+        )) | ForEach-Object { [char]$_ })
+        $blockResult = Invoke-JsonScript -ScriptPath $resolvedAmsiScript -Arguments @{
+            Mode = "execute"
+            ContentName = "AegisBlock.ps1"
+            ScriptContentBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($blockScript))
+        }
+        if (-not [bool]$blockResult.blocked -or [bool]$blockResult.executed) {
+            throw "expected suspicious script to be blocked before execution"
+        }
+
+        [ordered]@{
+            allow = $allowResult
+            benign_event = $matched | Select-Object -First 1
+            block = $blockResult
+        }
+    } finally {
+        Restore-ScriptBlockLoggingState -State $previousState
+    }
+}
+
+Invoke-ValidationStep -Name "memory_signal_roundtrip" -Body {
+    $resolvedMemoryScript = Resolve-ExistingPath -Path $MemorySnapshotScriptPath -Description "memory snapshot script"
+    $before = Invoke-JsonScript -ScriptPath $resolvedMemoryScript -Arguments @{}
+    $memoryProc = Start-Process -FilePath "powershell" -ArgumentList "-NoProfile", "-NonInteractive", "-Command", "[byte[]]`$buffer = New-Object byte[] (96MB); Start-Sleep -Seconds 15" -PassThru
+    try {
+        Start-Sleep -Seconds 2
+        $after = Invoke-JsonScript -ScriptPath $resolvedMemoryScript -Arguments @{}
+        $sample = @($after | Where-Object { [uint32]$_.process_id -eq [uint32]$memoryProc.Id } | Select-Object -First 1)
+        if ($sample.Count -ne 1) {
+            throw "memory snapshot did not include validation process"
+        }
+        if ([uint64]$sample[0].private_memory_bytes -lt 67108864) {
+            throw "memory snapshot did not capture expected private memory growth"
+        }
+
+        [ordered]@{
+            pid = $memoryProc.Id
+            before_count = @($before).Count
+            after_count = @($after).Count
+            sample = $sample[0]
+        }
+    } finally {
+        Stop-Process -Id $memoryProc.Id -Force -ErrorAction SilentlyContinue
     }
 }
 

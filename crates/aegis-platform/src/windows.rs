@@ -8,10 +8,12 @@ use aegis_model::{
     IsolationRulesV2, NetworkTarget, QuarantineReceipt, RollbackTarget, SensorCapabilities,
     SensorConfig, SuspiciousProcess,
 };
+use aegis_script::ScriptDecodePipeline;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -37,6 +39,12 @@ const WINDOWS_PROTECT_PROCESS_SCRIPT: &str =
     include_str!("../../../scripts/windows-protect-process.ps1");
 const WINDOWS_QUERY_DRIVER_INTEGRITY_SCRIPT: &str =
     include_str!("../../../scripts/windows-query-driver-integrity.ps1");
+const WINDOWS_SCAN_SCRIPT_WITH_AMSI_SCRIPT: &str =
+    include_str!("../../../scripts/windows-scan-script-with-amsi.ps1");
+const WINDOWS_QUERY_SCRIPT_EVENTS_SCRIPT: &str =
+    include_str!("../../../scripts/windows-query-script-events.ps1");
+const WINDOWS_QUERY_MEMORY_SNAPSHOT_SCRIPT: &str =
+    include_str!("../../../scripts/windows-query-memory-snapshot.ps1");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowsProviderKind {
@@ -196,6 +204,8 @@ struct WindowsHostCapabilities {
     has_registry_cli: bool,
     has_amsi_runtime: bool,
     has_script_block_logging: bool,
+    has_amsi_scan_interface: bool,
+    has_memory_inventory: bool,
     has_named_pipe_inventory: bool,
     has_module_inventory: bool,
     has_vss_inventory: bool,
@@ -284,6 +294,22 @@ impl WindowsHostCapabilities {
         self.driver_transport_ready() && self.ob_callback_registered
     }
 
+    fn script_sensor_ready(&self) -> bool {
+        self.reachable
+            && self.running_on_windows
+            && self.has_powershell_log
+            && self.has_amsi_runtime
+            && self.has_script_block_logging
+            && self.has_amsi_scan_interface
+    }
+
+    fn memory_sensor_ready(&self) -> bool {
+        self.reachable
+            && self.running_on_windows
+            && self.has_process_inventory
+            && self.has_memory_inventory
+    }
+
     fn provider_health(&self, provider: WindowsProviderKind, running: bool) -> bool {
         if !running || !self.reachable || !self.running_on_windows {
             return false;
@@ -298,10 +324,8 @@ impl WindowsHostCapabilities {
             WindowsProviderKind::MinifilterFile => self.file_monitor_ready(),
             WindowsProviderKind::WfpNetwork => self.has_net_connection,
             WindowsProviderKind::RegistryCallback => self.registry_provider_ready(),
-            WindowsProviderKind::AmsiScript => {
-                self.has_amsi_runtime && self.has_script_block_logging
-            }
-            WindowsProviderKind::MemorySensor => false,
+            WindowsProviderKind::AmsiScript => self.script_sensor_ready(),
+            WindowsProviderKind::MemorySensor => self.memory_sensor_ready(),
             WindowsProviderKind::IpcSensor => self.has_named_pipe_inventory,
             WindowsProviderKind::ModuleLoadSensor => self.has_module_inventory,
             WindowsProviderKind::SnapshotProtection => self.has_vss_inventory,
@@ -336,6 +360,11 @@ impl WindowsHostCapabilities {
             "script_block_logging={}",
             self.has_script_block_logging
         ));
+        facts.push(format!(
+            "amsi_scan_interface={}",
+            self.has_amsi_scan_interface
+        ));
+        facts.push(format!("memory_inventory={}", self.has_memory_inventory));
         facts.push(self.driver_transport_summary());
         facts.push(format!(
             "file_monitor={};file_protocol={};file_queue={};protected_paths={};file_detail={}",
@@ -396,6 +425,10 @@ struct WindowsCapabilityProbe {
     has_registry_cli: bool,
     has_amsi_runtime: bool,
     has_script_block_logging: bool,
+    #[serde(default)]
+    has_amsi_scan_interface: bool,
+    #[serde(default)]
+    has_memory_inventory: bool,
     has_named_pipe_inventory: bool,
     has_module_inventory: bool,
     has_vss_inventory: bool,
@@ -466,6 +499,129 @@ struct WindowsTasklistSnapshot {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 struct WindowsProcessAuditCursor {
     record_id: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsScriptBlockCursor {
+    record_id: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsRawScriptBlockEvent {
+    record_id: u64,
+    #[serde(default)]
+    process_id: Option<u32>,
+    #[serde(default)]
+    script_block_id: Option<String>,
+    #[serde(default)]
+    message_number: Option<u32>,
+    #[serde(default)]
+    message_total: Option<u32>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    script_text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WindowsScriptBlockEvent {
+    record_id: u64,
+    process_id: Option<u32>,
+    script_block_id: Option<String>,
+    path: Option<String>,
+    script_text: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct WindowsScriptBlockAssembly {
+    message_total: u32,
+    process_id: Option<u32>,
+    path: Option<String>,
+    fragments: BTreeMap<u32, String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsAmsiScanResponse {
+    content_name: String,
+    app_name: String,
+    amsi_result: u32,
+    blocked_by_admin: bool,
+    malware: bool,
+    should_block: bool,
+    session_opened: bool,
+    scan_interface_ready: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WindowsScriptAssessment {
+    operation: String,
+    risk_score: u8,
+    script_sha256: String,
+    preview: String,
+    suspicious_tokens: Vec<String>,
+    decode_layer_count: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsMemorySnapshot {
+    process_id: u32,
+    process_name: String,
+    working_set_bytes: u64,
+    private_memory_bytes: u64,
+    virtual_memory_bytes: u64,
+    paged_memory_bytes: u64,
+    #[serde(default)]
+    path: Option<String>,
+}
+
+impl WindowsScriptAssessment {
+    fn from_script(script: &str, scan: &WindowsAmsiScanResponse) -> Self {
+        let decode = ScriptDecodePipeline.decode(script);
+        let suspicious_tokens = decode.suspicious_tokens.clone();
+        let mut risk_score = 0u8;
+        risk_score = risk_score.saturating_add((decode.layers.len().min(3) as u8) * 20);
+        risk_score = risk_score.saturating_add((suspicious_tokens.len().min(3) as u8) * 20);
+        if scan.blocked_by_admin {
+            risk_score = risk_score.saturating_add(20);
+        }
+        if scan.malware {
+            risk_score = risk_score.saturating_add(30);
+        }
+
+        let blocks_on_tokens = suspicious_tokens.iter().any(|token| {
+            matches!(
+                token.as_str(),
+                "AmsiUtils" | "Invoke-Mimikatz" | "VirtualAlloc"
+            )
+        });
+        let operation = if scan.should_block || blocks_on_tokens {
+            "script-block"
+        } else if risk_score >= 40 || !suspicious_tokens.is_empty() || !decode.layers.is_empty() {
+            "script-alert"
+        } else {
+            "script-allow"
+        };
+
+        let preview_source = if decode.decoded.is_empty() {
+            script
+        } else {
+            decode.decoded.as_str()
+        };
+        let script_sha256 = {
+            let mut hasher = Sha256::new();
+            hasher.update(preview_source.as_bytes());
+            format!("{:x}", hasher.finalize())
+        };
+
+        Self {
+            operation: operation.to_string(),
+            risk_score,
+            script_sha256,
+            preview: truncate_subject(preview_source),
+            suspicious_tokens,
+            decode_layer_count: decode.layers.len(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -766,6 +922,7 @@ struct WindowsIntegrityAuditArtifact {
     kernel_code: IntegrityReport,
     etw_ingest: IntegrityReport,
     amsi_script: IntegrityReport,
+    memory_sensor: IntegrityReport,
 }
 
 struct WindowsState {
@@ -776,6 +933,9 @@ struct WindowsState {
     host_capabilities_pinned: bool,
     known_processes: BTreeMap<u32, WindowsProcessSnapshot>,
     security_process_cursor: Option<u64>,
+    script_block_cursor: Option<u64>,
+    pending_script_blocks: BTreeMap<String, WindowsScriptBlockAssembly>,
+    known_memory_processes: BTreeMap<u32, WindowsMemorySnapshot>,
     known_connections: BTreeMap<String, WindowsNetworkConnection>,
     known_named_pipes: BTreeMap<String, WindowsNamedPipeSnapshot>,
     known_modules: BTreeMap<String, WindowsModuleSnapshot>,
@@ -833,6 +993,9 @@ impl WindowsPlatform {
                 host_capabilities_pinned,
                 known_processes: BTreeMap::new(),
                 security_process_cursor: None,
+                script_block_cursor: None,
+                pending_script_blocks: BTreeMap::new(),
+                known_memory_processes: BTreeMap::new(),
                 known_connections: BTreeMap::new(),
                 known_named_pipes: BTreeMap::new(),
                 known_modules: BTreeMap::new(),
@@ -903,6 +1066,7 @@ impl WindowsPlatform {
                 ),
                 ("etw_ingest".to_string(), etw_report(&host)),
                 ("amsi_script".to_string(), amsi_report(&host)),
+                ("memory_sensor".to_string(), memory_report(&host)),
             ]),
         }
     }
@@ -937,6 +1101,20 @@ impl PlatformSensor for WindowsPlatform {
                 .with_context(|| "snapshot initial windows process audit cursor")?;
         } else {
             state.security_process_cursor = None;
+        }
+        if state.host.script_sensor_ready() {
+            state.script_block_cursor = latest_script_block_record_id(self.runner.as_ref())
+                .with_context(|| "snapshot initial windows script-block cursor")?;
+            state.pending_script_blocks.clear();
+        } else {
+            state.script_block_cursor = None;
+            state.pending_script_blocks.clear();
+        }
+        if state.host.memory_sensor_ready() {
+            state.known_memory_processes = snapshot_memory_inventory(self.runner.as_ref())
+                .with_context(|| "snapshot initial windows memory inventory")?;
+        } else {
+            state.known_memory_processes.clear();
         }
         if state.host.has_net_connection {
             state.known_connections = snapshot_network_inventory(self.runner.as_ref())
@@ -1012,8 +1190,8 @@ impl PlatformSensor for WindowsPlatform {
             network: host.has_net_connection,
             registry: host.registry_provider_ready(),
             auth: host.any_event_log(),
-            script: false,
-            memory: false,
+            script: host.script_sensor_ready(),
+            memory: host.memory_sensor_ready(),
             container: false,
         }
     }
@@ -1414,10 +1592,7 @@ impl PlatformProtection for WindowsPlatform {
     fn check_amsi_integrity(&self) -> Result<AmsiStatus> {
         let host = self.host_capabilities();
         Ok(AmsiStatus {
-            healthy: host.reachable
-                && host.running_on_windows
-                && host.has_amsi_runtime
-                && host.has_script_block_logging,
+            healthy: host.script_sensor_ready(),
         })
     }
 
@@ -1438,7 +1613,7 @@ impl PlatformRuntime for WindowsPlatform {
             },
             degrade_levels: 3,
             supports_registry: host.registry_provider_ready(),
-            supports_amsi: false,
+            supports_amsi: host.script_sensor_ready(),
             supports_etw_integrity: host.driver_transport_ready(),
             supports_bpf_integrity: false,
             supports_container_sensor: false,
@@ -1490,6 +1665,86 @@ try {
     $hasScriptBlockLogging = [int]$policy.EnableScriptBlockLogging -eq 1
 } catch {
     $hasScriptBlockLogging = $false
+}
+
+if (-not ("AegisProbe.AmsiBridge" -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+namespace AegisProbe {
+    public static class AmsiBridge {
+        [DllImport("amsi.dll", CharSet = CharSet.Unicode)]
+        public static extern int AmsiInitialize(string appName, out IntPtr amsiContext);
+
+        [DllImport("amsi.dll")]
+        public static extern void AmsiUninitialize(IntPtr amsiContext);
+
+        [DllImport("amsi.dll")]
+        public static extern int AmsiOpenSession(IntPtr amsiContext, out IntPtr session);
+
+        [DllImport("amsi.dll")]
+        public static extern void AmsiCloseSession(IntPtr amsiContext, IntPtr session);
+
+        [DllImport("amsi.dll", CharSet = CharSet.Unicode)]
+        public static extern int AmsiScanBuffer(
+            IntPtr amsiContext,
+            byte[] buffer,
+            uint length,
+            string contentName,
+            IntPtr session,
+            out uint result);
+    }
+}
+"@ | Out-Null
+}
+
+$hasAmsiScanInterface = $false
+if ($hasAmsiRuntime) {
+    $amsiContext = [IntPtr]::Zero
+    $amsiSession = [IntPtr]::Zero
+    try {
+        $status = [AegisProbe.AmsiBridge]::AmsiInitialize('AegisProbe', [ref]$amsiContext)
+        if ($status -eq 0 -and $amsiContext -ne [IntPtr]::Zero) {
+            $null = [AegisProbe.AmsiBridge]::AmsiOpenSession($amsiContext, [ref]$amsiSession)
+            $probeBytes = [System.Text.Encoding]::Unicode.GetBytes("Write-Output 'Aegis AMSI probe'")
+            $probeResult = [uint32]0
+            $status = [AegisProbe.AmsiBridge]::AmsiScanBuffer(
+                $amsiContext,
+                $probeBytes,
+                [uint32]$probeBytes.Length,
+                'AegisProbe.ps1',
+                $amsiSession,
+                [ref]$probeResult
+            )
+            $hasAmsiScanInterface = $status -eq 0
+        }
+    } catch {
+        $hasAmsiScanInterface = $false
+    } finally {
+        if ($amsiSession -ne [IntPtr]::Zero -and $amsiContext -ne [IntPtr]::Zero) {
+            [AegisProbe.AmsiBridge]::AmsiCloseSession($amsiContext, $amsiSession)
+        }
+        if ($amsiContext -ne [IntPtr]::Zero) {
+            [AegisProbe.AmsiBridge]::AmsiUninitialize($amsiContext)
+        }
+    }
+}
+
+$hasMemoryInventory = $false
+if ((Get-Command Get-Process -ErrorAction SilentlyContinue) -ne $null) {
+    try {
+        $null = Get-Process -ErrorAction Stop |
+            Select-Object -First 1 |
+            ForEach-Object {
+                [void]$_.WorkingSet64
+                [void]$_.PrivateMemorySize64
+                [void]$_.VirtualMemorySize64
+                [void]$_.PagedMemorySize64
+            }
+        $hasMemoryInventory = $true
+    } catch {
+        $hasMemoryInventory = $false
+    }
 }
 
 $hasNamedPipeInventory = $false
@@ -1662,6 +1917,8 @@ $data = [ordered]@{
     has_registry_cli = (Get-Command reg.exe -ErrorAction SilentlyContinue) -ne $null
     has_amsi_runtime = $hasAmsiRuntime
     has_script_block_logging = $hasScriptBlockLogging
+    has_amsi_scan_interface = $hasAmsiScanInterface
+    has_memory_inventory = $hasMemoryInventory
     has_named_pipe_inventory = $hasNamedPipeInventory
     has_module_inventory = $hasModuleInventory
     has_vss_inventory = $hasVssInventory
@@ -1697,6 +1954,8 @@ $data | ConvertTo-Json -Compress
         has_registry_cli: probe.has_registry_cli,
         has_amsi_runtime: probe.has_amsi_runtime,
         has_script_block_logging: probe.has_script_block_logging,
+        has_amsi_scan_interface: probe.has_amsi_scan_interface,
+        has_memory_inventory: probe.has_memory_inventory,
         has_named_pipe_inventory: probe.has_named_pipe_inventory,
         has_module_inventory: probe.has_module_inventory,
         has_vss_inventory: probe.has_vss_inventory,
@@ -1882,6 +2141,40 @@ fn run_embedded_powershell_json<T: DeserializeOwned>(
 ) -> Result<T> {
     let script = build_embedded_windows_script_invocation(script_body, args);
     run_powershell_json(runner, &script)
+}
+
+fn query_windows_script_events(
+    runner: &dyn WindowsCommandRunner,
+    after_record_id: u64,
+    max_entries: u32,
+) -> Result<Vec<WindowsRawScriptBlockEvent>> {
+    run_embedded_powershell_json(
+        runner,
+        WINDOWS_QUERY_SCRIPT_EVENTS_SCRIPT,
+        &[
+            ("AfterRecordId", after_record_id.to_string()),
+            ("MaxEntries", max_entries.to_string()),
+        ],
+    )
+}
+
+fn scan_windows_script_content(
+    runner: &dyn WindowsCommandRunner,
+    content_name: &str,
+    script_content: &str,
+) -> Result<WindowsAmsiScanResponse> {
+    run_embedded_powershell_json(
+        runner,
+        WINDOWS_SCAN_SCRIPT_WITH_AMSI_SCRIPT,
+        &[
+            ("Mode", "scan".to_string()),
+            ("ContentName", content_name.to_string()),
+            (
+                "ScriptContentBase64",
+                STANDARD.encode(script_content.as_bytes()),
+            ),
+        ],
+    )
 }
 
 fn query_windows_file_monitor_status(
@@ -2205,6 +2498,12 @@ fn collect_live_windows_events(
     if state.host.has_process_creation_events {
         collect_security_process_audit_events(state, runner)?;
     }
+    if state.host.script_sensor_ready() {
+        collect_script_block_events(state, runner)?;
+    }
+    if state.host.memory_sensor_ready() {
+        collect_memory_events(state, runner)?;
+    }
     if state.host.has_net_connection {
         collect_network_delta_events(state, runner)?;
     }
@@ -2236,6 +2535,207 @@ if ($null -eq $event) {
 "#;
     let cursor: Option<WindowsProcessAuditCursor> = run_powershell_json(runner, script)?;
     Ok(cursor.map(|value| value.record_id))
+}
+
+fn latest_script_block_record_id(runner: &dyn WindowsCommandRunner) -> Result<Option<u64>> {
+    let script = r#"
+$event = Get-WinEvent -FilterHashtable @{ LogName='Microsoft-Windows-PowerShell/Operational'; Id=4104 } -MaxEvents 1 -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($null -eq $event) {
+    'null'
+} else {
+    [ordered]@{
+        record_id = [uint64]$event.RecordId
+    } | ConvertTo-Json -Compress
+}
+"#;
+    let cursor: Option<WindowsScriptBlockCursor> = run_powershell_json(runner, script)?;
+    Ok(cursor.map(|value| value.record_id))
+}
+
+fn collect_script_block_events(
+    state: &mut WindowsState,
+    runner: &dyn WindowsCommandRunner,
+) -> Result<()> {
+    let Some(after_record_id) = state.script_block_cursor else {
+        state.script_block_cursor = latest_script_block_record_id(runner)?;
+        return Ok(());
+    };
+
+    let events = query_windows_script_events(runner, after_record_id, 64)?;
+    if let Some(last) = events.last() {
+        state.script_block_cursor = Some(last.record_id);
+    }
+
+    for raw in events {
+        let Some(script_event) =
+            assemble_windows_script_block_event(&mut state.pending_script_blocks, raw)
+        else {
+            continue;
+        };
+
+        let content_name = script_event
+            .script_block_id
+            .clone()
+            .unwrap_or_else(|| format!("ScriptBlock-{}", script_event.record_id));
+        let scan = scan_windows_script_content(runner, &content_name, &script_event.script_text)?;
+        let assessment = WindowsScriptAssessment::from_script(&script_event.script_text, &scan);
+        let tokens = if assessment.suspicious_tokens.is_empty() {
+            "-".to_string()
+        } else {
+            assessment.suspicious_tokens.join(",")
+        };
+        let subject = truncate_subject(&format!(
+            "record_id={};pid={};script_block_id={};decision={};risk={};amsi_result=0x{:04x};layers={};tokens={};sha256={};path={};preview={}",
+            script_event.record_id,
+            script_event
+                .process_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            script_event
+                .script_block_id
+                .as_deref()
+                .unwrap_or("-"),
+            assessment.operation,
+            assessment.risk_score,
+            scan.amsi_result,
+            assessment.decode_layer_count,
+            tokens,
+            assessment.script_sha256,
+            script_event.path.as_deref().unwrap_or("-"),
+            assessment.preview
+        ));
+        state.pending_events.push_back(
+            WindowsEventStub {
+                provider: WindowsProviderKind::AmsiScript,
+                operation: assessment.operation,
+                subject,
+            }
+            .encode(),
+        );
+    }
+
+    Ok(())
+}
+
+fn assemble_windows_script_block_event(
+    pending: &mut BTreeMap<String, WindowsScriptBlockAssembly>,
+    raw: WindowsRawScriptBlockEvent,
+) -> Option<WindowsScriptBlockEvent> {
+    let total = raw.message_total.unwrap_or(1).max(1);
+    let part = raw.message_number.unwrap_or(1).max(1);
+    let block_id = raw.script_block_id.clone();
+
+    if total == 1 || block_id.is_none() {
+        return Some(WindowsScriptBlockEvent {
+            record_id: raw.record_id,
+            process_id: raw.process_id,
+            script_block_id: raw.script_block_id,
+            path: raw.path,
+            script_text: raw.script_text,
+        });
+    }
+
+    let block_id = block_id.expect("checked above");
+    let entry = pending.entry(block_id.clone()).or_default();
+    entry.message_total = total;
+    if entry.process_id.is_none() {
+        entry.process_id = raw.process_id;
+    }
+    if entry.path.is_none() {
+        entry.path = raw.path.clone();
+    }
+    entry.fragments.insert(part, raw.script_text);
+
+    if entry.fragments.len() as u32 != entry.message_total {
+        return None;
+    }
+
+    let mut script_text = String::new();
+    for index in 1..=entry.message_total {
+        let fragment = entry.fragments.get(&index)?;
+        script_text.push_str(fragment);
+    }
+    let assembled = pending.remove(&block_id)?;
+    Some(WindowsScriptBlockEvent {
+        record_id: raw.record_id,
+        process_id: assembled.process_id,
+        script_block_id: Some(block_id),
+        path: assembled.path,
+        script_text,
+    })
+}
+
+fn collect_memory_events(
+    state: &mut WindowsState,
+    runner: &dyn WindowsCommandRunner,
+) -> Result<()> {
+    const MIN_PRIVATE_BYTES: u64 = 32 * 1024 * 1024;
+    const MIN_PRIVATE_DELTA_BYTES: u64 = 16 * 1024 * 1024;
+    const HOT_PRIVATE_BYTES: u64 = 64 * 1024 * 1024;
+
+    let current = snapshot_memory_inventory(runner)?;
+    for (pid, sample) in &current {
+        match state.known_memory_processes.get(pid) {
+            Some(previous) => {
+                let private_delta = sample
+                    .private_memory_bytes
+                    .saturating_sub(previous.private_memory_bytes);
+                let working_delta = sample
+                    .working_set_bytes
+                    .saturating_sub(previous.working_set_bytes);
+                let grew_enough = if previous.private_memory_bytes == 0 {
+                    sample.private_memory_bytes >= HOT_PRIVATE_BYTES
+                } else {
+                    sample.private_memory_bytes.saturating_mul(100)
+                        >= previous.private_memory_bytes.saturating_mul(125)
+                };
+                if sample.private_memory_bytes >= MIN_PRIVATE_BYTES
+                    && private_delta >= MIN_PRIVATE_DELTA_BYTES
+                    && grew_enough
+                {
+                    state.pending_events.push_back(
+                        WindowsEventStub {
+                            provider: WindowsProviderKind::MemorySensor,
+                            operation: "memory-growth".to_string(),
+                            subject: truncate_subject(&format!(
+                                "pid={};name={};private_memory_bytes={};private_delta_bytes={};working_set_bytes={};working_delta_bytes={};path={}",
+                                sample.process_id,
+                                sample.process_name,
+                                sample.private_memory_bytes,
+                                private_delta,
+                                sample.working_set_bytes,
+                                working_delta,
+                                sample.path.as_deref().unwrap_or("-")
+                            )),
+                        }
+                        .encode(),
+                    );
+                }
+            }
+            None => {
+                if sample.private_memory_bytes >= HOT_PRIVATE_BYTES {
+                    state.pending_events.push_back(
+                        WindowsEventStub {
+                            provider: WindowsProviderKind::MemorySensor,
+                            operation: "memory-hot".to_string(),
+                            subject: truncate_subject(&format!(
+                                "pid={};name={};private_memory_bytes={};working_set_bytes={};path={}",
+                                sample.process_id,
+                                sample.process_name,
+                                sample.private_memory_bytes,
+                                sample.working_set_bytes,
+                                sample.path.as_deref().unwrap_or("-")
+                            )),
+                        }
+                        .encode(),
+                    );
+                }
+            }
+        }
+    }
+
+    state.known_memory_processes = current;
+    Ok(())
 }
 
 fn collect_process_delta_events(
@@ -2692,6 +3192,17 @@ $rows = @(
         .collect())
 }
 
+fn snapshot_memory_inventory(
+    runner: &dyn WindowsCommandRunner,
+) -> Result<BTreeMap<u32, WindowsMemorySnapshot>> {
+    let rows: Vec<WindowsMemorySnapshot> =
+        run_embedded_powershell_json(runner, WINDOWS_QUERY_MEMORY_SNAPSHOT_SCRIPT, &[])?;
+    Ok(rows
+        .into_iter()
+        .map(|sample| (sample.process_id, sample))
+        .collect())
+}
+
 fn snapshot_tasklist_inventory(
     runner: &dyn WindowsCommandRunner,
 ) -> Result<BTreeMap<u32, WindowsTasklistSnapshot>> {
@@ -2910,6 +3421,7 @@ fn write_windows_integrity_artifact(state: &mut WindowsState) -> Result<PathBuf>
         kernel_code: kernel_code_report(&state.host),
         etw_ingest: etw_report(&state.host),
         amsi_script: amsi_report(&state.host),
+        memory_sensor: memory_report(&state.host),
     };
     let path = state
         .base_dir
@@ -3574,16 +4086,29 @@ fn etw_report(host: &WindowsHostCapabilities) -> IntegrityReport {
 }
 
 fn amsi_report(host: &WindowsHostCapabilities) -> IntegrityReport {
-    let passed = host.reachable
-        && host.running_on_windows
-        && host.has_amsi_runtime
-        && host.has_script_block_logging;
+    let passed = host.script_sensor_ready();
     let details = if !host.reachable {
         host.summary()
     } else {
         format!(
-            "amsi_runtime={};script_block_logging={};powershell_operational_log={}",
-            host.has_amsi_runtime, host.has_script_block_logging, host.has_powershell_log
+            "amsi_runtime={};script_block_logging={};powershell_operational_log={};amsi_scan_interface={}",
+            host.has_amsi_runtime,
+            host.has_script_block_logging,
+            host.has_powershell_log,
+            host.has_amsi_scan_interface
+        )
+    };
+    IntegrityReport { passed, details }
+}
+
+fn memory_report(host: &WindowsHostCapabilities) -> IntegrityReport {
+    let passed = host.memory_sensor_ready();
+    let details = if !host.reachable {
+        host.summary()
+    } else {
+        format!(
+            "process_inventory={};memory_inventory={}",
+            host.has_process_inventory, host.has_memory_inventory
         )
     };
     IntegrityReport { passed, details }
@@ -3693,6 +4218,8 @@ mod tests {
             has_registry_cli: true,
             has_amsi_runtime: false,
             has_script_block_logging: false,
+            has_amsi_scan_interface: false,
+            has_memory_inventory: false,
             has_named_pipe_inventory: false,
             has_module_inventory: false,
             has_vss_inventory: false,
@@ -3808,6 +4335,7 @@ mod tests {
                 r#""has_wmi_log":true,"has_task_scheduler_log":true,"has_sysmon_log":false,"#,
                 r#""has_process_creation_events":true,"has_net_connection":true,"has_firewall":true,"#,
                 r#""has_registry_cli":true,"has_amsi_runtime":{},"has_script_block_logging":{},"#,
+                r#""has_amsi_scan_interface":false,"has_memory_inventory":false,"#,
                 r#""has_named_pipe_inventory":{},"has_module_inventory":{},"has_vss_inventory":{},"#,
                 r#""has_device_inventory":{}}}"#
             ),
@@ -3817,6 +4345,30 @@ mod tests {
             has_module_inventory,
             has_vss_inventory,
             has_device_inventory
+        )
+    }
+
+    fn probe_output_with_script_memory_surface(
+        has_amsi_runtime: bool,
+        has_script_block_logging: bool,
+        has_amsi_scan_interface: bool,
+        has_memory_inventory: bool,
+    ) -> String {
+        format!(
+            concat!(
+                r#"{{"computer_name":"DESKTOP-TLASHJG","user_name":"desktop-tlashjg\\lamba","is_admin":true,"#,
+                r#""has_process_inventory":true,"has_security_log":true,"has_powershell_log":true,"#,
+                r#""has_wmi_log":true,"has_task_scheduler_log":true,"has_sysmon_log":false,"#,
+                r#""has_process_creation_events":true,"has_net_connection":true,"has_firewall":true,"#,
+                r#""has_registry_cli":true,"has_amsi_runtime":{},"has_script_block_logging":{},"#,
+                r#""has_amsi_scan_interface":{},"has_memory_inventory":{},"#,
+                r#""has_named_pipe_inventory":false,"has_module_inventory":false,"has_vss_inventory":false,"#,
+                r#""has_device_inventory":false}}"#
+            ),
+            has_amsi_runtime,
+            has_script_block_logging,
+            has_amsi_scan_interface,
+            has_memory_inventory
         )
     }
 
@@ -3955,6 +4507,87 @@ mod tests {
                     instance_id.replace('\\', "\\\\").replace('"', "\\\"")
                 )
             })
+            .collect::<Vec<_>>();
+        format!("[{}]", rows.join(","))
+    }
+
+    fn script_block_events_output(
+        entries: &[(
+            u64,
+            Option<u32>,
+            Option<&str>,
+            Option<u32>,
+            Option<u32>,
+            Option<&str>,
+            &str,
+        )],
+    ) -> String {
+        let rows = entries
+            .iter()
+            .map(
+                |(
+                    record_id,
+                    process_id,
+                    script_block_id,
+                    message_number,
+                    message_total,
+                    path,
+                    script_text,
+                )| {
+                    let process_id = process_id
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "null".to_string());
+                    let script_block_id = script_block_id
+                        .map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+                        .unwrap_or_else(|| "null".to_string());
+                    let message_number = message_number
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "null".to_string());
+                    let message_total = message_total
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "null".to_string());
+                    let path = path
+                        .map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+                        .unwrap_or_else(|| "null".to_string());
+                    format!(
+                        "{{\"record_id\":{record_id},\"process_id\":{process_id},\"script_block_id\":{script_block_id},\"message_number\":{message_number},\"message_total\":{message_total},\"path\":{path},\"script_text\":\"{}\"}}",
+                        script_text.replace('\\', "\\\\").replace('"', "\\\"")
+                    )
+                },
+            )
+            .collect::<Vec<_>>();
+        format!("[{}]", rows.join(","))
+    }
+
+    fn amsi_scan_output(result: u32, blocked_by_admin: bool, malware: bool) -> String {
+        format!(
+            r#"{{"content_name":"ScriptBlock-1","app_name":"AegisSensor","amsi_result":{result},"blocked_by_admin":{blocked_by_admin},"malware":{malware},"should_block":{},"session_opened":true,"scan_interface_ready":true}}"#,
+            blocked_by_admin || malware
+        )
+    }
+
+    fn memory_output(entries: &[(u32, &str, u64, u64, u64, u64, Option<&str>)]) -> String {
+        let rows = entries
+            .iter()
+            .map(
+                |(
+                    process_id,
+                    process_name,
+                    working_set_bytes,
+                    private_memory_bytes,
+                    virtual_memory_bytes,
+                    paged_memory_bytes,
+                    path,
+                )| {
+                    let path = path
+                        .map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+                        .unwrap_or_else(|| "null".to_string());
+                    format!(
+                        "{{\"process_id\":{process_id},\"process_name\":\"{}\",\"working_set_bytes\":{working_set_bytes},\"private_memory_bytes\":{private_memory_bytes},\"virtual_memory_bytes\":{virtual_memory_bytes},\"paged_memory_bytes\":{paged_memory_bytes},\"path\":{path}}}",
+                        process_name.replace('\\', "\\\\").replace('"', "\\\"")
+                    )
+                },
+            )
             .collect::<Vec<_>>();
         format!("[{}]", rows.join(","))
     }
@@ -4704,9 +5337,10 @@ mod tests {
     fn windows_amsi_health_reflects_runtime_and_script_block_state() {
         let mut platform = WindowsPlatform::new_with_runner(
             Box::new(QueuedWindowsRunner::new([
-                probe_output_with_surface(true, true, false, false, false, false),
+                probe_output_with_script_memory_surface(true, true, true, false),
                 process_output(&[("System", 4, 0, None)]),
                 audit_cursor_output(150),
+                audit_cursor_output(250),
                 network_output(&[]),
             ])),
             false,
@@ -4751,6 +5385,116 @@ mod tests {
                 .expect("etw integrity")
                 .healthy
         );
+    }
+
+    #[test]
+    fn windows_capabilities_reflect_real_script_and_memory_surfaces() {
+        let mut host = healthy_host();
+        host.has_amsi_runtime = true;
+        host.has_script_block_logging = true;
+        host.has_amsi_scan_interface = true;
+        host.has_memory_inventory = true;
+
+        let platform = WindowsPlatform::with_runner_for_test(
+            Box::new(QueuedWindowsRunner::new(Vec::<String>::new())),
+            host,
+        );
+
+        let capabilities = platform.capabilities();
+        let descriptor = platform.descriptor();
+
+        assert!(capabilities.script);
+        assert!(capabilities.memory);
+        assert!(descriptor.supports_amsi);
+    }
+
+    #[test]
+    fn windows_poll_events_emits_script_and_memory_signals() {
+        let mut host = healthy_host();
+        host.has_amsi_runtime = true;
+        host.has_script_block_logging = true;
+        host.has_amsi_scan_interface = true;
+        host.has_memory_inventory = true;
+
+        let mut platform = WindowsPlatform::with_runner_for_test(
+            Box::new(QueuedWindowsRunner::new([
+                process_output(&[(
+                    "powershell.exe",
+                    4242,
+                    640,
+                    Some("powershell.exe -NoProfile"),
+                )]),
+                audit_cursor_output(300),
+                audit_cursor_output(900),
+                memory_output(&[(
+                    4242,
+                    "powershell",
+                    12 * 1024 * 1024,
+                    8 * 1024 * 1024,
+                    64 * 1024 * 1024,
+                    4 * 1024 * 1024,
+                    Some(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+                )]),
+                network_output(&[]),
+                process_output(&[(
+                    "powershell.exe",
+                    4242,
+                    640,
+                    Some("powershell.exe -NoProfile"),
+                )]),
+                security_process_event_output(&[]),
+                script_block_events_output(&[(
+                    901,
+                    Some(4242),
+                    Some("script-block-1"),
+                    Some(1),
+                    Some(1),
+                    Some(r"C:\Temp\script.ps1"),
+                    "[Ref].Assembly.GetType('System.Management.Automation.AmsiUtils')",
+                )]),
+                amsi_scan_output(1, false, false),
+                memory_output(&[(
+                    4242,
+                    "powershell",
+                    120 * 1024 * 1024,
+                    96 * 1024 * 1024,
+                    160 * 1024 * 1024,
+                    48 * 1024 * 1024,
+                    Some(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+                )]),
+                network_output(&[]),
+            ])),
+            host,
+        );
+        platform
+            .start(&SensorConfig {
+                profile: "windows".to_string(),
+                queue_capacity: 1024,
+                require_kernel_driver: false,
+            })
+            .expect("start windows runtime");
+
+        let mut buffer = EventBuffer::default();
+        let drained = platform
+            .poll_events(&mut buffer)
+            .expect("poll windows script and memory events");
+
+        assert_eq!(drained, 2);
+        let events = buffer
+            .records
+            .iter()
+            .map(|record| String::from_utf8(record.clone()).expect("event utf8"))
+            .collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            event.contains("AmsiScript")
+                && event.contains("script-block")
+                && event.contains("AmsiUtils")
+        }));
+        assert!(events.iter().any(|event| {
+            event.contains("MemorySensor")
+                && event.contains("memory-growth")
+                && event.contains("private_delta_bytes=")
+        }));
     }
 
     #[test]

@@ -9,6 +9,7 @@ authors.workspace = true
 [dependencies]
 anyhow.workspace = true
 aegis-model = { path = "../aegis-model" }
+aegis-script = { path = "../aegis-script" }
 base64.workspace = true
 serde.workspace = true
 serde_json.workspace = true

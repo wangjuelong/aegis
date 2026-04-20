@@ -4,6 +4,7 @@ members = [
   "crates/aegis-core",
   "crates/aegis-model",
   "crates/aegis-platform",
+  "crates/aegis-script",
   "crates/aegis-updater",
   "crates/aegis-watchdog",
 ]

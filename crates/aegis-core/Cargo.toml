@@ -38,6 +38,7 @@ wasmtime.workspace = true
 zeroize.workspace = true
 aegis-model = { path = "../aegis-model" }
 aegis-platform = { path = "../aegis-platform" }
+aegis-script = { path = "../aegis-script" }
 
 [dev-dependencies]
 axum.workspace = true
