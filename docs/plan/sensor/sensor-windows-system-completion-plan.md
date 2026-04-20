@@ -15,7 +15,7 @@
 | `W09` | `done` | 已完成驱动工程、安装链、协议握手与 `driver mode` 严格失败闭环 |
 | `W10` | `done` | 已完成 Minifilter 文件事件、注册表 journal/rollback 真实链路，以及 Rust 平台层接入 |
 | `W11` | `done` | 已完成 `ObRegisterCallbacks` 进程保护、Minifilter 文件保护与真实完整性回执，真机验证通过 |
-| `W12` | `pending` | AMSI provider / memory signal 仍需继续实现 |
+| `W12` | `done` | 已完成共享脚本解码、AMSI 脚本阻断/告警链与内存信号采集，`192.168.2.218` 真机验证通过 |
 | `W13` | `pending` | 安装、自检、watchdog、自举链仍需继续实现 |
 | `W14` | `pending` | 正式签名、兼容性矩阵与发布门禁仍需继续实现 |
 
@@ -31,7 +31,6 @@
 
 ## 2. 当前缺口
 
-- 缺少脚本执行阻断进一步产品化接入与内存信号采集闭环。
 - 缺少安装、自举、自检、watchdog 与失败回滚链。
 - 缺少正式 MSI/驱动打包、驱动签名、ELAM 依赖校验、支持矩阵验收。
 - 测试机 `192.168.2.218` 可用；`192.168.1.4` 当前不可达，不能作为主验收机。
@@ -145,6 +144,12 @@
 
 ### W12: 脚本/AMSI/内存信号闭环
 
+**状态**
+
+- 已完成，真机主机：`192.168.2.218`
+- 已验证 `AmsiScanBuffer`、PowerShell 4104 脚本块采集与内存快照增量链
+- 代码提交：`b896275`
+
 **目标**
 
 - 用真实 AMSI provider 接入脚本扫描与阻断。
@@ -153,8 +158,9 @@
 
 **交付物**
 
-- AMSI provider 注册、扫描回调、阻断路径、绕过检测。
-- 脚本与内存事件桥接、健康诊断和验收脚本。
+- 共享脚本解码流水线，统一承载 Base64 / CharCode / EncodedCommand 解码逻辑。
+- AMSI 扫描/阻断脚本、PowerShell ScriptBlock 事件桥接、内存快照事件桥接。
+- 脚本与内存健康诊断、单元测试与真机验收脚本。
 
 **完成判定**
 
@@ -164,9 +170,13 @@
 
 **关键文件**
 
+- 新增：`crates/aegis-script/src/lib.rs`
+- 修改：`crates/aegis-core/src/script_decode.rs`
 - 修改：`crates/aegis-platform/src/windows.rs`
-- 新增：`windows/driver/src/memory_*`
-- 新增：`windows/amsi/`
+- 新增：`scripts/windows-scan-script-with-amsi.ps1`
+- 新增：`scripts/windows-query-script-events.ps1`
+- 新增：`scripts/windows-query-memory-snapshot.ps1`
+- 修改：`scripts/windows-runtime-verify.ps1`
 
 ### W13: 打包、看门狗、自举与发布前自检
 
