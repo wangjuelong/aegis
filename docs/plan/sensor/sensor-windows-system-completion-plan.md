@@ -17,7 +17,7 @@
 | `W11` | `done` | 已完成 `ObRegisterCallbacks` 进程保护、Minifilter 文件保护与真实完整性回执，真机验证通过 |
 | `W12` | `done` | 已完成共享脚本解码、AMSI 脚本阻断/告警链与内存信号采集，`192.168.2.218` 真机验证通过 |
 | `W13` | `done` | 已完成开发包安装/卸载、自举自检、watchdog 状态闭环与远端真机验收，`required_failures=[]` |
-| `W14` | `pending` | 正式签名、兼容性矩阵与发布门禁仍需继续实现 |
+| `W14` | `done` | 已完成 release 清单、签名/验签脚本、安装前后 release gate 与 Windows 11 真机发布验证；外部证书/审批缺失时严格失败 |
 
 ---
 
@@ -215,6 +215,14 @@
 
 ### W14: 正式签名、兼容性矩阵与发布验证
 
+**状态**
+
+- 已完成，真机主机：`192.168.2.218`
+- 已验证 `bundle_channel=release` 的签名、验签、安装前 release gate、安装后 release gate 与卸载闭环
+- 远端验证时间：`2026-04-20 21:09:35 +08:00`
+- 远端 payload：`C:\ProgramData\Aegis\validation\windows-package-verify-20260420-200129`
+- 代码提交：`08d94a3`
+
 **目标**
 
 - 建立正式代码签名、驱动签名、目录签名与验签流程。
@@ -235,14 +243,21 @@
 **关键文件**
 
 - 新增：`scripts/windows-sign-driver.ps1`
-- 新增：`scripts/windows-build-driver.ps1`
+- 新增：`packaging/windows/manifest.release.json`
+- 新增：`packaging/windows/verify-release.ps1`
+- 修改：`packaging/windows/install.ps1`
+- 修改：`packaging/windows/uninstall.ps1`
+- 修改：`packaging/windows/validate.ps1`
+- 修改：`scripts/windows-package-verify.sh`
+- 修改：`crates/aegis-core/src/upgrade.rs`
 - 修改：`docs/plan/sensor/sensor-windows-validation-matrix.md`
-- 修改：`docs/release/`
+- 修改：`docs/release/aegis-sensor-release-notes.md`
 
 ## 4. 验证矩阵
 
 - 本地 Rust 单元测试：
   - `cargo test -p aegis-platform windows --lib`
+  - `cargo test -p aegis-core windows_install_manifest_requires_relative_release_dependency_paths`
 - Windows 真机运行时验收：
   - `scripts/windows-runtime-verify.sh`
   - `scripts/windows-runtime-verify.ps1`
@@ -251,6 +266,7 @@
   - 安装/卸载
   - 签名/验签
   - 首启自检
+  - `packaging/windows/validate.ps1 -BundleChannel release`
 - 支持版本验收：
   - Windows 10 1809
   - Windows 11 21H2+
@@ -260,4 +276,4 @@
 
 - `192.168.2.218` 当前是唯一已验证可用的 Windows 主机。
 - 正式代码签名、驱动签发、ELAM 相关验证需要外部证书与 Microsoft 签发链；仓库内不能伪造这条链路。
-- 若缺少正式证书，允许完成严格失败的构建/签名流水线实现，但不得把 `W14` 标记为 `done`。
+- 当前仓库侧 `W14` 已通过“外部证书/批准文件注入 + 缺失即失败”的 release 验收；Microsoft 正式签发、多版本试点扩容仍属于仓库外流程，不在仓库内伪造。

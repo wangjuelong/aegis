@@ -108,7 +108,7 @@ Windows 平台目标覆盖：
 | W11 | 进程/文件/注册表保护与内核完整性 | done | 不允许继续把保护面仅落成工件；`check_ssdt_integrity`/`check_callback_tables`/`check_kernel_code` 不得再返回 `not implemented` | 已完成真实保护执行链和完整性检查，真机可验证阻断与检测结果 |
 | W12 | 脚本/AMSI/内存信号闭环 | done | 不允许继续把 `AmsiScript`/`MemorySensor` 固定为未实现；脚本能力不能只停留在日志健康面 | 已完成共享脚本解码、AMSI 扫描/阻断、PowerShell 4104 事件桥接、内存快照增量事件与真机验收 |
 | W13 | 打包、看门狗、自举与发布前自检 | done | 不允许继续把系统级交付等同于单个 `powershell.exe` 运行时；安装链必须显式校验驱动/服务/依赖 | 已完成开发包 manifest/install/uninstall/validate、`aegis-agentd` 首启配置与 bootstrap 检查、`aegis-watchdog --once` 状态快照，以及 `192.168.2.218` 真机安装/回滚闭环 |
-| W14 | 正式签名、兼容性矩阵与发布验证 | todo | 不允许把自签名或未验签产物标记为正式发布；无签名凭据必须严格失败 | 待实现代码签名/驱动签名/验签流水线、支持矩阵与正式发布验收记录 |
+| W14 | 正式签名、兼容性矩阵与发布验证 | done | 不允许把自签名或未验签产物标记为正式发布；无签名凭据必须严格失败 | 已完成 release manifest、签名/验签脚本、安装前后 release gate、支持矩阵文档与 `192.168.2.218` 真机发布验收 |
 
 ## 6. Windows 完成判定
 
@@ -131,8 +131,8 @@ Windows 平台目标覆盖：
 - Windows 进程/文件保护与内核完整性：`done`
 - Windows 脚本/AMSI/内存信号闭环：`done`
 - Windows 打包、看门狗、自举与发布前自检：`done`
-- Windows 真实系统级交付：`doing`
-- Windows 正式签名、发布验证：`todo`
+- Windows 真实系统级交付：`done`
+- Windows 正式签名、发布验证：`done`
 
 因此，本文件中的平台状态应保持：
 
@@ -153,7 +153,7 @@ Windows 平台目标覆盖：
 - `W11 = done`
 - `W12 = done`
 - `W13 = done`
-- `W14 = todo`
+- `W14 = done`
 
 ## 7. Windows 后续执行顺序
 
@@ -162,4 +162,4 @@ Windows 专项的最终目标不变：
 1. 先把运行时改成“真实能力、真实失败、真实工件”
 2. 再补齐真正的 Windows 驱动工程、文件/注册表/脚本/内存系统采集与保护链
 3. 再补齐真实 Windows 主机上的安装、自举、签名、兼容性与发布前验收
-4. 本轮范围内的 Windows 正式密钥保护、回滚锚点与硬件根信任已收口，但不代表系统级交付完成
+4. 当前仓库侧 Windows 系统级交付、正式签名与发布验证已收口；Microsoft 正式签发与多版本试点继续作为仓库外运维流程推进

@@ -5,9 +5,12 @@
 ## 目录内容
 
 - `manifest.json`：Windows 安装清单，描述必须交付的二进制、驱动目录与驱动安装脚本
+- `manifest.release.json`：release 安装清单，额外声明签名 receipt、CMS 签名与批准文件等强制依赖
 - `install.ps1`：开发包安装脚本，负责复制 payload、生成配置、安装驱动、执行首启自检与 watchdog 一次性验证
 - `uninstall.ps1`：回滚/卸载脚本，负责停止并删除驱动服务、移除已安装文件
-- `validate.ps1`：在 Windows 主机上完成本地构建、payload 组装、安装、自检、watchdog 验证与卸载
+- `verify-release.ps1`：对 release payload 执行 receipt/CMS/Authenticode/批准文件依赖校验
+- `validate.ps1`：在 Windows 主机上完成本地构建、payload 组装、签名、安装、自检、watchdog 验证与卸载
+- `scripts/windows-sign-driver.ps1`：对 release payload 中的 EXE/脚本/驱动/CAT 产物完成签名并生成 detached CMS receipt
 - `scripts/windows-package-verify.sh`：从 macOS/Linux 主机通过 SSH 把仓库 payload 发到 Windows 主机，并远端调用 `validate.ps1`
 
 ## Payload 约定
@@ -36,12 +39,23 @@ payload/
 
 ## 开发包与正式包
 
-当前 `manifest.json` 的 `bundle_channel=development`，因此：
+当前仓库同时维护两条严格隔离的交付路径：
+
+- `manifest.json`：`bundle_channel=development`
+- `manifest.release.json`：`bundle_channel=release`
+
+开发包路径下：
 
 - 会暴露 `trusted_bundle_signature` / `elam_approval` / `watchdog_ppl_approval` 的状态
 - 但不会把这些正式发布前置条件当成开发包安装阻断项
 
-正式签名和发布门禁在 `W14` 中补齐后，应额外产出 `bundle_channel=release` 的安装清单，并把上述依赖改为强制项。
+release 路径下：
+
+- 必须先执行 `scripts/windows-sign-driver.ps1`
+- 必须生成 `metadata/signed-release.json` 与 `metadata/signed-release.cms`
+- 必须携带 `metadata/elam-approved.txt` 与 `metadata/ppl-approved.txt`
+- 安装前后都会执行 `verify-release.ps1`
+- 缺少签名证书、时间戳地址、批准文件或任一 release 依赖时，`validate.ps1` 立即失败，不允许假通过
 
 ## 真机验证
 
@@ -65,6 +79,30 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\packaging\windows\validate
 - `install_result_path` 指向安装结果工件
 - `bootstrap_report_path` 与 `watchdog_snapshot_path` 指向首启自检和 watchdog 状态工件
 
+如需执行 release 验证，可显式指定：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\packaging\windows\validate.ps1 `
+  -RepoRoot C:\path\to\aegis `
+  -BundleChannel release `
+  -ToolchainRoot C:\ProgramData\Aegis\toolchains\1.91.0 `
+  -SigningCertificateThumbprint <thumbprint> `
+  -TimestampServer http://timestamp.digicert.com `
+  -ElamApprovalPath C:\path\to\elam-approved.txt `
+  -WatchdogPplApprovalPath C:\path\to\ppl-approved.txt
+```
+
+从 macOS/Linux 主机远端触发时，可使用：
+
+```bash
+AEGIS_WINDOWS_BUNDLE_CHANNEL=release \
+AEGIS_WINDOWS_SIGNING_CERT_THUMBPRINT=<thumbprint> \
+AEGIS_WINDOWS_TIMESTAMP_SERVER=http://timestamp.digicert.com \
+AEGIS_WINDOWS_ELAM_APPROVAL_FILE=/local/path/elam-approved.txt \
+AEGIS_WINDOWS_WATCHDOG_PPL_APPROVAL_FILE=/local/path/ppl-approved.txt \
+./scripts/windows-package-verify.sh
+```
+
 ## 已验证场景
 
 - 真机：`192.168.2.218` (`DESKTOP-TLASHJG`)
@@ -73,6 +111,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\packaging\windows\validate
 - 离线工具链：`C:\ProgramData\Aegis\toolchains\1.91.0`
 - 结果：`required_failures=[]`，安装结果、自检工件、watchdog 工件全部生成
 
+release 补充验证：
+
+- 验证时间：`2026-04-20 21:09:35 +08:00`
+- 主机：`192.168.2.218`
+- 结果：`bundle_channel=release`、`payload_release_verification.verified=true`、`installed_release_verification.verified=true`、`required_failures=[]`
+
 ## 失败语义
 
 - 缺少 payload 组件：安装立即失败
@@ -80,3 +124,4 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\packaging\windows\validate
 - 驱动安装失败：安装立即失败并回滚已复制文件
 - `aegis-agentd --bootstrap-check` 未批准：安装立即失败并回滚
 - `aegis-watchdog --once` 有告警或 bootstrap 未通过：安装立即失败并回滚
+- release 模式缺少签名证书 / 时间戳 / 批准文件 / receipt / CMS 签名：验证立即失败

@@ -15,6 +15,8 @@
 - W12 补充验证方式：远端重构建并安装 `AegisSensorKmod`，执行 AMSI 状态探测、PowerShell 4104 脚本块回执与内存快照增量链路脚本
 - W13 补充验证时间：`2026-04-20 20:22:37 +08:00`
 - W13 补充验证方式：远端执行 `packaging/windows/validate.ps1`，使用离线工具链 `C:\ProgramData\Aegis\toolchains\1.91.0` 完成本地构建、payload 组装、安装、自检、watchdog 一次性校验与回滚验证
+- W14 补充验证时间：`2026-04-20 21:09:35 +08:00`
+- W14 补充验证方式：远端执行 `packaging/windows/validate.ps1 -BundleChannel release`，注入代码签名证书、时间戳地址与 ELAM/PPL 批准文件，完成 release 签名、payload 验签、安装后复验与卸载闭环
 
 ## 2. 主机选择结果
 
@@ -65,6 +67,7 @@
 | `windows_package_validate` | pass | `packaging/windows/validate.ps1` 在 `192.168.2.218` 返回 `required_failures=[]` |
 | `windows_install_bootstrap` | pass | 安装结果记录 `copied_paths/config_result/driver_result/bootstrap_report`，`bootstrap_report.approved=true` |
 | `windows_watchdog_once` | pass | `watchdog-state.json` 中 `alerts=[]`，`bootstrap_passed=true`，`update_phase=Idle` |
+| `windows_release_validate` | pass | `bundle_channel=release`，`payload_release_verification.verified=true`，`installed_release_verification.verified=true`，`required_failures=[]` |
 
 ## 5. 关键产物
 
@@ -87,6 +90,9 @@
 - W13 watchdog 工件：`C:\ProgramData\Aegis\state\watchdog-state.json`
 - W13 离线工具链：`C:\ProgramData\Aegis\toolchains\1.91.0`
 - W13 关键结果：`{"required_failures":[],"bootstrap_approved":true,"watchdog_alerts":0,"driver_service_state":"Running"}`
+- W14 release receipt：`C:\ProgramData\Aegis\validation\windows-package-payload\metadata\signed-release.json`
+- W14 release signature：`C:\ProgramData\Aegis\validation\windows-package-payload\metadata\signed-release.cms`
+- W14 关键结果：`{"bundle_channel":"release","payload_release_verification":true,"installed_release_verification":true,"required_failures":[]}`
 
 ## 6. 结论
 
@@ -96,4 +102,5 @@
 - `W11` 已额外验证通过 `ObRegisterCallbacks` 进程保护、Minifilter 路径保护与驱动完整性查询；`WindowsPlatform` 不再把 `ObProcess`/`verify_integrity` 维持在审计占位状态。
 - `W12` 已额外验证通过共享脚本解码、AMSI 脚本阻断/告警、PowerShell 4104 脚本块回执与内存快照增量事件；`WindowsPlatform` 不再把 `AmsiScript`/`MemorySensor` 固定为未实现。
 - `W13` 已额外验证通过 Windows 开发包构建、安装、自举自检、watchdog 状态闭环与失败回滚链；当前仓库已具备发布前开发包验收入口。
+- `W14` 已额外验证通过 release 清单、代码签名/验签、安装前后 release gate 与批准文件依赖校验；当前仓库已具备严格失败的 Windows release 验收入口。
 - `security_4688` 的验收口径以“日志可读、record_id 可取”为准；`cmd.exe` 临时探针命中率被保留为观察项，不作为失败条件。

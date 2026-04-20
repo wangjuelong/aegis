@@ -1,8 +1,8 @@
 # Aegis Sensor 发布说明
 
-- 发布日期：2026-04-19
+- 发布日期：2026-04-20
 - 合入目标：`main`
-- 发布来源：`feat/agent-gap-closure`
+- 发布来源：`wangjuelong/feat/windows-system-completion`
 
 ## 1. 本次交付
 
@@ -14,6 +14,7 @@
 - 响应执行、自保护、审批链、升级门控、诊断模式、WASM 插件宿主
 - 容器宿主机模式、sidecar lite、Runtime SDK、Cloud API Connector
 - watchdog / updater 热更新链路、升级清单验签与 rollback artifact 校验
+- Windows release manifest、签名/验签脚本、安装前后 release gate、ELAM/PPL 批准依赖校验与 Windows 11 真机发布验证
 
 ## 2. 验证摘要
 
@@ -23,6 +24,7 @@
 - `cargo run -p aegis-watchdog`：通过
 - `cargo run -p aegis-updater`：通过
 - `cargo run -p aegis-core --example runtime_sdk_connector`：通过
+- `packaging/windows/validate.ps1 -BundleChannel release`：在 `192.168.2.218` 通过，`required_failures=[]`
 
 相关 QE 细节见 [`docs/qe/aegis-sensor-qe-matrix.md`](../qe/aegis-sensor-qe-matrix.md)。
 
@@ -35,9 +37,10 @@
 ## 4. 回滚说明
 
 - 所有工作包均按“代码提交 + 文档提交”形成独立提交对，可按工作包粒度回退。
-- 升级与回滚模型已在 `upgrade`、`recovery`、`wal` 模块中建立基线，并补齐清单验签与 rollback artifact 校验，可作为后续发布工程化的直接输入。
+- 升级与回滚模型已在 `upgrade`、`recovery`、`wal` 模块中建立基线，并补齐 release 清单验签、receipt/CMS 校验与 rollback artifact 校验，可作为后续正式发布工程化的直接输入。
 
 ## 5. 已知边界
 
 - 本轮发布说明基于本地工作区回归和 mock/platform contract 验证。
-- Windows/Linux 远端宿主机未纳入自动化安装验收；如需现场联调，直接使用 [`docs/env/开发环境.md`](../env/开发环境.md) 中环境。
+- Windows 远端已在 `192.168.2.218` 完成 release 安装验收；Windows 10 / Windows Server 扩展兼容性仍依赖额外主机池。
+- Microsoft 正式代码签名、驱动签发与 ELAM/PPL 外部审批链不在仓库内伪造；当前仓库只保证“缺外部凭据即失败、有凭据即可完成 release gate”。
