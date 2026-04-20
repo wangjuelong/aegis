@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="12.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{6C1C7D3F-6D54-4E1A-9361-A16E6E5D7D11}</ProjectGuid>
+    <Keyword>KernelModeDriver10.0</Keyword>
+    <RootNamespace>AegisFileMonitor</RootNamespace>
+    <MinimumVisualStudioVersion>14.0</MinimumVisualStudioVersion>
+    <DriverTargetPlatform>Desktop</DriverTargetPlatform>
+    <TargetVersion>Windows10</TargetVersion>
+    <TargetPlatformVersion>10.0.26100.0</TargetPlatformVersion>
+    <WindowsSDKInstalled>true</WindowsSDKInstalled>
+    <WindowsSDK_Desktop_Support>true</WindowsSDK_Desktop_Support>
+    <WindowsSDK_UAP_Support>true</WindowsSDK_UAP_Support>
+    <MatchingSdkPresent>true</MatchingSdkPresent>
+    <MatchingWdkPresent>true</MatchingWdkPresent>
+    <WDKContentRoot Condition="'$(WDKContentRoot)' == ''">$(Registry:HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows Kits\Installed Roots@KitsRoot10)</WDKContentRoot>
+    <WDKBuildFolder Condition="'$(WDKBuildFolder)' == ''">10.0.26100.0</WDKBuildFolder>
+    <WindowsTargetPlatformVersion Condition="'$(WindowsTargetPlatformVersion)' == ''">10.0.26100.0</WindowsTargetPlatformVersion>
+    <VisualStudioVersion Condition="'$(VisualStudioVersion)' == ''">17.0</VisualStudioVersion>
+  </PropertyGroup>
+
+  <UsingTask TaskName="SetEnv" AssemblyFile="$(VCTargetsPath)Microsoft.Build.CPPTasks.Common.dll" />
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Driver</ConfigurationType>
+    <PlatformToolset>v142</PlatformToolset>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <CharacterSet>Unicode</CharacterSet>
+    <IsKernelModeToolset>true</IsKernelModeToolset>
+    <DriverType>FileSystemDriver</DriverType>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Driver</ConfigurationType>
+    <PlatformToolset>v142</PlatformToolset>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <CharacterSet>Unicode</CharacterSet>
+    <IsKernelModeToolset>true</IsKernelModeToolset>
+    <DriverType>FileSystemDriver</DriverType>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <Import Project="$(WDKContentRoot)build\$(WDKBuildFolder)\WindowsDriver.Default.props" Condition="Exists('$(WDKContentRoot)build\$(WDKBuildFolder)\WindowsDriver.Default.props')" />
+  <Import Project="$(WDKContentRoot)build\$(WDKBuildFolder)\$(Platform)\WindowsKernelModeDriver\WDK.$(Platform).WindowsKernelModeDriver.props" Condition="Exists('$(WDKContentRoot)build\$(WDKBuildFolder)\$(Platform)\WindowsKernelModeDriver\WDK.$(Platform).WindowsKernelModeDriver.props')" />
+  <Import Project="$(WDKContentRoot)build\$(WDKBuildFolder)\x64\ImportAfter\WDK.x64.WindowsKernelModeDriver.Platform.props" Condition="'$(Platform)'=='x64' and Exists('$(WDKContentRoot)build\$(WDKBuildFolder)\x64\ImportAfter\WDK.x64.WindowsKernelModeDriver.Platform.props')" />
+
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <TargetName>AegisFileMonitor</TargetName>
+    <OutDir>$(ProjectDir)build\$(Configuration)\$(Platform)\</OutDir>
+    <IntDir>$(ProjectDir)build\obj\$(Configuration)\$(Platform)\</IntDir>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <TargetName>AegisFileMonitor</TargetName>
+    <OutDir>$(ProjectDir)build\$(Configuration)\$(Platform)\</OutDir>
+    <IntDir>$(ProjectDir)build\obj\$(Configuration)\$(Platform)\</IntDir>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(WDKContentRoot)Include\$(WDKBuildFolder)\km;$(WDKContentRoot)Include\$(WDKBuildFolder)\km\crt;$(WDKContentRoot)Include\$(WDKBuildFolder)\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <AdditionalLibraryDirectories>$(WDKContentRoot)Lib\$(WDKBuildFolder)\km\$(Platform);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>fltMgr.lib;ntoskrnl.lib;BufferOverflowFastFailK.lib;ntstrsafe.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <EntryPointSymbol>DriverEntry</EntryPointSymbol>
+    </Link>
+    <DriverSign>
+      <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
+    </DriverSign>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(WDKContentRoot)Include\$(WDKBuildFolder)\km;$(WDKContentRoot)Include\$(WDKBuildFolder)\km\crt;$(WDKContentRoot)Include\$(WDKBuildFolder)\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <AdditionalLibraryDirectories>$(WDKContentRoot)Lib\$(WDKBuildFolder)\km\$(Platform);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>fltMgr.lib;ntoskrnl.lib;BufferOverflowFastFailK.lib;ntstrsafe.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <EntryPointSymbol>DriverEntry</EntryPointSymbol>
+    </Link>
+    <DriverSign>
+      <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
+    </DriverSign>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClCompile Include="src\aegis_file_minifilter.c" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="include\aegis_file_minifilter_protocol.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <Inf Include="AegisFileMonitor.inf">
+      <DateStamp>04/20/2026</DateStamp>
+    </Inf>
+  </ItemGroup>
+
+  <Import Project="$(WDKContentRoot)build\$(WDKBuildFolder)\WindowsDriver.Common.targets" Condition="Exists('$(WDKContentRoot)build\$(WDKBuildFolder)\WindowsDriver.Common.targets')" />
+  <Import Project="$(WDKContentRoot)build\$(WDKBuildFolder)\$(Platform)\ImportAfter\WDK.$(Platform).WindowsDriverCommonToolset.Platform.Targets" Condition="Exists('$(WDKContentRoot)build\$(WDKBuildFolder)\$(Platform)\ImportAfter\WDK.$(Platform).WindowsDriverCommonToolset.Platform.Targets')" />
+  <Target Name="CopyDriverBinaryToPackage" BeforeTargets="Inf2Cat">
+    <MakeDir Directories="$(OutDir)$(ProjectName)" Condition="!Exists('$(OutDir)$(ProjectName)')" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(OutDir)$(ProjectName)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(ProjectDir)" SkipUnchangedFiles="true" />
+  </Target>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="SetBuildDefaultEnvironmentVariables" />
+  <Target Name="SetCABuildNativeEnvironmentVariables" />
+  <Target Name="SetTelemetryEnvironmentVariables" />
+  <ImportGroup Label="ExtensionTargets" />
+</Project>

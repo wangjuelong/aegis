@@ -27,6 +27,42 @@ function Resolve-ExistingPath {
     $resolved.Path
 }
 
+function Resolve-DriverProjectPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DriverRoot
+    )
+
+    $defaultProject = Join-Path $DriverRoot "AegisSensorKmod.vcxproj"
+    if (Test-Path -LiteralPath $defaultProject) {
+        return (Resolve-ExistingPath -Path $defaultProject -Description "driver project")
+    }
+
+    $projects = @(Get-ChildItem -LiteralPath $DriverRoot -Filter "*.vcxproj" -File -ErrorAction Stop)
+    if ($projects.Count -ne 1) {
+        throw "unable to resolve unique driver project under $DriverRoot"
+    }
+    return $projects[0].FullName
+}
+
+function Resolve-DriverInfPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DriverRoot
+    )
+
+    $defaultInf = Join-Path $DriverRoot "AegisSensorKmod.inf"
+    if (Test-Path -LiteralPath $defaultInf) {
+        return (Resolve-ExistingPath -Path $defaultInf -Description "driver INF")
+    }
+
+    $infFiles = @(Get-ChildItem -LiteralPath $DriverRoot -Filter "*.inf" -File -ErrorAction Stop)
+    if ($infFiles.Count -ne 1) {
+        throw "unable to resolve unique driver INF under $DriverRoot"
+    }
+    return $infFiles[0].FullName
+}
+
 function Get-LatestWindowsSdkVersion {
     param(
         [Parameter(Mandatory = $true)]
@@ -170,8 +206,9 @@ function Get-MsvcToolBinPath {
 }
 
 $driverRoot = Resolve-ExistingPath -Path $DriverRoot -Description "driver root"
-$projectPath = Resolve-ExistingPath -Path (Join-Path $driverRoot "AegisSensorKmod.vcxproj") -Description "driver project"
-$infPath = Resolve-ExistingPath -Path (Join-Path $driverRoot "AegisSensorKmod.inf") -Description "driver INF"
+$projectPath = Resolve-DriverProjectPath -DriverRoot $driverRoot
+$infPath = Resolve-DriverInfPath -DriverRoot $driverRoot
+$projectName = [System.IO.Path]::GetFileNameWithoutExtension($projectPath)
 
 $sdkVersion = Get-LatestWindowsSdkVersion -Platform $Platform
 $wdkVersion = Get-LatestWdkVersion -Platform $Platform
@@ -212,14 +249,19 @@ if ($LASTEXITCODE -ne 0) {
     throw "MSBuild failed with exit code $LASTEXITCODE"
 }
 
-$sysPath = Join-Path $driverRoot "build\$Configuration\$Platform\AegisSensorKmod.sys"
+$buildOutputRoot = Join-Path $driverRoot "build\$Configuration\$Platform"
+$sysPath = Join-Path $buildOutputRoot "$projectName.sys"
 $sysPath = Resolve-ExistingPath -Path $sysPath -Description "built driver binary"
+$packageDir = Resolve-ExistingPath -Path (Join-Path $buildOutputRoot $projectName) -Description "driver package directory"
+$packageInfPath = Resolve-ExistingPath -Path (Join-Path $packageDir "$projectName.inf") -Description "packaged driver INF"
 
 $output = [ordered]@{
     driver_root = $driverRoot
     project_path = $projectPath
     configuration = $Configuration
     platform = $Platform
+    build_output_root = $buildOutputRoot
+    package_dir = $packageDir
     sdk_version = $sdkVersion
     wdk_version = $wdkVersion
     wdk_tasks_visual_studio_version = $wdkTasksVisualStudioVersion
@@ -234,15 +276,12 @@ $output = [ordered]@{
     inf2cat_path = $inf2CatTool
     drvcat_path = $drvCatTool
     inf_path = $infPath
+    package_inf_path = $packageInfPath
     sys_path = $sysPath
 }
 
 if ($GenerateCatalog) {
-    & $inf2CatTool /driver:$driverRoot /os:10_X64
-    if ($LASTEXITCODE -ne 0) {
-        throw "Inf2Cat failed with exit code $LASTEXITCODE"
-    }
-    $catPath = Resolve-ExistingPath -Path (Join-Path $driverRoot "AegisSensorKmod.cat") -Description "generated CAT file"
+    $catPath = Resolve-ExistingPath -Path (Join-Path $packageDir "$projectName.cat") -Description "generated CAT file"
     $output["cat_path"] = $catPath
 }
 

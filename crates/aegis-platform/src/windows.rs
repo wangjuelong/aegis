@@ -24,6 +24,13 @@ const AEGIS_WINDOWS_DRIVER_SERVICE_NAME: &str = "AegisSensorKmod";
 const AEGIS_WINDOWS_DRIVER_DEVICE_PATH: &str = r"\\.\AegisSensor";
 const AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION: u32 = 0x0001_0000;
 const AEGIS_WINDOWS_DRIVER_IOCTL_QUERY_VERSION: u32 = 0x0022_2000;
+const AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME: &str = r"\AegisFileMonitorPort";
+const WINDOWS_QUERY_FILE_EVENTS_SCRIPT: &str =
+    include_str!("../../../scripts/windows-query-file-events.ps1");
+const WINDOWS_QUERY_REGISTRY_EVENTS_SCRIPT: &str =
+    include_str!("../../../scripts/windows-query-registry-events.ps1");
+const WINDOWS_ROLLBACK_REGISTRY_SCRIPT: &str =
+    include_str!("../../../scripts/windows-rollback-registry.ps1");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowsProviderKind {
@@ -193,6 +200,15 @@ struct WindowsHostCapabilities {
     driver_protocol_version: Option<u32>,
     driver_version: Option<String>,
     driver_status_detail: Option<String>,
+    has_file_monitor_port: bool,
+    file_monitor_protocol_version: Option<u32>,
+    file_monitor_queue_capacity: Option<u32>,
+    file_monitor_current_sequence: Option<u32>,
+    file_monitor_status_detail: Option<String>,
+    registry_callback_registered: bool,
+    registry_journal_capacity: Option<u32>,
+    registry_current_sequence: Option<u32>,
+    registry_status_detail: Option<String>,
     last_error: Option<String>,
 }
 
@@ -237,6 +253,16 @@ impl WindowsHostCapabilities {
         )
     }
 
+    fn file_monitor_ready(&self) -> bool {
+        self.driver_transport_ready()
+            && self.has_file_monitor_port
+            && self.file_monitor_protocol_version == Some(AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION)
+    }
+
+    fn registry_provider_ready(&self) -> bool {
+        self.driver_transport_ready() && self.registry_callback_registered
+    }
+
     fn provider_health(&self, provider: WindowsProviderKind, running: bool) -> bool {
         if !running || !self.reachable || !self.running_on_windows {
             return false;
@@ -248,9 +274,9 @@ impl WindowsHostCapabilities {
             }
             WindowsProviderKind::PsProcess => self.has_process_inventory,
             WindowsProviderKind::ObProcess => false,
-            WindowsProviderKind::MinifilterFile => false,
+            WindowsProviderKind::MinifilterFile => self.file_monitor_ready(),
             WindowsProviderKind::WfpNetwork => self.has_net_connection,
-            WindowsProviderKind::RegistryCallback => false,
+            WindowsProviderKind::RegistryCallback => self.registry_provider_ready(),
             WindowsProviderKind::AmsiScript => {
                 self.has_amsi_runtime && self.has_script_block_logging
             }
@@ -290,6 +316,29 @@ impl WindowsHostCapabilities {
             self.has_script_block_logging
         ));
         facts.push(self.driver_transport_summary());
+        facts.push(format!(
+            "file_monitor={};file_protocol={};file_queue={};file_detail={}",
+            self.file_monitor_ready(),
+            self.file_monitor_protocol_version
+                .map(|value| format!("0x{value:08x}"))
+                .unwrap_or_else(|| "none".to_string()),
+            self.file_monitor_queue_capacity
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            self.file_monitor_status_detail
+                .clone()
+                .unwrap_or_else(|| "-".to_string())
+        ));
+        facts.push(format!(
+            "registry_provider={};registry_journal_capacity={};registry_detail={}",
+            self.registry_provider_ready(),
+            self.registry_journal_capacity
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            self.registry_status_detail
+                .clone()
+                .unwrap_or_else(|| "-".to_string())
+        ));
         facts.join(", ")
     }
 }
@@ -329,6 +378,24 @@ struct WindowsCapabilityProbe {
     driver_version: Option<String>,
     #[serde(default)]
     driver_status_detail: Option<String>,
+    #[serde(default)]
+    has_file_monitor_port: bool,
+    #[serde(default)]
+    file_monitor_protocol_version: Option<u32>,
+    #[serde(default)]
+    file_monitor_queue_capacity: Option<u32>,
+    #[serde(default)]
+    file_monitor_current_sequence: Option<u32>,
+    #[serde(default)]
+    file_monitor_status_detail: Option<String>,
+    #[serde(default)]
+    registry_callback_registered: bool,
+    #[serde(default)]
+    registry_journal_capacity: Option<u32>,
+    #[serde(default)]
+    registry_current_sequence: Option<u32>,
+    #[serde(default)]
+    registry_status_detail: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -385,6 +452,71 @@ impl WindowsSecurityProcessEvent {
             self.command_line.as_deref().unwrap_or("-")
         ))
     }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsFileMonitorStatus {
+    protocol_version: u32,
+    queue_capacity: u32,
+    current_sequence: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsFileMonitorEvent {
+    sequence: u32,
+    timestamp: i64,
+    process_id: u32,
+    operation: String,
+    path: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsFileMonitorQuery {
+    protocol_version: u32,
+    queue_capacity: u32,
+    oldest_sequence: u32,
+    current_sequence: u32,
+    returned_count: u32,
+    overflowed: bool,
+    events: Vec<WindowsFileMonitorEvent>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsRegistryMonitorStatus {
+    protocol_version: u32,
+    registry_callback_registered: bool,
+    journal_capacity: u32,
+    current_sequence: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsRegistryMonitorEvent {
+    sequence: u32,
+    timestamp: i64,
+    operation: String,
+    key_path: String,
+    value_name: String,
+    old_value_present: bool,
+    new_value_present: bool,
+    old_value: Option<String>,
+    new_value: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsRegistryMonitorQuery {
+    protocol_version: u32,
+    oldest_sequence: u32,
+    current_sequence: u32,
+    returned_count: u32,
+    overflowed: bool,
+    events: Vec<WindowsRegistryMonitorEvent>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsRegistryRollbackResponse {
+    protocol_version: u32,
+    applied_count: u32,
+    current_sequence: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -528,6 +660,9 @@ struct WindowsProtectionSurfaceArtifact {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 struct WindowsRegistryRollbackArtifact {
     selector: String,
+    resolved_key_path: String,
+    applied_count: u32,
+    current_sequence: u32,
     protected_paths: Vec<String>,
     registry_protection_surface: Vec<String>,
 }
@@ -576,6 +711,8 @@ struct WindowsState {
     known_modules: BTreeMap<String, WindowsModuleSnapshot>,
     known_vss_snapshots: BTreeMap<String, WindowsVssSnapshot>,
     known_devices: BTreeMap<String, WindowsDeviceSnapshot>,
+    file_monitor_cursor: Option<u32>,
+    registry_monitor_cursor: Option<u32>,
     firewall_backup_path: Option<String>,
     firewall_rule_group: Option<String>,
     block_rule_groups: Vec<String>,
@@ -631,6 +768,8 @@ impl WindowsPlatform {
                 known_modules: BTreeMap::new(),
                 known_vss_snapshots: BTreeMap::new(),
                 known_devices: BTreeMap::new(),
+                file_monitor_cursor: None,
+                registry_monitor_cursor: None,
                 firewall_backup_path: None,
                 firewall_rule_group: None,
                 block_rule_groups: Vec::new(),
@@ -784,6 +923,8 @@ impl PlatformSensor for WindowsPlatform {
         } else {
             state.known_devices.clear();
         }
+        state.file_monitor_cursor = state.host.file_monitor_current_sequence;
+        state.registry_monitor_cursor = state.host.registry_current_sequence;
         state.execution.running = true;
         Ok(())
     }
@@ -822,9 +963,9 @@ impl PlatformSensor for WindowsPlatform {
             .clone();
         SensorCapabilities {
             process: host.has_process_inventory,
-            file: false,
+            file: host.file_monitor_ready(),
             network: host.has_net_connection,
-            registry: false,
+            registry: host.registry_provider_ready(),
             auth: host.any_event_log(),
             script: false,
             memory: false,
@@ -914,9 +1055,28 @@ impl PlatformResponse for WindowsPlatform {
 
     fn registry_rollback(&self, target: &RollbackTarget) -> Result<()> {
         let mut state = self.state.lock().expect("windows state poisoned");
+        ensure_windows_driver_transport(&state.host, "execute windows registry rollback")?;
+        if !state.host.registry_provider_ready() {
+            bail!(
+                "execute windows registry rollback requires registry callback journal: {}",
+                state.host.summary()
+            );
+        }
+        let resolved_key_path =
+            resolve_windows_registry_key_path(self.runner.as_ref(), &target.selector)
+                .with_context(|| format!("resolve windows registry selector {}", target.selector))?;
+        let rollback = rollback_windows_registry_key(
+            self.runner.as_ref(),
+            &resolved_key_path,
+            AEGIS_WINDOWS_DRIVER_SERVICE_NAME,
+        )
+        .with_context(|| format!("rollback windows registry key {}", resolved_key_path))?;
         state.execution.rollback_targets.push(target.clone());
-        let artifact_path = write_windows_registry_rollback_artifact(&mut state, target)
-            .with_context(|| "write windows registry rollback artifact")?;
+        state.host.registry_current_sequence = Some(rollback.current_sequence);
+        state.registry_monitor_cursor = Some(rollback.current_sequence);
+        let artifact_path =
+            write_windows_registry_rollback_artifact(&mut state, target, &resolved_key_path, &rollback)
+                .with_context(|| "write windows registry rollback artifact")?;
         state.execution.audit_artifacts.push(artifact_path);
         Ok(())
     }
@@ -1177,7 +1337,7 @@ impl PlatformRuntime for WindowsPlatform {
                 KernelTransport::CommandProbe
             },
             degrade_levels: 3,
-            supports_registry: false,
+            supports_registry: host.registry_provider_ready(),
             supports_amsi: false,
             supports_etw_integrity: false,
             supports_bpf_integrity: false,
@@ -1418,7 +1578,7 @@ $data | ConvertTo-Json -Compress
 "#;
 
     let probe: WindowsCapabilityProbe = run_powershell_json(runner, script)?;
-    Ok(WindowsHostCapabilities {
+    let mut host = WindowsHostCapabilities {
         reachable: true,
         running_on_windows: true,
         execution_mode: runner.mode_name().to_string(),
@@ -1447,8 +1607,67 @@ $data | ConvertTo-Json -Compress
         driver_protocol_version: probe.driver_protocol_version,
         driver_version: probe.driver_version,
         driver_status_detail: probe.driver_status_detail,
+        has_file_monitor_port: probe.has_file_monitor_port,
+        file_monitor_protocol_version: probe.file_monitor_protocol_version,
+        file_monitor_queue_capacity: probe.file_monitor_queue_capacity,
+        file_monitor_current_sequence: probe.file_monitor_current_sequence,
+        file_monitor_status_detail: probe.file_monitor_status_detail,
+        registry_callback_registered: probe.registry_callback_registered,
+        registry_journal_capacity: probe.registry_journal_capacity,
+        registry_current_sequence: probe.registry_current_sequence,
+        registry_status_detail: probe.registry_status_detail,
         last_error: None,
-    })
+    };
+
+    if host.driver_transport_ready() {
+        match query_windows_file_monitor_status(runner, AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME) {
+            Ok(status) => {
+                host.has_file_monitor_port = true;
+                host.file_monitor_protocol_version = Some(status.protocol_version);
+                host.file_monitor_queue_capacity = Some(status.queue_capacity);
+                host.file_monitor_current_sequence = Some(status.current_sequence);
+                host.file_monitor_status_detail = Some(format!(
+                    "port={};protocol=0x{:08x};queue_capacity={};current_sequence={}",
+                    AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
+                    status.protocol_version,
+                    status.queue_capacity,
+                    status.current_sequence
+                ));
+            }
+            Err(error) => {
+                host.has_file_monitor_port = false;
+                host.file_monitor_protocol_version = None;
+                host.file_monitor_queue_capacity = None;
+                host.file_monitor_current_sequence = None;
+                host.file_monitor_status_detail = Some(error.to_string());
+            }
+        }
+
+        match query_windows_registry_monitor_status(runner, AEGIS_WINDOWS_DRIVER_SERVICE_NAME) {
+            Ok(status) => {
+                host.registry_callback_registered = status.registry_callback_registered
+                    && status.protocol_version == AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION;
+                host.registry_journal_capacity = Some(status.journal_capacity);
+                host.registry_current_sequence = Some(status.current_sequence);
+                host.registry_status_detail = Some(format!(
+                    "service={};protocol=0x{:08x};journal_capacity={};current_sequence={};registered={}",
+                    AEGIS_WINDOWS_DRIVER_SERVICE_NAME,
+                    status.protocol_version,
+                    status.journal_capacity,
+                    status.current_sequence,
+                    status.registry_callback_registered
+                ));
+            }
+            Err(error) => {
+                host.registry_callback_registered = false;
+                host.registry_journal_capacity = None;
+                host.registry_current_sequence = None;
+                host.registry_status_detail = Some(error.to_string());
+            }
+        }
+    }
+
+    Ok(host)
 }
 
 fn ensure_windows_driver_transport(host: &WindowsHostCapabilities, action: &str) -> Result<()> {
@@ -1474,10 +1693,278 @@ fn run_powershell_json<T: DeserializeOwned>(
         .with_context(|| format!("parse powershell json output: {}", raw.trim()))
 }
 
+fn build_embedded_windows_script_invocation(
+    script_body: &str,
+    args: &[(&str, String)],
+) -> String {
+    let mut script = format!(
+        "$embedded = [scriptblock]::Create(@'\n{}\n'@)\n& $embedded",
+        script_body.trim()
+    );
+    for (name, value) in args {
+        script.push_str(&format!(" -{} '{}'", name, escape_windows_ps_string(value)));
+    }
+    script
+}
+
+fn run_embedded_powershell_json<T: DeserializeOwned>(
+    runner: &dyn WindowsCommandRunner,
+    script_body: &str,
+    args: &[(&str, String)],
+) -> Result<T> {
+    let script = build_embedded_windows_script_invocation(script_body, args);
+    run_powershell_json(runner, &script)
+}
+
+fn query_windows_file_monitor_status(
+    runner: &dyn WindowsCommandRunner,
+    port_name: &str,
+) -> Result<WindowsFileMonitorStatus> {
+    run_embedded_powershell_json(
+        runner,
+        WINDOWS_QUERY_FILE_EVENTS_SCRIPT,
+        &[
+            ("Mode", "status".to_string()),
+            ("PortName", port_name.to_string()),
+        ],
+    )
+}
+
+fn query_windows_file_monitor_events(
+    runner: &dyn WindowsCommandRunner,
+    port_name: &str,
+    last_sequence: u32,
+    max_entries: u32,
+) -> Result<WindowsFileMonitorQuery> {
+    run_embedded_powershell_json(
+        runner,
+        WINDOWS_QUERY_FILE_EVENTS_SCRIPT,
+        &[
+            ("Mode", "events".to_string()),
+            ("PortName", port_name.to_string()),
+            ("LastSequence", last_sequence.to_string()),
+            ("MaxEntries", max_entries.to_string()),
+        ],
+    )
+}
+
+fn query_windows_registry_monitor_status(
+    runner: &dyn WindowsCommandRunner,
+    service_name: &str,
+) -> Result<WindowsRegistryMonitorStatus> {
+    run_embedded_powershell_json(
+        runner,
+        WINDOWS_QUERY_REGISTRY_EVENTS_SCRIPT,
+        &[
+            ("Mode", "status".to_string()),
+            ("ServiceName", service_name.to_string()),
+        ],
+    )
+}
+
+fn query_windows_registry_monitor_events(
+    runner: &dyn WindowsCommandRunner,
+    service_name: &str,
+    last_sequence: u32,
+    max_entries: u32,
+) -> Result<WindowsRegistryMonitorQuery> {
+    run_embedded_powershell_json(
+        runner,
+        WINDOWS_QUERY_REGISTRY_EVENTS_SCRIPT,
+        &[
+            ("Mode", "events".to_string()),
+            ("ServiceName", service_name.to_string()),
+            ("LastSequence", last_sequence.to_string()),
+            ("MaxEntries", max_entries.to_string()),
+        ],
+    )
+}
+
+fn rollback_windows_registry_key(
+    runner: &dyn WindowsCommandRunner,
+    key_path: &str,
+    service_name: &str,
+) -> Result<WindowsRegistryRollbackResponse> {
+    run_embedded_powershell_json(
+        runner,
+        WINDOWS_ROLLBACK_REGISTRY_SCRIPT,
+        &[
+            ("KeyPath", key_path.to_string()),
+            ("ServiceName", service_name.to_string()),
+        ],
+    )
+}
+
+fn resolve_windows_registry_key_path(
+    runner: &dyn WindowsCommandRunner,
+    selector: &str,
+) -> Result<String> {
+    #[derive(Deserialize)]
+    struct ResolvedKeyPath {
+        key_path: String,
+    }
+
+    let script = format!(
+        r#"
+function Resolve-AegisRegistryKeyPath {{
+    param([Parameter(Mandatory = $true)][string]$Selector)
+
+    $normalized = ($Selector -replace '/', '\').Trim()
+    if ([string]::IsNullOrWhiteSpace($normalized)) {{
+        throw "registry selector is empty"
+    }}
+    if ($normalized.ToUpperInvariant().StartsWith('\REGISTRY\')) {{
+        return $normalized
+    }}
+
+    $patterns = @(
+        [ordered]@{{ Prefix = 'HKLM:\'; KernelRoot = '\REGISTRY\MACHINE' }},
+        [ordered]@{{ Prefix = 'HKLM\'; KernelRoot = '\REGISTRY\MACHINE' }},
+        [ordered]@{{ Prefix = 'HKEY_LOCAL_MACHINE:\'; KernelRoot = '\REGISTRY\MACHINE' }},
+        [ordered]@{{ Prefix = 'HKEY_LOCAL_MACHINE\'; KernelRoot = '\REGISTRY\MACHINE' }},
+        [ordered]@{{ Prefix = 'HKCU:\'; KernelRoot = '\REGISTRY\USER\' + [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value }},
+        [ordered]@{{ Prefix = 'HKCU\'; KernelRoot = '\REGISTRY\USER\' + [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value }},
+        [ordered]@{{ Prefix = 'HKEY_CURRENT_USER:\'; KernelRoot = '\REGISTRY\USER\' + [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value }},
+        [ordered]@{{ Prefix = 'HKEY_CURRENT_USER\'; KernelRoot = '\REGISTRY\USER\' + [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value }}
+    )
+
+    foreach ($pattern in $patterns) {{
+        if ($normalized.StartsWith($pattern.Prefix, [System.StringComparison]::OrdinalIgnoreCase)) {{
+            $suffix = $normalized.Substring($pattern.Prefix.Length).TrimStart('\')
+            if ([string]::IsNullOrWhiteSpace($suffix)) {{
+                return $pattern.KernelRoot
+            }}
+            return $pattern.KernelRoot + '\' + $suffix
+        }}
+    }}
+
+    throw "unsupported windows registry selector: $Selector"
+}}
+
+[ordered]@{{
+    key_path = Resolve-AegisRegistryKeyPath -Selector '{}'
+}} | ConvertTo-Json -Compress
+"#,
+        escape_windows_ps_string(selector)
+    );
+
+    let resolved: ResolvedKeyPath = run_powershell_json(runner, &script)?;
+    Ok(resolved.key_path)
+}
+
+fn file_monitor_event_subject(event: &WindowsFileMonitorEvent) -> String {
+    truncate_subject(&format!(
+        "sequence={};pid={};operation={};path={}",
+        event.sequence, event.process_id, event.operation, event.path
+    ))
+}
+
+fn registry_monitor_event_subject(event: &WindowsRegistryMonitorEvent) -> String {
+    truncate_subject(&format!(
+        "sequence={};operation={};key={};value={};old={};new={}",
+        event.sequence,
+        event.operation,
+        event.key_path,
+        if event.value_name.is_empty() {
+            "-"
+        } else {
+            &event.value_name
+        },
+        event.old_value.as_deref().unwrap_or("-"),
+        event.new_value.as_deref().unwrap_or("-")
+    ))
+}
+
+fn collect_file_monitor_events(
+    state: &mut WindowsState,
+    runner: &dyn WindowsCommandRunner,
+) -> Result<()> {
+    let last_sequence = state.file_monitor_cursor.unwrap_or(0);
+    let response =
+        query_windows_file_monitor_events(runner, AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME, last_sequence, 256)?;
+    if response.protocol_version != AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION {
+        bail!(
+            "file monitor protocol mismatch: expected 0x{expected:08x}, got 0x{actual:08x}",
+            expected = AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION,
+            actual = response.protocol_version
+        );
+    }
+
+    state.host.has_file_monitor_port = true;
+    state.host.file_monitor_protocol_version = Some(response.protocol_version);
+    state.host.file_monitor_queue_capacity = Some(response.queue_capacity);
+    state.host.file_monitor_current_sequence = Some(response.current_sequence);
+    state.host.file_monitor_status_detail = Some(format!(
+        "port={};current_sequence={};returned_count={};overflowed={}",
+        AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
+        response.current_sequence,
+        response.returned_count,
+        response.overflowed
+    ));
+    state.file_monitor_cursor = Some(response.current_sequence);
+
+    for event in response.events {
+        state.pending_events.push_back(
+            WindowsEventStub {
+                provider: WindowsProviderKind::MinifilterFile,
+                operation: format!("file-{}", event.operation),
+                subject: file_monitor_event_subject(&event),
+            }
+            .encode(),
+        );
+    }
+    Ok(())
+}
+
+fn collect_registry_monitor_events(
+    state: &mut WindowsState,
+    runner: &dyn WindowsCommandRunner,
+) -> Result<()> {
+    let last_sequence = state.registry_monitor_cursor.unwrap_or(0);
+    let response =
+        query_windows_registry_monitor_events(runner, AEGIS_WINDOWS_DRIVER_SERVICE_NAME, last_sequence, 256)?;
+    if response.protocol_version != AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION {
+        bail!(
+            "registry callback protocol mismatch: expected 0x{expected:08x}, got 0x{actual:08x}",
+            expected = AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION,
+            actual = response.protocol_version
+        );
+    }
+
+    state.host.registry_callback_registered = true;
+    state.host.registry_current_sequence = Some(response.current_sequence);
+    state.host.registry_status_detail = Some(format!(
+        "service={};current_sequence={};returned_count={};overflowed={}",
+        AEGIS_WINDOWS_DRIVER_SERVICE_NAME,
+        response.current_sequence,
+        response.returned_count,
+        response.overflowed
+    ));
+    state.registry_monitor_cursor = Some(response.current_sequence);
+
+    for event in response.events {
+        state.pending_events.push_back(
+            WindowsEventStub {
+                provider: WindowsProviderKind::RegistryCallback,
+                operation: format!("registry-{}", event.operation),
+                subject: registry_monitor_event_subject(&event),
+            }
+            .encode(),
+        );
+    }
+    Ok(())
+}
+
 fn collect_live_windows_events(
     state: &mut WindowsState,
     runner: &dyn WindowsCommandRunner,
 ) -> Result<()> {
+    if state.host.file_monitor_ready() {
+        collect_file_monitor_events(state, runner)?;
+    }
+    if state.host.registry_provider_ready() {
+        collect_registry_monitor_events(state, runner)?;
+    }
     if state.host.has_process_inventory {
         collect_process_delta_events(state, runner)?;
     }
@@ -2100,9 +2587,14 @@ fn record_windows_protection_surface_artifact(state: &mut WindowsState) -> Resul
 fn write_windows_registry_rollback_artifact(
     state: &mut WindowsState,
     target: &RollbackTarget,
+    resolved_key_path: &str,
+    rollback: &WindowsRegistryRollbackResponse,
 ) -> Result<PathBuf> {
     let artifact = WindowsRegistryRollbackArtifact {
         selector: target.selector.clone(),
+        resolved_key_path: resolved_key_path.to_string(),
+        applied_count: rollback.applied_count,
+        current_sequence: rollback.current_sequence,
         protected_paths: state
             .execution
             .protected_paths
@@ -2882,6 +3374,15 @@ mod tests {
             driver_protocol_version: None,
             driver_version: None,
             driver_status_detail: None,
+            has_file_monitor_port: false,
+            file_monitor_protocol_version: None,
+            file_monitor_queue_capacity: None,
+            file_monitor_current_sequence: None,
+            file_monitor_status_detail: None,
+            registry_callback_registered: false,
+            registry_journal_capacity: None,
+            registry_current_sequence: None,
+            registry_status_detail: None,
             last_error: None,
         }
     }
@@ -2895,6 +3396,26 @@ mod tests {
         host.driver_version = Some("1.0.0-test".to_string());
         host.driver_status_detail = Some(
             r#"{"protocol_version":65536,"driver_version":"1.0.0-test"}"#.to_string(),
+        );
+        host
+    }
+
+    fn healthy_host_with_driver_surfaces() -> WindowsHostCapabilities {
+        let mut host = healthy_host_with_driver();
+        host.has_file_monitor_port = true;
+        host.file_monitor_protocol_version = Some(AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION);
+        host.file_monitor_queue_capacity = Some(256);
+        host.file_monitor_current_sequence = Some(1200);
+        host.file_monitor_status_detail = Some(
+            "port=\\AegisFileMonitorPort;protocol=0x00010000;queue_capacity=256;current_sequence=1200"
+                .to_string(),
+        );
+        host.registry_callback_registered = true;
+        host.registry_journal_capacity = Some(256);
+        host.registry_current_sequence = Some(640);
+        host.registry_status_detail = Some(
+            "service=AegisSensorKmod;protocol=0x00010000;journal_capacity=256;current_sequence=640;registered=True"
+                .to_string(),
         );
         host
     }
@@ -3123,6 +3644,66 @@ mod tests {
         )
     }
 
+    fn file_events_output(
+        current_sequence: u32,
+        queue_capacity: u32,
+        events: &[(u32, i64, u32, &str, &str)],
+    ) -> String {
+        let rows = events
+            .iter()
+            .map(|(sequence, timestamp, process_id, operation, path)| {
+                format!(
+                    "{{\"sequence\":{sequence},\"timestamp\":{timestamp},\"process_id\":{process_id},\"operation\":\"{}\",\"path\":\"{}\"}}",
+                    operation.replace('\\', "\\\\").replace('"', "\\\""),
+                    path.replace('\\', "\\\\").replace('"', "\\\"")
+                )
+            })
+            .collect::<Vec<_>>();
+        format!(
+            r#"{{"port_name":"\\AegisFileMonitorPort","protocol_version":65536,"queue_capacity":{queue_capacity},"oldest_sequence":0,"current_sequence":{current_sequence},"returned_count":{},"overflowed":false,"events":[{}]}}"#,
+            events.len(),
+            rows.join(",")
+        )
+    }
+
+    fn registry_events_output(
+        current_sequence: u32,
+        events: &[(u32, i64, &str, &str, &str, Option<&str>, Option<&str>)],
+    ) -> String {
+        let rows = events
+            .iter()
+            .map(
+                |(sequence, timestamp, operation, key_path, value_name, old_value, new_value)| {
+                    let old_value = old_value
+                        .map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+                        .unwrap_or_else(|| "null".to_string());
+                    let new_value = new_value
+                        .map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+                        .unwrap_or_else(|| "null".to_string());
+                    format!(
+                        "{{\"sequence\":{sequence},\"timestamp\":{timestamp},\"operation\":\"{}\",\"key_path\":\"{}\",\"value_name\":\"{}\",\"old_value_present\":{},\"new_value_present\":{},\"old_value\":{old_value},\"new_value\":{new_value}}}",
+                        operation.replace('\\', "\\\\").replace('"', "\\\""),
+                        key_path.replace('\\', "\\\\").replace('"', "\\\""),
+                        value_name.replace('\\', "\\\\").replace('"', "\\\""),
+                        old_value != "null",
+                        new_value != "null"
+                    )
+                },
+            )
+            .collect::<Vec<_>>();
+        format!(
+            r#"{{"service_name":"AegisSensorKmod","protocol_version":65536,"oldest_sequence":0,"current_sequence":{current_sequence},"returned_count":{},"overflowed":false,"events":[{}]}}"#,
+            events.len(),
+            rows.join(",")
+        )
+    }
+
+    fn registry_rollback_output(applied_count: u32, current_sequence: u32) -> String {
+        format!(
+            r#"{{"service_name":"AegisSensorKmod","key_path":"\\REGISTRY\\MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run","protocol_version":65536,"applied_count":{applied_count},"current_sequence":{current_sequence}}}"#
+        )
+    }
+
     fn process_output(processes: &[(&str, u32, u32, Option<&str>)]) -> String {
         let rows = processes
             .iter()
@@ -3197,13 +3778,16 @@ mod tests {
                 String::new(),
                 quarantine_receipt_output(&quarantine_path, "deadbeef"),
                 artifact_bundle_output(artifact_id, &bundle_path),
+                r#"{"key_path":"\\REGISTRY\\MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"}"#
+                    .to_string(),
+                registry_rollback_output(1, 641),
                 firewall_isolation_output(
                     r"C:\ProgramData\Aegis\firewall\backup.json",
                     "AegisIsolation-test",
                 ),
                 String::new(),
             ])),
-            healthy_host(),
+            healthy_host_with_driver_surfaces(),
         )
     }
 
@@ -3419,6 +4003,8 @@ mod tests {
         assert!(protection_json.contains("Image File Execution Options"));
         let rollback_json = fs::read_to_string(rollback_artifact).expect("read rollback artifact");
         assert!(rollback_json.contains(r"HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"));
+        assert!(rollback_json.contains(r"\\REGISTRY\\MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"));
+        assert!(rollback_json.contains("\"applied_count\": 1"));
         assert!(rollback_json.contains("C:/temp/payload.exe"));
         let block_artifact = snapshot
             .audit_artifacts
@@ -3584,6 +4170,111 @@ mod tests {
                 .expect("ssdt integrity")
                 .passed
         );
+    }
+
+    #[test]
+    fn windows_driver_surfaces_report_real_file_and_registry_capabilities() {
+        let mut host = healthy_host_with_driver_surfaces();
+        host.has_process_inventory = false;
+        host.has_process_creation_events = false;
+        host.has_net_connection = false;
+
+        let mut platform = WindowsPlatform::with_runner_for_test(
+            Box::new(QueuedWindowsRunner::new(Vec::<String>::new())),
+            host,
+        );
+        platform
+            .start(&SensorConfig {
+                profile: "windows-system".to_string(),
+                queue_capacity: 1024,
+                require_kernel_driver: true,
+            })
+            .expect("start windows runtime with driver surfaces");
+
+        let descriptor = platform.descriptor();
+        assert_eq!(descriptor.kernel_transport, KernelTransport::Driver);
+        assert!(descriptor.supports_registry);
+        let capabilities = platform.capabilities();
+        assert!(capabilities.file);
+        assert!(capabilities.registry);
+
+        let snapshot = platform.health_snapshot();
+        assert_eq!(
+            snapshot.provider_health.get("MinifilterFile").copied(),
+            Some(true)
+        );
+        assert_eq!(
+            snapshot.provider_health.get("RegistryCallback").copied(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn windows_poll_events_emits_driver_file_and_registry_deltas() {
+        let mut host = healthy_host_with_driver_surfaces();
+        host.has_process_inventory = false;
+        host.has_process_creation_events = false;
+        host.has_net_connection = false;
+
+        let mut platform = WindowsPlatform::with_runner_for_test(
+            Box::new(QueuedWindowsRunner::new([
+                file_events_output(
+                    1201,
+                    256,
+                    &[(
+                        1201,
+                        1713612010,
+                        4242,
+                        "write",
+                        r"C:\ProgramData\Aegis\sample.txt",
+                    )],
+                ),
+                registry_events_output(
+                    641,
+                    &[(
+                        641,
+                        1713612020,
+                        "set",
+                        r"\REGISTRY\MACHINE\SOFTWARE\AegisW10Test",
+                        "SampleValue",
+                        Some("before"),
+                        Some("after"),
+                    )],
+                ),
+            ])),
+            host,
+        );
+        platform
+            .start(&SensorConfig {
+                profile: "windows-system".to_string(),
+                queue_capacity: 1024,
+                require_kernel_driver: true,
+            })
+            .expect("start windows runtime with driver surfaces");
+
+        let mut buffer = EventBuffer::default();
+        let drained = platform
+            .poll_events(&mut buffer)
+            .expect("poll driver-backed windows events");
+
+        assert_eq!(drained, 2);
+        let events = buffer
+            .records
+            .iter()
+            .map(|record| String::from_utf8(record.clone()).expect("event utf8"))
+            .collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            event.contains("MinifilterFile")
+                && event.contains("file-write")
+                && event.contains(r"C:\ProgramData\Aegis\sample.txt")
+        }));
+        assert!(events.iter().any(|event| {
+            event.contains("RegistryCallback")
+                && event.contains("registry-set")
+                && event.contains(r"\REGISTRY\MACHINE\SOFTWARE\AegisW10Test")
+                && event.contains("before")
+                && event.contains("after")
+        }));
     }
 
     #[test]

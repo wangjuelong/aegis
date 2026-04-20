@@ -1,0 +1,51 @@
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = "ActivityMonitor"
+ClassGuid   = {b86dff51-a31e-4bac-b3cf-e8cfe75c9fc2}
+Provider    = %ManufacturerName%
+DriverVer   = 04/20/2026,1.0.0.0
+CatalogFile = AegisFileMonitor.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[DefaultInstall.NTamd64]
+OptionDesc = %ServiceDescription%
+CopyFiles  = MiniFilter.DriverFiles
+
+[DefaultInstall.NTamd64.Services]
+AddService = %ServiceName%,,MiniFilter.Service
+
+[SourceDisksNames]
+1 = %DiskName%,,,
+
+[SourceDisksFiles]
+AegisFileMonitor.sys = 1
+
+[MiniFilter.Service]
+DisplayName      = %ServiceDescription%
+Description      = %ServiceDescription%
+ServiceBinary    = %12%\AegisFileMonitor.sys
+Dependencies     = "FltMgr"
+ServiceType      = 2
+StartType        = 3
+ErrorControl     = 1
+LoadOrderGroup   = "FSFilter Activity Monitor"
+AddReg           = MiniFilter.AddRegistry
+
+[MiniFilter.AddRegistry]
+HKR,"Parameters\\Instances","DefaultInstance",0x00000000,%DefaultInstance%
+HKR,"Parameters\\Instances\\%DefaultInstance%","Altitude",0x00000000,%Altitude%
+HKR,"Parameters\\Instances\\%DefaultInstance%","Flags",0x00010001,0
+
+[MiniFilter.DriverFiles]
+AegisFileMonitor.sys
+
+[Strings]
+ManufacturerName = "Aegis"
+ServiceName = "AegisFileMonitor"
+ServiceDescription = "Aegis File Monitor Minifilter"
+DefaultInstance = "AegisFileMonitor Instance"
+Altitude = "385220"
+DiskName = "Aegis File Monitor Install Disk"
