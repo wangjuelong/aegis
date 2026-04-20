@@ -31,6 +31,7 @@ Windows 平台目标覆盖：
 
 - Windows 当前已经完成的是平台骨架、provider 注册、能力矩阵、事件注入与测试基线。
 - `W03.1` 已完成：`WindowsPlatform` 已接入本机 Windows / SSH Windows 两类真实执行通道，启动阶段会实测 PowerShell、进程枚举、事件日志、防火墙与注册表能力，不再返回硬编码健康状态。
+- `W03.2` 已完成：`poll_events()` 已接入 `Win32_Process` 真实进程基线差分，`detect_hidden_processes()` 已接入 `Win32_Process` / `tasklist` 双视图比对；并已修复中文 Windows 主机下 `tasklist /FO CSV /NH` 无表头导致的解析问题。
 - 当前仓库的主要缺口不是“没有接口”，而是 Windows 侧仍大量使用伪状态与伪成功返回，无法反映真实主机能力、真实事件链路与真实响应结果。
 - 本轮研发的原则是先把 `WindowsPlatform` 变成“只汇报真实能力、不伪造成功”的运行时，再逐步补齐进程、网络、注册表、脚本、自保护、签名与硬件根信任链。
 
@@ -48,7 +49,7 @@ Windows 平台目标覆盖：
 | 工作包 | 目标 | 状态 | 设计约束 | 完成判定 |
 |--------|------|------|----------|----------|
 | W03.1 | Windows 主机真实执行链与能力探测 | done | 不允许继续返回硬编码健康状态；必须区分本机 Windows、远端 SSH Windows、不可用三种运行态 | 已完成本机/SSH 真实执行通道、启动期能力探测、真实能力矩阵与真实健康快照；不可用时会直接失败而不是伪成功 |
-| W03.2 | 真实进程基线、增量轮询与隐藏进程检测 | todo | 不允许仅保留注入事件；必须基于 `Win32_Process`/`tasklist` 等真实主机视图构造 process delta | `poll_events()` 可输出真实 `process-start/process-exit` 事件，`detect_hidden_processes()` 基于双视图差异给出结果 |
+| W03.2 | 真实进程基线、增量轮询与隐藏进程检测 | done | 不允许仅保留注入事件；必须基于 `Win32_Process`/`tasklist` 等真实主机视图构造 process delta | 已完成真实进程基线差分与双视图隐藏进程检测，`poll_events()` 可输出真实 `process-start/process-exit` 事件 |
 | W03.3 | ETW/审计能力健康检查与进程审计事件链 | todo | 不允许把 ETW/AMSI 健康固定为 `true`；必须根据日志/审计策略实测结果判断 | 能检查 Security/PowerShell/WMI/TaskScheduler/Sysmon 等日志可用性，能判断 Process Creation 审计是否开启 |
 | W04.1 | 真实网络基线、连接增量与隔离执行链 | todo | 不允许只改内存快照；必须生成并执行真实 Windows 防火墙/网络隔离命令 | 能枚举 TCP/UDP 连接，输出真实 network delta；`network_isolate/network_release` 能在主机执行防火墙动作 |
 | W04.2 | 注册表回滚与保护清单落盘 | todo | 不允许只把 rollback 目标塞进快照；必须生成可审计的注册表回滚/保护清单 | 回滚目标、受保护路径和注册表保护面能落盘到审计工件，并返回真实路径 |
@@ -71,7 +72,7 @@ Windows 平台目标覆盖：
 本轮默认执行顺序：
 
 1. `W03.1` `done`
-2. `W03.2`
+2. `W03.2` `done`
 3. `W03.3`
 4. `W04.1`
 5. `W04.2`
@@ -88,13 +89,15 @@ Windows 平台目标覆盖：
 
 - Windows 平台骨架与测试基线：`done`
 - Windows 真实执行链与能力探测：`done`
+- Windows 真实进程差分与隐藏进程检测：`done`
 - Windows 真实系统级交付：`doing`
 
 因此，本文件中的平台状态应保持：
 
 - `W01-W02 = done`
 - `W03.1 = done`
-- `W03.2-W08.1 = todo`，进入实施后逐项更新为 `doing/done`
+- `W03.2 = done`
+- `W03.3-W08.1 = todo`，进入实施后逐项更新为 `doing/done`
 
 ## 7. Windows 后续执行顺序
 
