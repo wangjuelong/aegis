@@ -16,7 +16,7 @@
 | `W10` | `done` | 已完成 Minifilter 文件事件、注册表 journal/rollback 真实链路，以及 Rust 平台层接入 |
 | `W11` | `done` | 已完成 `ObRegisterCallbacks` 进程保护、Minifilter 文件保护与真实完整性回执，真机验证通过 |
 | `W12` | `done` | 已完成共享脚本解码、AMSI 脚本阻断/告警链与内存信号采集，`192.168.2.218` 真机验证通过 |
-| `W13` | `pending` | 安装、自检、watchdog、自举链仍需继续实现 |
+| `W13` | `done` | 已完成开发包安装/卸载、自举自检、watchdog 状态闭环与远端真机验收，`required_failures=[]` |
 | `W14` | `pending` | 正式签名、兼容性矩阵与发布门禁仍需继续实现 |
 
 ---
@@ -31,7 +31,7 @@
 
 ## 2. 当前缺口
 
-- 缺少安装、自举、自检、watchdog 与失败回滚链。
+- 开发包安装、自举、自检、watchdog 与失败回滚链已完成，但仍未形成正式发布包。
 - 缺少正式 MSI/驱动打包、驱动签名、ELAM 依赖校验、支持矩阵验收。
 - 测试机 `192.168.2.218` 可用；`192.168.1.4` 当前不可达，不能作为主验收机。
 - 当前仓库没有可用的正式代码签名证书或 `pfx/cer` 资产；正式签名链必须依赖外部凭据注入。
@@ -180,6 +180,15 @@
 
 ### W13: 打包、看门狗、自举与发布前自检
 
+**状态**
+
+- 已完成，真机主机：`192.168.2.218`
+- 已验证开发包安装、驱动注册、`aegis-agentd --write-default-config`、`--bootstrap-check` 与 `aegis-watchdog --once` 闭环
+- 远端验证时间：`2026-04-20 20:22:37 +08:00`
+- 远端 payload：`C:\ProgramData\Aegis\validation\windows-package-verify-20260420-200129`
+- 离线 Rust 工具链：`C:\ProgramData\Aegis\toolchains\1.91.0`
+- 代码提交：`61e1d0e`
+
 **目标**
 
 - 交付 Windows 安装链：主进程、watchdog、updater、驱动。
@@ -196,6 +205,7 @@
 
 - 安装过程会显式校验驱动加载、服务注册、依赖项与运行模式。
 - 若缺签名/缺依赖/缺批准，安装与首启失败，并留下可复盘日志。
+- 已在真机拿到 `install-result.json`、`bootstrap-check.json`、`watchdog-state.json`，且 `required_failures=[]`。
 
 **关键文件**
 

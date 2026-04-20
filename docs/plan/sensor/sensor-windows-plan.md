@@ -42,7 +42,8 @@ Windows 平台目标覆盖：
 - 当前仓库在本轮计划范围内已经完成“真实能力、真实失败、真实工件”的 Windows 运行时闭环，并已补齐 Windows 驱动工程、安装/卸载链、版本化控制通道与 `driver_transport` 真机验收。
 - `W11` 已完成：`ObRegisterCallbacks` 进程保护、Minifilter 路径保护与真实驱动完整性回执已接入，`192.168.2.218` 已验证 `Stop-Process`/文件修改阻断与 `block-create` 事件记录。
 - `W12` 已完成：共享脚本解码、AMSI 脚本阻断/告警链、PowerShell 4104 脚本块事件与内存快照增量已接入，`192.168.2.218` 已验证 benign script 事件捕获和官方 AMSI 测试样本阻断。
-- 但这不等于 Windows 最终系统级交付已经完成。当前仍缺少安装/自举/watchdog、正式签名、兼容性验证与发布工程化。
+- `W13` 已完成：开发包安装/卸载、自举自检、watchdog 状态快照、失败回滚与远端打包验证已经闭环，真机 `validate.ps1` 返回 `required_failures=[]`。
+- 但这不等于 Windows 最终系统级交付已经完成。当前仍缺少正式签名、兼容性验证与发布工程化。
 
 ## 5. Windows 研发计划与状态
 
@@ -91,6 +92,12 @@ Windows 平台目标覆盖：
 9. `W06.2` `done`
 10. `W07.1` `done`
 11. `W08.1`
+12. `W09`
+13. `W10`
+14. `W11`
+15. `W12`
+16. `W13`
+17. `W14`
 
 ### 5.4 后续不妥协系统级研发计划
 
@@ -100,7 +107,7 @@ Windows 平台目标覆盖：
 | W10 | 文件与注册表系统采集链 | done | 不允许继续把 `file/registry=false` 或把 rollback 只做成 JSON 工件 | 已完成 Minifilter 文件事件、注册表 journal/回滚、真实事件上报与真机回滚闭环 |
 | W11 | 进程/文件/注册表保护与内核完整性 | done | 不允许继续把保护面仅落成工件；`check_ssdt_integrity`/`check_callback_tables`/`check_kernel_code` 不得再返回 `not implemented` | 已完成真实保护执行链和完整性检查，真机可验证阻断与检测结果 |
 | W12 | 脚本/AMSI/内存信号闭环 | done | 不允许继续把 `AmsiScript`/`MemorySensor` 固定为未实现；脚本能力不能只停留在日志健康面 | 已完成共享脚本解码、AMSI 扫描/阻断、PowerShell 4104 事件桥接、内存快照增量事件与真机验收 |
-| W13 | 打包、看门狗、自举与发布前自检 | todo | 不允许继续把系统级交付等同于单个 `powershell.exe` 运行时；安装链必须显式校验驱动/服务/依赖 | 待实现 MSI/安装链、watchdog 首启自检、失败回滚与发布前验收脚本 |
+| W13 | 打包、看门狗、自举与发布前自检 | done | 不允许继续把系统级交付等同于单个 `powershell.exe` 运行时；安装链必须显式校验驱动/服务/依赖 | 已完成开发包 manifest/install/uninstall/validate、`aegis-agentd` 首启配置与 bootstrap 检查、`aegis-watchdog --once` 状态快照，以及 `192.168.2.218` 真机安装/回滚闭环 |
 | W14 | 正式签名、兼容性矩阵与发布验证 | todo | 不允许把自签名或未验签产物标记为正式发布；无签名凭据必须严格失败 | 待实现代码签名/驱动签名/验签流水线、支持矩阵与正式发布验收记录 |
 
 ## 6. Windows 完成判定
@@ -123,6 +130,7 @@ Windows 平台目标覆盖：
 - Windows 文件与注册表系统采集链：`done`
 - Windows 进程/文件保护与内核完整性：`done`
 - Windows 脚本/AMSI/内存信号闭环：`done`
+- Windows 打包、看门狗、自举与发布前自检：`done`
 - Windows 真实系统级交付：`doing`
 - Windows 正式签名、发布验证：`todo`
 
@@ -144,7 +152,8 @@ Windows 平台目标覆盖：
 - `W10 = done`
 - `W11 = done`
 - `W12 = done`
-- `W13-W14 = todo`
+- `W13 = done`
+- `W14 = todo`
 
 ## 7. Windows 后续执行顺序
 

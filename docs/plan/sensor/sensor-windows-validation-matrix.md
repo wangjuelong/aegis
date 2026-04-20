@@ -13,6 +13,8 @@
 - W11 补充验证方式：远端重构建并安装 `AegisSensorKmod + AegisFileMonitor`，执行进程保护、文件保护与完整性回执脚本
 - W12 补充验证时间：`2026-04-20 18:05:12 +08:00`
 - W12 补充验证方式：远端重构建并安装 `AegisSensorKmod`，执行 AMSI 状态探测、PowerShell 4104 脚本块回执与内存快照增量链路脚本
+- W13 补充验证时间：`2026-04-20 20:22:37 +08:00`
+- W13 补充验证方式：远端执行 `packaging/windows/validate.ps1`，使用离线工具链 `C:\ProgramData\Aegis\toolchains\1.91.0` 完成本地构建、payload 组装、安装、自检、watchdog 一次性校验与回滚验证
 
 ## 2. 主机选择结果
 
@@ -60,6 +62,9 @@
 | `file_protection_roundtrip` | pass | `C:\ProgramData\Aegis\validation\w11-protection-test\protected-dir` 下文件 `write/rename/delete` 全部返回“访问被拒绝” |
 | `file_protection_block_events` | pass | Minifilter 队列捕获到 `3` 条 `block-create` 事件，路径命中 `w11-block-event-test\\protected-dir\\sample.txt` |
 | `driver_integrity_roundtrip` | pass | `ssdt/callback/kernel_code inspection=true`；主机处于 `code_integrity_testsign=true`，因此 `kernel_code_suspicious=true` 为测试签名环境告警，不是静态占位 |
+| `windows_package_validate` | pass | `packaging/windows/validate.ps1` 在 `192.168.2.218` 返回 `required_failures=[]` |
+| `windows_install_bootstrap` | pass | 安装结果记录 `copied_paths/config_result/driver_result/bootstrap_report`，`bootstrap_report.approved=true` |
+| `windows_watchdog_once` | pass | `watchdog-state.json` 中 `alerts=[]`，`bootstrap_passed=true`，`update_phase=Idle` |
 
 ## 5. 关键产物
 
@@ -76,6 +81,12 @@
 - W11 文件保护验证目录：`C:\ProgramData\Aegis\validation\w11-protection-test\protected-dir`
 - W11 阻断事件验证目录：`C:\ProgramData\Aegis\validation\w11-block-event-test\protected-dir`
 - W11 关键结果：`{"ob_callback_registered":true,"stop_process_blocked":true,"file_write_blocked":true,"file_rename_blocked":true,"file_delete_blocked":true,"ssdt_inspection_succeeded":true,"callback_inspection_succeeded":true,"kernel_code_inspection_succeeded":true,"code_integrity_testsign":true}`
+- W13 远端 payload 根目录：`C:\ProgramData\Aegis\validation\windows-package-verify-20260420-200129`
+- W13 安装结果工件：`C:\ProgramData\Aegis\state\install-result.json`
+- W13 自检工件：`C:\ProgramData\Aegis\state\bootstrap-check.json`
+- W13 watchdog 工件：`C:\ProgramData\Aegis\state\watchdog-state.json`
+- W13 离线工具链：`C:\ProgramData\Aegis\toolchains\1.91.0`
+- W13 关键结果：`{"required_failures":[],"bootstrap_approved":true,"watchdog_alerts":0,"driver_service_state":"Running"}`
 
 ## 6. 结论
 
@@ -84,4 +95,5 @@
 - `W10` 已额外验证通过文件 Minifilter 和注册表 callback/rollback 真实链路，`WindowsPlatform` 不再把这两项能力固定为 `false`。
 - `W11` 已额外验证通过 `ObRegisterCallbacks` 进程保护、Minifilter 路径保护与驱动完整性查询；`WindowsPlatform` 不再把 `ObProcess`/`verify_integrity` 维持在审计占位状态。
 - `W12` 已额外验证通过共享脚本解码、AMSI 脚本阻断/告警、PowerShell 4104 脚本块回执与内存快照增量事件；`WindowsPlatform` 不再把 `AmsiScript`/`MemorySensor` 固定为未实现。
+- `W13` 已额外验证通过 Windows 开发包构建、安装、自举自检、watchdog 状态闭环与失败回滚链；当前仓库已具备发布前开发包验收入口。
 - `security_4688` 的验收口径以“日志可读、record_id 可取”为准；`cmd.exe` 临时探针命中率被保留为观察项，不作为失败条件。
