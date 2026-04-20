@@ -102,7 +102,7 @@
 | 编号 | 剩余事项 | 状态 | 说明 |
 |------|----------|------|------|
 | O01 | Linux 更高阶 remote attestation / verifier 分离信任链 | todo | 当前仅完成单机 TPM attestation 基线，远端证明链未入仓 |
-| O02 | Windows 真实运行时、事件链路、响应链与系统级交付 | doing | `W03.1-W05.1` 已完成，真实脚本/响应链与系统级交付仍未收口 |
+| O02 | Windows 真实运行时、事件链路、响应链与系统级交付 | doing | `W03.1-W05.2` 已完成，真实脚本/响应链与系统级交付仍未收口 |
 | O03 | Windows 正式硬件根信任、签名与兼容性验证 | todo | 当前未完成正式硬件 trust chain、驱动签发与发布验证 |
 | O04 | macOS ESF / Network Extension / System Extension 真实系统级交付 | todo | 当前仅完成 macOS 平台骨架与测试基线 |
 | O05 | macOS notarization、授权流与正式硬件根信任 | todo | 当前未完成签名、公证、用户批准与 Secure Enclave/Keychain 正式接入 |
