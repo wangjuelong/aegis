@@ -27,11 +27,17 @@ Linux 平台目标覆盖：
 - quote / checkquote attestation baseline
 - PCR policy session 绑定的 sealed-object 解封
 - Linux 容器验证与诊断面集成
+- Linux 安装/发布工程
+- Linux 远程 attestation / verifier 分离信任链
+- Linux 容器 / sidecar / runtime connector 交付链
 
 ## 4. 当前总体结论
 
 - 当前开发机与 Linux 测试机可闭合的 Linux 研发项已完成。
-- 剩余未完成项已经收缩为更高阶 remote attestation / verifier 分离信任链，以及更高阶生产部署/发行工程。
+- 剩余未完成项为：
+  - 更高阶 remote attestation / verifier 分离信任链
+  - Linux 安装 / 发布工程
+  - Linux 容器 / sidecar / runtime connector 交付链
 
 ## 5. Linux 研发计划与状态
 
@@ -49,6 +55,7 @@ Linux 平台目标覆盖：
 | L10 | Linux 容器验证与诊断集成 | done | 已完成 Linux 容器内 `cargo test` 基线验证与 `aegis-agentd -- --diagnose` 诊断接线 |
 | L11 | 更高阶 remote attestation / verifier 分离信任链 | todo | 当前仅完成单机 TPM attestation baseline，未完成远端 verifier、信任根与证明链 |
 | L12 | Linux 生产部署、签名与发行工程 | todo | 当前已具备测试机闭环，但更高阶生产打包、发行与长期运维工程未单独收口 |
+| L13 | Linux 容器 / Sidecar / Runtime Connector 交付链 | todo | 当前仅完成 contract / example / test baseline，未形成交付目录、manifest 与 validate 入口 |
 
 ## 6. 已完成验证
 
@@ -83,5 +90,4 @@ Linux 测试机已完成：
 按当前事实，Linux 文档应保持：
 
 - `L01-L10 = done`
-- `L11-L12 = todo`
-
+- `L11-L13 = todo`
