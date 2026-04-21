@@ -31,6 +31,8 @@ const WINDOWS_QUERY_FILE_EVENTS_SCRIPT: &str =
     include_str!("../../../scripts/windows-query-file-events.ps1");
 const WINDOWS_CONFIGURE_FILE_PROTECTION_SCRIPT: &str =
     include_str!("../../../scripts/windows-configure-file-protection.ps1");
+const WINDOWS_CONFIGURE_REGISTRY_PROTECTION_SCRIPT: &str =
+    include_str!("../../../scripts/windows-configure-registry-protection.ps1");
 const WINDOWS_QUERY_REGISTRY_EVENTS_SCRIPT: &str =
     include_str!("../../../scripts/windows-query-registry-events.ps1");
 const WINDOWS_ROLLBACK_REGISTRY_SCRIPT: &str =
@@ -224,6 +226,7 @@ struct WindowsHostCapabilities {
     registry_callback_registered: bool,
     registry_journal_capacity: Option<u32>,
     registry_current_sequence: Option<u32>,
+    protected_registry_path_count: Option<u32>,
     registry_status_detail: Option<String>,
     ob_callback_registered: bool,
     protected_process_count: Option<u32>,
@@ -383,9 +386,12 @@ impl WindowsHostCapabilities {
                 .unwrap_or_else(|| "-".to_string())
         ));
         facts.push(format!(
-            "registry_provider={};registry_journal_capacity={};registry_detail={}",
+            "registry_provider={};registry_journal_capacity={};protected_registry_paths={};registry_detail={}",
             self.registry_provider_ready(),
             self.registry_journal_capacity
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            self.protected_registry_path_count
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".to_string()),
             self.registry_status_detail
@@ -461,6 +467,8 @@ struct WindowsCapabilityProbe {
     registry_journal_capacity: Option<u32>,
     #[serde(default)]
     registry_current_sequence: Option<u32>,
+    #[serde(default)]
+    protected_registry_path_count: Option<u32>,
     #[serde(default)]
     registry_status_detail: Option<String>,
 }
@@ -684,11 +692,21 @@ struct WindowsFileProtectionResponse {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsRegistryProtectionResponse {
+    protocol_version: u32,
+    protected_path_count: u32,
+    #[serde(default)]
+    resolved_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 struct WindowsRegistryMonitorStatus {
     protocol_version: u32,
     registry_callback_registered: bool,
     journal_capacity: u32,
     current_sequence: u32,
+    #[serde(default)]
+    protected_path_count: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -698,6 +716,8 @@ struct WindowsRegistryMonitorEvent {
     operation: String,
     key_path: String,
     value_name: String,
+    #[serde(default)]
+    blocked: bool,
     old_value_present: bool,
     new_value_present: bool,
     old_value: Option<String>,
@@ -880,7 +900,7 @@ impl WindowsDeviceSnapshot {
 struct WindowsProtectionSurfaceArtifact {
     protected_pids: Vec<u32>,
     protected_paths: Vec<String>,
-    registry_protection_surface: Vec<String>,
+    protected_registry_paths: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -890,7 +910,7 @@ struct WindowsRegistryRollbackArtifact {
     applied_count: u32,
     current_sequence: u32,
     protected_paths: Vec<String>,
-    registry_protection_surface: Vec<String>,
+    protected_registry_paths: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -1565,6 +1585,65 @@ impl PlatformProtection for WindowsPlatform {
         Ok(())
     }
 
+    fn protect_registry(&self, selectors: &[String]) -> Result<()> {
+        let mut state = self.state.lock().expect("windows state poisoned");
+        ensure_windows_driver_transport(&state.host, "protect windows registry")?;
+        if !state.host.registry_provider_ready() {
+            bail!(
+                "protect windows registry requires registry callback journal: {}",
+                state.host.summary()
+            );
+        }
+
+        let mut merged_paths = state.execution.protected_registry_paths.clone();
+        for selector in selectors {
+            let resolved = resolve_windows_registry_key_path(self.runner.as_ref(), selector)
+                .with_context(|| format!("resolve windows registry selector {}", selector))?;
+            if !merged_paths.iter().any(|existing| existing == &resolved) {
+                merged_paths.push(resolved);
+            }
+        }
+
+        let clear = clear_windows_registry_protection(
+            self.runner.as_ref(),
+            AEGIS_WINDOWS_DRIVER_SERVICE_NAME,
+        )
+        .with_context(|| "clear windows protected registry paths before apply")?;
+        if clear.protocol_version != AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION {
+            bail!(
+                "registry protection clear protocol mismatch: expected 0x{expected:08x}, got 0x{actual:08x}",
+                expected = AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION,
+                actual = clear.protocol_version
+            );
+        }
+
+        let mut protected_path_count = clear.protected_path_count;
+        for key_path in &merged_paths {
+            let response = protect_windows_registry_path(
+                self.runner.as_ref(),
+                AEGIS_WINDOWS_DRIVER_SERVICE_NAME,
+                key_path,
+            )
+            .with_context(|| format!("protect windows registry path {}", key_path))?;
+            if response.protocol_version != AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION {
+                bail!(
+                    "registry protection protocol mismatch: expected 0x{expected:08x}, got 0x{actual:08x}",
+                    expected = AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION,
+                    actual = response.protocol_version
+                );
+            }
+            protected_path_count = response.protected_path_count;
+        }
+
+        state.execution.protected_registry_paths = merged_paths;
+        state.host.protected_registry_path_count = Some(protected_path_count);
+        refresh_windows_driver_surfaces(&mut state.host, self.runner.as_ref())
+            .with_context(|| "refresh windows driver surfaces after protect_registry")?;
+        record_windows_protection_surface_artifact(&mut state)
+            .with_context(|| "write windows protection surface artifact")?;
+        Ok(())
+    }
+
     fn verify_integrity(&self) -> Result<IntegrityReport> {
         let mut state = self.state.lock().expect("windows state poisoned");
         if state.host.driver_transport_ready() {
@@ -1974,6 +2053,7 @@ $data | ConvertTo-Json -Compress
         registry_callback_registered: probe.registry_callback_registered,
         registry_journal_capacity: probe.registry_journal_capacity,
         registry_current_sequence: probe.registry_current_sequence,
+        protected_registry_path_count: probe.protected_registry_path_count,
         registry_status_detail: probe.registry_status_detail,
         ob_callback_registered: false,
         protected_process_count: None,
@@ -2062,19 +2142,22 @@ fn refresh_windows_driver_surfaces(
                 && status.protocol_version == AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION;
             host.registry_journal_capacity = Some(status.journal_capacity);
             host.registry_current_sequence = Some(status.current_sequence);
+            host.protected_registry_path_count = Some(status.protected_path_count);
             host.registry_status_detail = Some(format!(
-                "service={};protocol=0x{:08x};journal_capacity={};current_sequence={};registered={}",
+                "service={};protocol=0x{:08x};journal_capacity={};current_sequence={};registered={};protected_paths={}",
                 AEGIS_WINDOWS_DRIVER_SERVICE_NAME,
                 status.protocol_version,
                 status.journal_capacity,
                 status.current_sequence,
-                status.registry_callback_registered
+                status.registry_callback_registered,
+                status.protected_path_count
             ));
         }
         Err(error) => {
             host.registry_callback_registered = false;
             host.registry_journal_capacity = None;
             host.registry_current_sequence = None;
+            host.protected_registry_path_count = None;
             host.registry_status_detail = Some(error.to_string());
         }
     }
@@ -2312,6 +2395,36 @@ fn protect_windows_file_path(
     )
 }
 
+fn clear_windows_registry_protection(
+    runner: &dyn WindowsCommandRunner,
+    service_name: &str,
+) -> Result<WindowsRegistryProtectionResponse> {
+    run_embedded_powershell_json(
+        runner,
+        WINDOWS_CONFIGURE_REGISTRY_PROTECTION_SCRIPT,
+        &[
+            ("Mode", "clear".to_string()),
+            ("ServiceName", service_name.to_string()),
+        ],
+    )
+}
+
+fn protect_windows_registry_path(
+    runner: &dyn WindowsCommandRunner,
+    service_name: &str,
+    key_path: &str,
+) -> Result<WindowsRegistryProtectionResponse> {
+    run_embedded_powershell_json(
+        runner,
+        WINDOWS_CONFIGURE_REGISTRY_PROTECTION_SCRIPT,
+        &[
+            ("Mode", "protect".to_string()),
+            ("ServiceName", service_name.to_string()),
+            ("KeyPath", key_path.to_string()),
+        ],
+    )
+}
+
 fn resolve_windows_registry_key_path(
     runner: &dyn WindowsCommandRunner,
     selector: &str,
@@ -2378,9 +2491,10 @@ fn file_monitor_event_subject(event: &WindowsFileMonitorEvent) -> String {
 
 fn registry_monitor_event_subject(event: &WindowsRegistryMonitorEvent) -> String {
     truncate_subject(&format!(
-        "sequence={};operation={};key={};value={};old={};new={}",
+        "sequence={};operation={};blocked={};key={};value={};old={};new={}",
         event.sequence,
         event.operation,
+        event.blocked,
         event.key_path,
         if event.value_name.is_empty() {
             "-"
@@ -2461,11 +2575,12 @@ fn collect_registry_monitor_events(
     state.host.registry_callback_registered = true;
     state.host.registry_current_sequence = Some(response.current_sequence);
     state.host.registry_status_detail = Some(format!(
-        "service={};current_sequence={};returned_count={};overflowed={}",
+        "service={};current_sequence={};returned_count={};overflowed={};protected_paths={}",
         AEGIS_WINDOWS_DRIVER_SERVICE_NAME,
         response.current_sequence,
         response.returned_count,
-        response.overflowed
+        response.overflowed,
+        state.host.protected_registry_path_count.unwrap_or_default()
     ));
     state.registry_monitor_cursor = Some(response.current_sequence);
 
@@ -2473,7 +2588,11 @@ fn collect_registry_monitor_events(
         state.pending_events.push_back(
             WindowsEventStub {
                 provider: WindowsProviderKind::RegistryCallback,
-                operation: format!("registry-{}", event.operation),
+                operation: if event.blocked {
+                    format!("registry-block-{}", event.operation)
+                } else {
+                    format!("registry-{}", event.operation)
+                },
                 subject: registry_monitor_event_subject(&event),
             }
             .encode(),
@@ -3287,14 +3406,6 @@ fn write_windows_response_script(
     Ok(path)
 }
 
-const WINDOWS_REGISTRY_PROTECTION_SURFACE: [&str; 5] = [
-    r"HKLM\Software\Microsoft\Windows\CurrentVersion\Run",
-    r"HKLM\SYSTEM\CurrentControlSet\Services",
-    r"HKLM\Software\Microsoft\Windows NT\CurrentVersion\Image File Execution Options",
-    r"HKLM\Software\Classes\CLSID",
-    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-];
-
 fn write_windows_protection_surface_artifact(state: &mut WindowsState) -> Result<PathBuf> {
     let artifact = WindowsProtectionSurfaceArtifact {
         protected_pids: state.execution.protected_pids.clone(),
@@ -3304,10 +3415,7 @@ fn write_windows_protection_surface_artifact(state: &mut WindowsState) -> Result
             .iter()
             .map(|path| path.display().to_string())
             .collect(),
-        registry_protection_surface: WINDOWS_REGISTRY_PROTECTION_SURFACE
-            .iter()
-            .map(|path| (*path).to_string())
-            .collect(),
+        protected_registry_paths: state.execution.protected_registry_paths.clone(),
     };
     let path = state
         .base_dir
@@ -3346,10 +3454,7 @@ fn write_windows_registry_rollback_artifact(
             .iter()
             .map(|path| path.display().to_string())
             .collect(),
-        registry_protection_surface: WINDOWS_REGISTRY_PROTECTION_SURFACE
-            .iter()
-            .map(|path| (*path).to_string())
-            .collect(),
+        protected_registry_paths: state.execution.protected_registry_paths.clone(),
     };
     let path = state
         .base_dir
@@ -4238,6 +4343,7 @@ mod tests {
             registry_callback_registered: false,
             registry_journal_capacity: None,
             registry_current_sequence: None,
+            protected_registry_path_count: None,
             registry_status_detail: None,
             ob_callback_registered: false,
             protected_process_count: None,
@@ -4280,8 +4386,9 @@ mod tests {
         host.registry_callback_registered = true;
         host.registry_journal_capacity = Some(256);
         host.registry_current_sequence = Some(640);
+        host.protected_registry_path_count = Some(1);
         host.registry_status_detail = Some(
-            "service=AegisSensorKmod;protocol=0x00010000;journal_capacity=256;current_sequence=640;registered=True"
+            "service=AegisSensorKmod;protocol=0x00010000;journal_capacity=256;current_sequence=640;registered=True;protected_paths=1"
                 .to_string(),
         );
         host.ob_callback_registered = true;
@@ -4671,9 +4778,25 @@ mod tests {
         )
     }
 
-    fn registry_status_output(current_sequence: u32, journal_capacity: u32) -> String {
+    fn registry_status_output(
+        current_sequence: u32,
+        journal_capacity: u32,
+        protected_path_count: u32,
+    ) -> String {
         format!(
-            r#"{{"service_name":"AegisSensorKmod","protocol_version":65536,"registry_callback_registered":true,"journal_capacity":{journal_capacity},"journal_count":1,"oldest_sequence":1,"current_sequence":{current_sequence}}}"#
+            r#"{{"service_name":"AegisSensorKmod","protocol_version":65536,"registry_callback_registered":true,"journal_capacity":{journal_capacity},"journal_count":1,"oldest_sequence":1,"current_sequence":{current_sequence},"protected_path_count":{protected_path_count}}}"#
+        )
+    }
+
+    fn registry_protection_output(
+        protected_path_count: u32,
+        resolved_path: Option<&str>,
+    ) -> String {
+        let resolved_path = resolved_path
+            .map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+            .unwrap_or_else(|| "null".to_string());
+        format!(
+            r#"{{"protocol_version":65536,"protected_path_count":{protected_path_count},"resolved_path":{resolved_path}}}"#
         )
     }
 
@@ -4695,12 +4818,21 @@ mod tests {
 
     fn registry_events_output(
         current_sequence: u32,
-        events: &[(u32, i64, &str, &str, &str, Option<&str>, Option<&str>)],
+        events: &[(u32, i64, &str, bool, &str, &str, Option<&str>, Option<&str>)],
     ) -> String {
         let rows = events
             .iter()
             .map(
-                |(sequence, timestamp, operation, key_path, value_name, old_value, new_value)| {
+                |(
+                    sequence,
+                    timestamp,
+                    operation,
+                    blocked,
+                    key_path,
+                    value_name,
+                    old_value,
+                    new_value,
+                )| {
                     let old_value = old_value
                         .map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
                         .unwrap_or_else(|| "null".to_string());
@@ -4708,7 +4840,7 @@ mod tests {
                         .map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
                         .unwrap_or_else(|| "null".to_string());
                     format!(
-                        "{{\"sequence\":{sequence},\"timestamp\":{timestamp},\"operation\":\"{}\",\"key_path\":\"{}\",\"value_name\":\"{}\",\"old_value_present\":{},\"new_value_present\":{},\"old_value\":{old_value},\"new_value\":{new_value}}}",
+                        "{{\"sequence\":{sequence},\"timestamp\":{timestamp},\"operation\":\"{}\",\"blocked\":{blocked},\"key_path\":\"{}\",\"value_name\":\"{}\",\"old_value_present\":{},\"new_value_present\":{},\"old_value\":{old_value},\"new_value\":{new_value}}}",
                         operation.replace('\\', "\\\\").replace('"', "\\\""),
                         key_path.replace('\\', "\\\\").replace('"', "\\\""),
                         value_name.replace('\\', "\\\\").replace('"', "\\\""),
@@ -4807,7 +4939,19 @@ mod tests {
                 file_protection_output(0, None),
                 file_protection_output(1, Some(r"\Device\HarddiskVolume4\temp\payload.exe")),
                 file_status_output(1200, 256, 1),
-                registry_status_output(641, 256),
+                registry_status_output(641, 256, 0),
+                driver_integrity_output(1, false, 0x00000401),
+                r#"{"key_path":"\\REGISTRY\\MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options"}"#
+                    .to_string(),
+                registry_protection_output(0, None),
+                registry_protection_output(
+                    1,
+                    Some(
+                        r"\REGISTRY\MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options",
+                    ),
+                ),
+                file_status_output(1200, 256, 1),
+                registry_status_output(641, 256, 1),
                 driver_integrity_output(1, false, 0x00000401),
                 quarantine_receipt_output(&quarantine_path, "deadbeef"),
                 artifact_bundle_output(artifact_id, &bundle_path),
@@ -4965,6 +5109,12 @@ mod tests {
         platform
             .protect_files(&[PathBuf::from("C:/temp/payload.exe")])
             .expect("protect files should record");
+        platform
+            .protect_registry(&[
+                r"HKLM\Software\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+                    .to_string(),
+            ])
+            .expect("protect registry should record");
         let receipt = platform
             .quarantine_file(Path::new("C:/temp/payload.exe"))
             .expect("quarantine should execute");
@@ -5002,6 +5152,13 @@ mod tests {
             snapshot.protected_paths,
             vec![PathBuf::from("C:/temp/payload.exe")]
         );
+        assert_eq!(
+            snapshot.protected_registry_paths,
+            vec![
+                r"\REGISTRY\MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+                    .to_string()
+            ]
+        );
         assert_eq!(snapshot.quarantined_files.len(), 1);
         assert_eq!(snapshot.quarantined_files[0], receipt);
         assert!(snapshot.quarantined_files[0].vault_path.exists());
@@ -5036,13 +5193,18 @@ mod tests {
         let protection_json =
             fs::read_to_string(protection_artifact).expect("read protection artifact");
         assert!(protection_json.contains("C:/temp/payload.exe"));
-        assert!(protection_json.contains("Image File Execution Options"));
+        assert!(protection_json.contains(
+            r"\\REGISTRY\\MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options"
+        ));
         let rollback_json = fs::read_to_string(rollback_artifact).expect("read rollback artifact");
         assert!(rollback_json.contains(r"HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"));
         assert!(rollback_json
             .contains(r"\\REGISTRY\\MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"));
         assert!(rollback_json.contains("\"applied_count\": 1"));
         assert!(rollback_json.contains("C:/temp/payload.exe"));
+        assert!(rollback_json.contains(
+            r"\\REGISTRY\\MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options"
+        ));
         let block_artifact = snapshot
             .audit_artifacts
             .iter()
@@ -5291,6 +5453,7 @@ mod tests {
                         641,
                         1713612020,
                         "set",
+                        false,
                         r"\REGISTRY\MACHINE\SOFTWARE\AegisW10Test",
                         "SampleValue",
                         Some("before"),

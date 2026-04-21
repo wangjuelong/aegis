@@ -25,6 +25,9 @@ namespace AegisRegistryBridge {
         public UInt32 JournalCount;
         public UInt32 OldestSequence;
         public UInt32 CurrentSequence;
+        public UInt32 ObCallbackRegistered;
+        public UInt32 ProtectedProcessCount;
+        public UInt32 ProtectedRegistryPathCount;
     }
 
     [StructLayout(LayoutKind.Sequential, Pack = 1)]
@@ -55,6 +58,7 @@ namespace AegisRegistryBridge {
         public UInt32 NewValuePresent;
         public UInt32 OldDataTruncated;
         public UInt32 NewDataTruncated;
+        public UInt32 Blocked;
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 512)]
         public string KeyPath;
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
@@ -208,6 +212,7 @@ try {
             journal_count = [uint32]$status.JournalCount
             oldest_sequence = [uint32]$status.OldestSequence
             current_sequence = [uint32]$status.CurrentSequence
+            protected_path_count = [uint32]$status.ProtectedRegistryPathCount
         } | ConvertTo-Json -Depth 5 -Compress
         return
     }
@@ -261,10 +266,13 @@ try {
             operation = switch ([uint32]$record.Operation) {
                 1 { "set" }
                 2 { "delete" }
+                3 { "create-key" }
+                4 { "delete-key" }
                 default { "unknown" }
             }
             key_path = ([string]$record.KeyPath).Trim([char]0)
             value_name = ([string]$record.ValueName).Trim([char]0)
+            blocked = ([uint32]$record.Blocked) -ne 0
             value_type = [uint32]$record.ValueType
             old_value_present = ([uint32]$record.OldValuePresent) -ne 0
             new_value_present = ([uint32]$record.NewValuePresent) -ne 0

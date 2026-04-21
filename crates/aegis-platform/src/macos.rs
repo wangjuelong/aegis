@@ -8,7 +8,7 @@ use aegis_model::{
     IsolationRulesV2, NetworkTarget, QuarantineReceipt, RollbackTarget, SensorCapabilities,
     SensorConfig, SuspiciousProcess,
 };
-use anyhow::Result;
+use anyhow::{bail, Result};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -447,6 +447,10 @@ impl PlatformProtection for MacosPlatform {
             .protected_paths
             .extend(paths.iter().cloned());
         Ok(())
+    }
+
+    fn protect_registry(&self, _selectors: &[String]) -> Result<()> {
+        bail!("registry protection is unavailable on macos")
     }
 
     fn verify_integrity(&self) -> Result<IntegrityReport> {

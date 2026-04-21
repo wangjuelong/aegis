@@ -33,6 +33,7 @@ pub enum MockAction {
     ClearAllBlocks,
     ProtectProcess(u32),
     ProtectFiles(usize),
+    ProtectRegistry(usize),
 }
 
 #[derive(Default)]
@@ -338,6 +339,15 @@ impl PlatformProtection for MockPlatform {
             .expect("mock state poisoned")
             .actions
             .push(MockAction::ProtectFiles(paths.len()));
+        Ok(())
+    }
+
+    fn protect_registry(&self, selectors: &[String]) -> Result<()> {
+        self.state
+            .lock()
+            .expect("mock state poisoned")
+            .actions
+            .push(MockAction::ProtectRegistry(selectors.len()));
         Ok(())
     }
 

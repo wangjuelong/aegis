@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-HOST=${AEGIS_WINDOWS_HOST:-192.168.2.218}
-USER_NAME=${AEGIS_WINDOWS_USER:-lamba}
-PASSWORD=${AEGIS_WINDOWS_PASSWORD:-lamba}
+HOST=${AEGIS_WINDOWS_HOST:-192.168.2.222}
+USER_NAME=${AEGIS_WINDOWS_USER:-admin}
+PASSWORD=${AEGIS_WINDOWS_PASSWORD:-admin}
 OUTPUT_PATH=${AEGIS_WINDOWS_VALIDATE_OUTPUT:-target/windows-validation/${HOST}.json}
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -15,6 +15,8 @@ UNINSTALL_SCRIPT_PATH="${SCRIPT_DIR}/windows-uninstall-driver.ps1"
 AMSI_SCAN_SCRIPT_PATH="${SCRIPT_DIR}/windows-scan-script-with-amsi.ps1"
 SCRIPT_EVENT_QUERY_PATH="${SCRIPT_DIR}/windows-query-script-events.ps1"
 MEMORY_SNAPSHOT_SCRIPT_PATH="${SCRIPT_DIR}/windows-query-memory-snapshot.ps1"
+REGISTRY_EVENT_QUERY_PATH="${SCRIPT_DIR}/windows-query-registry-events.ps1"
+REGISTRY_PROTECTION_SCRIPT_PATH="${SCRIPT_DIR}/windows-configure-registry-protection.ps1"
 DRIVER_SOURCE_DIR="${REPO_ROOT}/windows/driver"
 
 REMOTE_PAYLOAD_ID="windows-runtime-verify-$(date +%Y%m%d-%H%M%S)"
@@ -40,7 +42,9 @@ for path in \
   "$UNINSTALL_SCRIPT_PATH" \
   "$AMSI_SCAN_SCRIPT_PATH" \
   "$SCRIPT_EVENT_QUERY_PATH" \
-  "$MEMORY_SNAPSHOT_SCRIPT_PATH"; do
+  "$MEMORY_SNAPSHOT_SCRIPT_PATH" \
+  "$REGISTRY_EVENT_QUERY_PATH" \
+  "$REGISTRY_PROTECTION_SCRIPT_PATH"; do
   if [[ ! -f "$path" ]]; then
     echo "missing validation helper script: $path" >&2
     exit 1
@@ -64,11 +68,13 @@ sshpass -p "$PASSWORD" scp -r "${SSH_OPTS[@]}" \
   "$AMSI_SCAN_SCRIPT_PATH" \
   "$SCRIPT_EVENT_QUERY_PATH" \
   "$MEMORY_SNAPSHOT_SCRIPT_PATH" \
+  "$REGISTRY_EVENT_QUERY_PATH" \
+  "$REGISTRY_PROTECTION_SCRIPT_PATH" \
   "$DRIVER_SOURCE_DIR" \
   "$USER_NAME@$HOST:${REMOTE_PAYLOAD_POSIX}/" >/dev/null
 
 RESULT_JSON=$(sshpass -p "$PASSWORD" ssh "${SSH_OPTS[@]}" "$USER_NAME@$HOST" \
-  "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${REMOTE_PAYLOAD_WIN}\\windows-runtime-verify.ps1\" -DriverRoot \"${REMOTE_PAYLOAD_WIN}\\driver\" -BuildScriptPath \"${REMOTE_PAYLOAD_WIN}\\windows-build-driver.ps1\" -InstallScriptPath \"${REMOTE_PAYLOAD_WIN}\\windows-install-driver.ps1\" -UninstallScriptPath \"${REMOTE_PAYLOAD_WIN}\\windows-uninstall-driver.ps1\"")
+  "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${REMOTE_PAYLOAD_WIN}\\windows-runtime-verify.ps1\" -DriverRoot \"${REMOTE_PAYLOAD_WIN}\\driver\" -BuildScriptPath \"${REMOTE_PAYLOAD_WIN}\\windows-build-driver.ps1\" -InstallScriptPath \"${REMOTE_PAYLOAD_WIN}\\windows-install-driver.ps1\" -UninstallScriptPath \"${REMOTE_PAYLOAD_WIN}\\windows-uninstall-driver.ps1\" -RegistryEventQueryPath \"${REMOTE_PAYLOAD_WIN}\\windows-query-registry-events.ps1\" -RegistryProtectionScriptPath \"${REMOTE_PAYLOAD_WIN}\\windows-configure-registry-protection.ps1\"")
 
 printf '%s\n' "$RESULT_JSON" | tee "$OUTPUT_PATH"
 

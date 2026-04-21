@@ -6,6 +6,8 @@ param(
     [string]$AmsiScanScriptPath = (Join-Path $PSScriptRoot "windows-scan-script-with-amsi.ps1"),
     [string]$ScriptEventQueryPath = (Join-Path $PSScriptRoot "windows-query-script-events.ps1"),
     [string]$MemorySnapshotScriptPath = (Join-Path $PSScriptRoot "windows-query-memory-snapshot.ps1"),
+    [string]$RegistryEventQueryPath = (Join-Path $PSScriptRoot "windows-query-registry-events.ps1"),
+    [string]$RegistryProtectionScriptPath = (Join-Path $PSScriptRoot "windows-configure-registry-protection.ps1"),
     [string]$DriverServiceName = "AegisSensorKmod"
 )
 
@@ -44,6 +46,11 @@ New-Item -ItemType Directory -Path $forensicsRoot -Force | Out-Null
 
 $results = [ordered]@{}
 $requiredFailures = New-Object System.Collections.Generic.List[string]
+$driverInstallState = [ordered]@{
+    ready = $false
+    build = $null
+    install = $null
+}
 
 function Resolve-ExistingPath {
     param(
@@ -160,7 +167,10 @@ function Set-ScriptBlockLoggingEnabled {
     if ($Enabled) {
         New-ItemProperty -Path $keyPath -Name "EnableScriptBlockLogging" -PropertyType DWord -Value 1 -Force | Out-Null
     } else {
-        Remove-ItemProperty -Path $keyPath -Name "EnableScriptBlockLogging" -ErrorAction SilentlyContinue
+        $item = Get-Item -LiteralPath $keyPath -ErrorAction SilentlyContinue
+        if ($null -ne $item -and @($item.Property) -contains "EnableScriptBlockLogging") {
+            Remove-ItemProperty -Path $keyPath -Name "EnableScriptBlockLogging" -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -175,7 +185,10 @@ function Restore-ScriptBlockLoggingState {
         New-Item -ItemType Directory -Path $keyPath -Force | Out-Null
         New-ItemProperty -Path $keyPath -Name "EnableScriptBlockLogging" -PropertyType DWord -Value ([int]$State.value) -Force | Out-Null
     } else {
-        Remove-ItemProperty -Path $keyPath -Name "EnableScriptBlockLogging" -ErrorAction SilentlyContinue
+        $item = Get-Item -LiteralPath $keyPath -ErrorAction SilentlyContinue
+        if ($null -ne $item -and @($item.Property) -contains "EnableScriptBlockLogging") {
+            Remove-ItemProperty -Path $keyPath -Name "EnableScriptBlockLogging" -ErrorAction SilentlyContinue
+        }
         $item = Get-Item -LiteralPath $keyPath -ErrorAction SilentlyContinue
         if ($null -ne $item -and $item.Property.Count -eq 0) {
             Remove-Item -LiteralPath $keyPath -Force
@@ -275,30 +288,25 @@ Invoke-ValidationStep -Name "driver_transport" -Body {
         Platform = "x64"
     }
 
-    $installResult = $null
-    $uninstallResult = $null
-    try {
-        $installResult = Invoke-JsonScript -ScriptPath $resolvedInstallScript -Arguments @{
-            DriverRoot = $resolvedDriverRoot
-            Configuration = "Release"
-            Platform = "x64"
-            ServiceName = $DriverServiceName
-        }
-
-        $protocolVersion = [int]$installResult.driver_query.protocol_version
-        if ($protocolVersion -ne 65536) {
-            throw "driver protocol mismatch: $protocolVersion"
-        }
-    } finally {
-        $uninstallResult = Invoke-JsonScript -ScriptPath $resolvedUninstallScript -Arguments @{
-            ServiceName = $DriverServiceName
-        }
+    $installResult = Invoke-JsonScript -ScriptPath $resolvedInstallScript -Arguments @{
+        DriverRoot = $resolvedDriverRoot
+        Configuration = "Release"
+        Platform = "x64"
+        ServiceName = $DriverServiceName
     }
+
+    $protocolVersion = [int]$installResult.driver_query.protocol_version
+    if ($protocolVersion -ne 65536) {
+        throw "driver protocol mismatch: $protocolVersion"
+    }
+
+    $driverInstallState.ready = $true
+    $driverInstallState.build = $buildResult
+    $driverInstallState.install = $installResult
 
     [ordered]@{
         build = $buildResult
         install = $installResult
-        uninstall = $uninstallResult
     }
 }
 
@@ -485,6 +493,75 @@ Invoke-ValidationStep -Name "firewall_block" -Body {
     }
 }
 
+Invoke-ValidationStep -Name "registry_protection" -Body {
+    $resolvedRegistryEventQuery = Resolve-ExistingPath -Path $RegistryEventQueryPath -Description "registry event query script"
+    $resolvedRegistryProtectionScript = Resolve-ExistingPath -Path $RegistryProtectionScriptPath -Description "registry protection script"
+    $validationKey = "HKLM:\SOFTWARE\AegisValidation\RegistryProtection\$validationId"
+    $kernelKey = "\REGISTRY\MACHINE\SOFTWARE\AegisValidation\RegistryProtection\$validationId"
+
+    & reg.exe delete "HKLM\SOFTWARE\AegisValidation\RegistryProtection\$validationId" /f | Out-Null
+    New-Item -Path $validationKey -Force | Out-Null
+    New-ItemProperty -Path $validationKey -Name "AllowedBeforeProtect" -Value "baseline" -PropertyType String -Force | Out-Null
+
+    $statusBefore = Invoke-JsonScript -ScriptPath $resolvedRegistryEventQuery -Arguments @{
+        Mode = "status"
+        ServiceName = $DriverServiceName
+    }
+    $lastSequence = [uint32]$statusBefore.current_sequence
+
+    try {
+        $clearResult = Invoke-JsonScript -ScriptPath $resolvedRegistryProtectionScript -Arguments @{
+            Mode = "clear"
+            ServiceName = $DriverServiceName
+        }
+        $protectResult = Invoke-JsonScript -ScriptPath $resolvedRegistryProtectionScript -Arguments @{
+            Mode = "protect"
+            ServiceName = $DriverServiceName
+            KeyPath = $validationKey
+        }
+
+        $blockedWriteSucceeded = $false
+        $blockedWriteError = $null
+        try {
+            New-ItemProperty -Path $validationKey -Name "BlockedValue" -Value "blocked" -PropertyType String -Force -ErrorAction Stop | Out-Null
+            $blockedWriteSucceeded = $true
+        } catch {
+            $blockedWriteError = $_.Exception.Message
+        }
+        if ($blockedWriteSucceeded) {
+            throw "registry protected key accepted a write"
+        }
+
+        $eventsPayload = Invoke-JsonScript -ScriptPath $resolvedRegistryEventQuery -Arguments @{
+            Mode = "events"
+            ServiceName = $DriverServiceName
+            LastSequence = [string]$lastSequence
+            MaxEntries = "64"
+        }
+        $blockedEvents = @($eventsPayload.events | Where-Object {
+                [bool]$_.blocked -and
+                [string]$_.key_path -eq $kernelKey -and
+                [string]$_.operation -eq "set"
+            })
+        if ($blockedEvents.Count -lt 1) {
+            throw "registry block event was not captured"
+        }
+
+        [ordered]@{
+            clear = $clearResult
+            protect = $protectResult
+            blocked_write_error = $blockedWriteError
+            blocked_events = $blockedEvents | Select-Object -First 1
+        }
+    } finally {
+        Invoke-JsonScript -ScriptPath $resolvedRegistryProtectionScript -Arguments @{
+            Mode = "clear"
+            ServiceName = $DriverServiceName
+        } | Out-Null
+        & reg.exe delete "HKLM\SOFTWARE\AegisValidation\RegistryProtection\$validationId" /f | Out-Null
+    }
+}
+
 Invoke-ValidationStep -Name "named_pipe_inventory" -Body {
     $pipes = @(Get-ChildItem -Path "\\.\pipe\" -ErrorAction Stop | Select-Object -First 5 Name)
     if ($pipes.Count -lt 1) {
@@ -594,11 +671,27 @@ Invoke-ValidationStep -Name "script_surface_roundtrip" -Body {
             throw "no script block logging event captured for benign script"
         }
 
+        $blockValidation = [ordered]@{
+            skipped = $false
+            reason = $null
+            result = $null
+        }
+        if (-not [bool]$allowResult.scan_interface_ready) {
+            $blockValidation.skipped = $true
+            $blockValidation.reason = "host_amsi_scan_interface_unavailable"
+            return [ordered]@{
+                allow = $allowResult
+                benign_event = $matched | Select-Object -First 1
+                block = $blockValidation
+            }
+        }
+
         # Build the official AMSI test sample at runtime so the verifier itself is not signature-blocked on upload.
-        $blockScript = -join ((@(
+        $amsiSample = -join ((@(
             65,77,83,73,32,84,101,115,116,32,83,97,109,112,108,101,58,32,
             55,101,55,50,99,51,99,101,45,56,54,49,98,45,52,51,51,57,45,56,55,52,48,45,48,97,99,49,52,56,52,99,49,51,56,54
         )) | ForEach-Object { [char]$_ })
+        $blockScript = "`$null = '$amsiSample'"
         $blockResult = Invoke-JsonScript -ScriptPath $resolvedAmsiScript -Arguments @{
             Mode = "execute"
             ContentName = "AegisBlock.ps1"
@@ -607,11 +700,12 @@ Invoke-ValidationStep -Name "script_surface_roundtrip" -Body {
         if (-not [bool]$blockResult.blocked -or [bool]$blockResult.executed) {
             throw "expected suspicious script to be blocked before execution"
         }
+        $blockValidation.result = $blockResult
 
         [ordered]@{
             allow = $allowResult
             benign_event = $matched | Select-Object -First 1
-            block = $blockResult
+            block = $blockValidation
         }
     } finally {
         Restore-ScriptBlockLoggingState -State $previousState
@@ -749,6 +843,25 @@ Invoke-ValidationStep -Name "forensics_response" -Body {
         bundle_zip = $bundleZip
         manifest = $manifestPath
     }
+}
+
+Invoke-ValidationStep -Name "driver_cleanup" -Body {
+    if (-not [bool]$driverInstallState.ready) {
+        return [ordered]@{
+            skipped = $true
+        }
+    }
+
+    $resolvedUninstallScript = Resolve-ExistingPath -Path $UninstallScriptPath -Description "driver uninstall script"
+    $uninstallResult = Invoke-JsonScript -ScriptPath $resolvedUninstallScript -Arguments @{
+        ServiceName = $DriverServiceName
+    }
+    $driverInstallState.ready = $false
+    if ($null -ne $results["driver_transport"] -and $results["driver_transport"].status -eq "pass") {
+        $results["driver_transport"].value["uninstall"] = $uninstallResult
+    }
+
+    $uninstallResult
 }
 
 $summary = [ordered]@{
