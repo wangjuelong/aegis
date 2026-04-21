@@ -1,0 +1,17 @@
+[Unit]
+Description=Aegis Sensor Watchdog
+After=aegis-agentd.service
+Requires=aegis-agentd.service
+ConditionPathExists=/opt/aegis/bin/aegis-watchdog
+
+[Service]
+Type=simple
+User=root
+Group=root
+Environment=AEGIS_STATE_ROOT=/var/lib/aegis
+ExecStart=/opt/aegis/bin/aegis-watchdog --monitor --state-root /var/lib/aegis --interval-ms 2000 --grace-period-ms 15000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

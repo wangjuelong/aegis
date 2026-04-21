@@ -21,7 +21,8 @@ pub const UPDATE_ARTIFACT_KIND: &str = "artifact";
 pub const UPDATE_ROLLBACK_KIND: &str = "rollback";
 pub const DEVELOPMENT_UPDATE_SIGNING_KEY_ID: &str = "update-k1";
 pub const DEVELOPMENT_UPDATE_SIGNING_KEY_BYTES: [u8; 32] = [21u8; 32];
-pub const WINDOWS_INSTALL_MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const INSTALL_MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const WINDOWS_INSTALL_MANIFEST_SCHEMA_VERSION: u32 = INSTALL_MANIFEST_SCHEMA_VERSION;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpgradeArtifact {
@@ -715,7 +716,16 @@ impl UpdateVerificationSnapshot {
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum WindowsInstallComponentKind {
+pub enum InstallPlatform {
+    #[default]
+    Windows,
+    Linux,
+    Macos,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallComponentKind {
     #[default]
     Binary,
     Script,
@@ -737,10 +747,10 @@ fn path_is_windows_absolute(path: &Path) -> bool {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WindowsInstallComponent {
+pub struct InstallComponent {
     pub name: String,
     #[serde(default)]
-    pub kind: WindowsInstallComponentKind,
+    pub kind: InstallComponentKind,
     pub source_relative_path: PathBuf,
     pub install_relative_path: PathBuf,
     #[serde(default = "default_required_component")]
@@ -748,7 +758,7 @@ pub struct WindowsInstallComponent {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WindowsReleaseDependency {
+pub struct InstallDependency {
     pub name: String,
     #[serde(default)]
     pub required: bool,
@@ -758,20 +768,37 @@ pub struct WindowsReleaseDependency {
     pub detail: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstallServiceUnit {
+    pub name: String,
+    pub unit_name: String,
+    #[serde(default = "default_required_component")]
+    pub required: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WindowsInstallManifest {
+pub struct InstallManifest {
     pub schema_version: u32,
+    #[serde(default)]
+    pub platform: InstallPlatform,
     pub bundle_channel: String,
     pub install_root: PathBuf,
     pub state_root: PathBuf,
-    pub driver_service_name: String,
     #[serde(default)]
-    pub components: Vec<WindowsInstallComponent>,
+    pub config_root: Option<PathBuf>,
     #[serde(default)]
-    pub release_dependencies: Vec<WindowsReleaseDependency>,
+    pub driver_service_name: Option<String>,
+    #[serde(default)]
+    pub components: Vec<InstallComponent>,
+    #[serde(default)]
+    pub release_dependencies: Vec<InstallDependency>,
+    #[serde(default)]
+    pub service_units: Vec<InstallServiceUnit>,
 }
 
-impl WindowsInstallManifest {
+pub type WindowsInstallManifest = InstallManifest;
+
+impl InstallManifest {
     pub fn from_json_str(raw: &str) -> Result<Self> {
         let manifest = serde_json::from_str::<Self>(raw)?;
         manifest.validate()?;
@@ -784,20 +811,40 @@ impl WindowsInstallManifest {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != WINDOWS_INSTALL_MANIFEST_SCHEMA_VERSION {
+        if self.schema_version != INSTALL_MANIFEST_SCHEMA_VERSION {
             bail!(
-                "unsupported windows install manifest schema version: {}",
+                "unsupported install manifest schema version: {}",
                 self.schema_version
             );
         }
         if self.bundle_channel.trim().is_empty() {
-            bail!("windows install manifest bundle_channel is required");
-        }
-        if self.driver_service_name.trim().is_empty() {
-            bail!("windows install manifest driver_service_name is required");
+            bail!("install manifest bundle_channel is required");
         }
         if self.components.is_empty() {
-            bail!("windows install manifest must include at least one component");
+            bail!("install manifest must include at least one component");
+        }
+
+        match self.platform {
+            InstallPlatform::Windows => {
+                if self
+                    .driver_service_name
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    bail!("windows install manifest driver_service_name is required");
+                }
+            }
+            InstallPlatform::Linux => {
+                if self.config_root.as_ref().is_none_or(|path| path.as_os_str().is_empty()) {
+                    bail!("linux install manifest config_root is required");
+                }
+                if self.service_units.is_empty() {
+                    bail!("linux install manifest must include service_units");
+                }
+            }
+            InstallPlatform::Macos => {}
         }
 
         let mut names = HashMap::new();
@@ -865,6 +912,22 @@ impl WindowsInstallManifest {
                         relative_path.display()
                     );
                 }
+            }
+        }
+
+        let mut service_unit_names = HashMap::new();
+        for service_unit in &self.service_units {
+            if service_unit.name.trim().is_empty() {
+                bail!("install service unit name is required");
+            }
+            if service_unit.unit_name.trim().is_empty() {
+                bail!("install service unit unit_name is required");
+            }
+            if service_unit_names
+                .insert(service_unit.name.clone(), service_unit.unit_name.clone())
+                .is_some()
+            {
+                bail!("duplicate install service unit: {}", service_unit.name);
             }
         }
 
@@ -1069,10 +1132,10 @@ mod tests {
     use super::{
         AgentRuntimeSnapshot, BootstrapCheckItem, BootstrapCheckReport, CanaryGateDecision,
         CanaryGateThresholds, CanaryObservation, DiagnoseCertificateStatus, DiagnoseCollector,
-        DiagnoseConnectionStatus, DiagnoseKeyProtectionStatus, DiagnoseReplayStatus,
-        DiagnoseSensorStatus, DiagnoseWalStatus, HotUpdateManifestVerifier, RolloutGateEvaluator,
-        RuntimeStateStore, UpdatePhase, UpdateVerificationSnapshot, UpgradeArtifact,
-        UpgradePlanner, WatchdogLinkMonitor, WatchdogRuntimeSnapshot, WindowsInstallManifest,
+        DiagnoseConnectionStatus, DiagnoseKeyProtectionStatus, DiagnoseReplayStatus, DiagnoseSensorStatus,
+        DiagnoseWalStatus, HotUpdateManifestVerifier, InstallPlatform, RolloutGateEvaluator,
+        RuntimeStateStore, UpdatePhase, UpdateVerificationSnapshot, UpgradeArtifact, UpgradePlanner,
+        WatchdogLinkMonitor, WatchdogRuntimeSnapshot, WindowsInstallManifest,
         DEVELOPMENT_UPDATE_SIGNING_KEY_BYTES, DEVELOPMENT_UPDATE_SIGNING_KEY_ID,
     };
     use crate::config::AgentConfig;
@@ -1597,6 +1660,102 @@ mod tests {
 
         let error = WindowsInstallManifest::from_json_str(invalid).expect_err("reject absolute");
         assert!(error.to_string().contains("must be relative"));
+    }
+
+    #[test]
+    fn linux_install_manifest_requires_service_units_and_config_root() {
+        let manifest = r#"
+        {
+          "schema_version": 1,
+          "platform": "linux",
+          "bundle_channel": "development",
+          "install_root": "/opt/aegis",
+          "state_root": "/var/lib/aegis",
+          "config_root": "/etc/aegis",
+          "service_units": [
+            {
+              "name": "agentd",
+              "unit_name": "aegis-agentd.service",
+              "required": true
+            }
+          ],
+          "components": [
+            {
+              "name": "agentd",
+              "kind": "binary",
+              "source_relative_path": "bin/aegis-agentd",
+              "install_relative_path": "bin/aegis-agentd",
+              "required": true
+            }
+          ]
+        }
+        "#;
+
+        let parsed = WindowsInstallManifest::from_json_str(manifest).expect("parse linux manifest");
+        assert_eq!(parsed.platform, InstallPlatform::Linux);
+        assert_eq!(parsed.service_units.len(), 1);
+
+        let missing_service_units = r#"
+        {
+          "schema_version": 1,
+          "platform": "linux",
+          "bundle_channel": "development",
+          "install_root": "/opt/aegis",
+          "state_root": "/var/lib/aegis",
+          "config_root": "/etc/aegis",
+          "components": [
+            {
+              "name": "agentd",
+              "kind": "binary",
+              "source_relative_path": "bin/aegis-agentd",
+              "install_relative_path": "bin/aegis-agentd",
+              "required": true
+            }
+          ]
+        }
+        "#;
+        let error = WindowsInstallManifest::from_json_str(missing_service_units)
+            .expect_err("linux manifest should require service units");
+        assert!(error.to_string().contains("service_units"));
+    }
+
+    #[test]
+    fn linux_install_manifest_rejects_duplicate_service_units() {
+        let invalid = r#"
+        {
+          "schema_version": 1,
+          "platform": "linux",
+          "bundle_channel": "development",
+          "install_root": "/opt/aegis",
+          "state_root": "/var/lib/aegis",
+          "config_root": "/etc/aegis",
+          "service_units": [
+            {
+              "name": "agentd",
+              "unit_name": "aegis-agentd.service",
+              "required": true
+            },
+            {
+              "name": "agentd",
+              "unit_name": "aegis-watchdog.service",
+              "required": true
+            }
+          ],
+          "components": [
+            {
+              "name": "agentd",
+              "kind": "binary",
+              "source_relative_path": "bin/aegis-agentd",
+              "install_relative_path": "bin/aegis-agentd",
+              "required": true
+            }
+          ]
+        }
+        "#;
+
+        let error = WindowsInstallManifest::from_json_str(invalid)
+            .expect_err("duplicate service units should fail");
+        assert!(error.to_string().contains("duplicate install service unit"));
     }
 
     #[test]

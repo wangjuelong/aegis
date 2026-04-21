@@ -1,0 +1,20 @@
+[Unit]
+Description=Aegis Sensor Agent
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/opt/aegis/bin/aegis-agentd
+ConditionPathExists=/etc/aegis/agent.toml
+
+[Service]
+Type=simple
+User=root
+Group=root
+Environment=AEGIS_STATE_ROOT=/var/lib/aegis
+Environment=AEGIS_CONFIG=/etc/aegis/agent.toml
+ExecStart=/opt/aegis/bin/aegis-agentd --state-root /var/lib/aegis --config /etc/aegis/agent.toml
+Restart=always
+RestartSec=5
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

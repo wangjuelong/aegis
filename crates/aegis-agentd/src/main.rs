@@ -10,9 +10,9 @@ use aegis_core::self_protection::{
 use aegis_core::transport_drivers::TransportAgentContext;
 use aegis_core::upgrade::{
     AgentRuntimeSnapshot, BootstrapCheckItem, BootstrapCheckReport, DiagnoseCertificateStatus,
-    DiagnoseCollector, DiagnoseConnectionStatus, DiagnoseKeyProtectionStatus, DiagnoseReplayStatus,
-    DiagnoseSensorStatus, DiagnoseWalStatus, RuntimeStateStore, UpdateVerificationSnapshot,
-    WindowsInstallManifest,
+    DiagnoseCollector, DiagnoseConnectionStatus, DiagnoseKeyProtectionStatus,
+    DiagnoseReplayStatus, DiagnoseSensorStatus, DiagnoseWalStatus, InstallPlatform,
+    RuntimeStateStore, UpdateVerificationSnapshot, WindowsInstallManifest,
 };
 use aegis_core::wal::{PendingBatchStore, ReplayLane};
 use aegis_model::{
@@ -300,6 +300,24 @@ fn run_bootstrap_check(cli: &CliArgs) -> Result<BootstrapCheckReport> {
             install_root.display()
         ),
     );
+    if let Some(config_root) = &manifest.config_root {
+        let runtime_config_root = config
+            .storage
+            .config_path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| config.storage.config_path.clone());
+        push_check(
+            &mut items,
+            "manifest_config_root_match",
+            runtime_config_root == *config_root,
+            format!(
+                "manifest={} runtime={}",
+                config_root.display(),
+                runtime_config_root.display()
+            ),
+        );
+    }
 
     for component in &manifest.components {
         let installed_path = install_root.join(&component.install_relative_path);
@@ -309,6 +327,18 @@ fn run_bootstrap_check(cli: &CliArgs) -> Result<BootstrapCheckReport> {
             !component.required || installed_path.exists(),
             format!("{}", installed_path.display()),
         );
+    }
+
+    if manifest.platform == InstallPlatform::Linux {
+        for service_unit in &manifest.service_units {
+            let installed_unit = PathBuf::from("/etc/systemd/system").join(&service_unit.unit_name);
+            push_check(
+                &mut items,
+                format!("service_unit:{}", service_unit.name),
+                !service_unit.required || installed_unit.exists(),
+                installed_unit.display().to_string(),
+            );
+        }
     }
 
     for dependency in &manifest.release_dependencies {

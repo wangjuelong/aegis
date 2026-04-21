@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 BUILD_DIR="$ROOT_DIR/build"
 INCLUDE_DIR="$BUILD_DIR/include"
+VENDORED_INCLUDE_DIR="$ROOT_DIR/include"
+VMLINUX_HEADER_OVERRIDE=${AEGIS_BTF_VMLINUX_HEADER:-}
 
 require_tool() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -23,11 +25,25 @@ target_arch() {
   esac
 }
 
-require_tool bpftool
 require_tool clang
+if [[ -z "$VMLINUX_HEADER_OVERRIDE" ]]; then
+  require_tool bpftool
+fi
 
 mkdir -p "$INCLUDE_DIR"
-bpftool btf dump file /sys/kernel/btf/vmlinux format c >"$INCLUDE_DIR/vmlinux.h"
+if [[ ! -f "$VENDORED_INCLUDE_DIR/bpf/bpf_helpers.h" ]]; then
+  echo "missing vendored libbpf headers under $VENDORED_INCLUDE_DIR/bpf" >&2
+  exit 1
+fi
+if [[ -n "$VMLINUX_HEADER_OVERRIDE" ]]; then
+  if [[ ! -f "$VMLINUX_HEADER_OVERRIDE" ]]; then
+    echo "missing AEGIS_BTF_VMLINUX_HEADER: $VMLINUX_HEADER_OVERRIDE" >&2
+    exit 1
+  fi
+  cp "$VMLINUX_HEADER_OVERRIDE" "$INCLUDE_DIR/vmlinux.h"
+else
+  bpftool btf dump file /sys/kernel/btf/vmlinux format c >"$INCLUDE_DIR/vmlinux.h"
+fi
 
 ARCH=$(target_arch)
 CFLAGS=(
@@ -37,6 +53,7 @@ CFLAGS=(
   bpf
   -D__TARGET_ARCH_"$ARCH"
   -I"$INCLUDE_DIR"
+  -I"$VENDORED_INCLUDE_DIR"
   -I/usr/include/x86_64-linux-gnu
 )
 
