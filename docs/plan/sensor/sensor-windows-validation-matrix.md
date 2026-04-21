@@ -7,6 +7,7 @@
 - 本地输出：`target/windows-validation/192.168.2.218.json`
 - W15 本地输出：`target/windows-validation/192.168.2.222.json`
 - W16 本地输出：`target/windows-validation/192.168.2.222.json`
+- W17 本地输出：`target/windows-validation/192.168.2.222.json`
 - 实际验证时间：`2026-04-20 18:05:12 +08:00`
 - 实际验证 ID：`windows-runtime-20260420-180434`
 - W10 补充验证时间：`2026-04-20 16:46:03 +08:00`
@@ -23,6 +24,8 @@
 - W15 补充验证方式：远端重构建并安装 `AegisSensorKmod`，执行注册表保护路径下发、受保护键写入阻断与 registry journal `blocked=true` 验收
 - W16 补充验证时间：`2026-04-21 12:16:16 +08:00`
 - W16 补充验证方式：远端重构建并安装 `AegisSensorKmod + AegisFileMonitor`，执行 `block_path` / `block_pid` / `block_hash` 三类真实阻断、`block-*` 事件回传与 block 清空验收
+- W17 补充验证时间：`2026-04-21 14:04:08 +08:00`
+- W17 补充验证方式：远端重构建并安装 `AegisSensorKmod + AegisFileMonitor`，执行 `file_target_path_protection`，验证外部文件 `move` / `hardlink` 进入受保护目录失败
 
 ## 2. 主机选择结果
 
@@ -54,6 +57,7 @@
 | `network_inventory` | pass | `TCP=144`，`UDP=62` |
 | `firewall_block` | pass | 成功创建并清理 `AegisValidation-55b576db` rule group |
 | `registry_protection` | pass | 在 `192.168.2.222` 下发 `\\REGISTRY\\MACHINE\\SOFTWARE\\AegisValidation\\RegistryProtection\\windows-runtime-20260421-111721`，写入 `BlockedValue` 返回“尝试执行未经授权的操作”，journal 记录 `blocked=true` |
+| `file_target_path_protection` | pass | 在 `192.168.2.222` 下发受保护目录后，外部文件 `MoveFileEx` / `CreateHardLink` 进入目录均失败 |
 | `preemptive_blocking` | pass | 在 `192.168.2.222` 下发 `block_path` / `block_pid` / `block_hash` 后，路径创建/重命名/删除、目标 PID 写入、命中 hash 的文件打开均被拒绝，且 Minifilter 记录 `block-path` / `block-pid` / `block-hash` 事件并在清空后返回 `block_entry_count=0` |
 | `named_pipe_inventory` | pass | 成功枚举命名管道样本，包括 `InitShutdown`、`lsass`、`ntsvcs` |
 | `module_inventory` | pass | 成功读取 `1Password.exe` 进程模块清单 |
@@ -109,6 +113,9 @@
 - W16 验收摘要：`C:\ProgramData\Aegis\validation\windows-runtime-20260421-121355\summary.json`
 - W16 远端 payload 根目录：`C:\ProgramData\Aegis\validation\windows-runtime-verify-20260421-121345`
 - W16 关键结果：`{"path_blocked":true,"pid_blocked":true,"hash_blocked":true,"block_path_event":true,"block_pid_event":true,"block_hash_event":true,"block_entry_count_after_clear":0,"required_failures":[]}`
+- W17 验收摘要：`C:\ProgramData\Aegis\validation\windows-runtime-20260421-140132\summary.json`
+- W17 远端 payload 根目录：`C:\ProgramData\Aegis\validation\windows-runtime-verify-20260421-140122`
+- W17 关键结果：`{"move_into_protected_dir_blocked":true,"hardlink_into_protected_dir_blocked":true,"required_failures":[]}`
 
 ## 6. 结论
 
@@ -121,4 +128,5 @@
 - `W14` 已额外验证通过 release 清单、代码签名/验签、安装前后 release gate 与批准文件依赖校验；当前仓库已具备严格失败的 Windows release 验收入口。
 - `W15` 已额外验证通过注册表真实保护链：`protect_registry` 可下发真实内核路径，受保护注册表写入被驱动 pre-callback 拒绝，journal 与审计工件均反映真实保护状态。
 - `W16` 已额外验证通过 `block_hash` / `block_pid` / `block_path` 真实阻断链：Minifilter 权威 block map、TTL、事件回传与清空链路已经闭环，`WindowsPlatform` 不再把这三项能力维持在 audit-only 工件阶段。
+- `W17` 已额外验证通过目标路径保护链：`protect_files` 已能阻断外部文件 move / hardlink 进入受保护目录，目标路径绕过缺口已关闭。
 - `security_4688` 的验收口径以“日志可读、record_id 可取”为准；`cmd.exe` 临时探针命中率被保留为观察项，不作为失败条件。

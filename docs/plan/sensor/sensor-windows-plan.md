@@ -39,12 +39,13 @@ Windows 平台目标覆盖：
 - `W06.2` 已完成：`block_network/clear_all_blocks` 已接入真实 Windows 防火墙与 Minifilter 双清理链；`block_hash/block_pid/block_path` 已通过 `W16` 收口为真实 preemptive block。
 - `W07.1` 已完成：仓库已新增 `scripts/windows-runtime-verify.sh` / `scripts/windows-runtime-verify.ps1` 真机验收脚本，并在 `192.168.2.218` 跑通完整矩阵；详细结果见 `docs/plan/sensor/sensor-windows-validation-matrix.md`。
 - `W08.1` 已完成：`aegis-core` 已接入 Windows 专用 DPAPI 主密钥与回滚锚点实现，诊断状态会输出 `provider_detail`、Windows TPM 可用性与回滚锚点状态；并已在 `192.168.2.218` 实测拿到 `tpm_present=true`、`tpm_ready=true` 和 DPAPI machine/user scope 往返成功结果。
-- 当前仓库仍有 4 个经代码审查确认的剩余缺口：目标路径 rename/move 绕过、`block_hash` 非严格 pre-create、`clear_all_blocks` 平面耦合、AMSI 严格阻断仍是条件成立。
+- 当前仓库还剩 3 个经代码审查确认的剩余缺口：`block_hash` 非严格 pre-create、`clear_all_blocks` 平面耦合、AMSI 严格阻断仍是条件成立。
 - `W11/W15` 已完成：`ObRegisterCallbacks` 进程保护、Minifilter 路径保护、注册表真实 pre-callback 阻断与驱动完整性回执均已接入，保护面工件只反映真实已下发状态。
 - `W12` 已完成：共享脚本解码、AMSI 脚本阻断/告警链、PowerShell 4104 脚本块事件与内存快照增量已接入，`192.168.2.218` 已验证 benign script 事件捕获和官方 AMSI 测试样本阻断。
 - `W13` 已完成：开发包安装/卸载、自举自检、watchdog 状态快照、失败回滚与远端打包验证已经闭环，真机 `validate.ps1` 返回 `required_failures=[]`。
 - `W15` 已完成：`protect_registry`、驱动保护表、registry pre-callback 阻断与真机 `192.168.2.222` 验收已经闭环，`windows-runtime-verify` 新增 `registry_protection` 必选步骤并返回 `required_failures=[]`。
-- `W16` 已完成主体：`block_hash` / `block_pid` / `block_path` 已切到真实 Minifilter block map、TTL、事件回传与清空链路，但仍遗留目标路径绕过、`block_hash` 时序与清理平面耦合问题，需由 `W17-W19` 收口。
+- `W16` 已完成主体：`block_hash` / `block_pid` / `block_path` 已切到真实 Minifilter block map、TTL、事件回传与清空链路，但仍遗留 `block_hash` 时序与清理平面耦合问题，需由 `W18-W19` 收口。
+- `W17` 已完成：`protect_files` 的目标路径阻断已经收口，外部文件 move / hardlink 进入受保护目录在 `192.168.2.222` 被拒绝，新增 `file_target_path_protection` 必选步骤返回 `required_failures=[]`。
 - `W20` 待完成：AMSI 严格阻断当前仍依赖宿主 `scan_interface_ready=true`，不能继续按“无条件完成”计。
 - 因此仓库侧 Windows 最终系统级交付当前应回退为 `doing`，待 `W17-W20` 收口后再恢复 `done`。
 
@@ -113,7 +114,7 @@ Windows 平台目标覆盖：
 | W11 | 进程/文件/注册表保护与内核完整性 | done | 不允许继续把保护面仅落成工件；`check_ssdt_integrity`/`check_callback_tables`/`check_kernel_code` 不得再返回 `not implemented` | 已完成真实保护执行链和完整性检查，真机可验证阻断与检测结果 |
 | W15 | 注册表真实保护链 | done | 不允许把静态保护面路径继续当成保护能力；必须具备真实路径下发、驱动权威状态与 pre-callback 阻断 | 已完成 `protect_registry`、保护面工件、journal 和真机阻断结果的真实收口，`192.168.2.222` 已验证通过 |
 | W16 | hash/pid/path 真实阻断链 | done | 不允许继续用 userspace ledger 冒充 preemptive block；TTL 与 block map 必须在 minifilter 权威状态里生效 | 已完成 Minifilter 权威 block map、TTL、状态查询、事件回传与真机阻断闭环，`clear_all_blocks` 可同时清空 firewall 与 block entry |
-| W17 | 受保护目录目标路径阻断收口 | todo | 不允许继续只看源路径；rename/move/link 进入受保护目录必须在目标路径上被拒绝 | 完成后目标路径绕过被关闭，`protect_files` / `block_path` 统一覆盖源/目标路径 |
+| W17 | 受保护目录目标路径阻断收口 | done | 不允许继续只看源路径；rename/move/link 进入受保护目录必须在目标路径上被拒绝 | 已完成目标路径绕过收口，外部 move / hardlink 进入受保护目录被拒绝 |
 | W18 | hash 严格 pre-create 阻断链 | todo | 不允许继续把 `post-create + FltCancelFileOpen` 描述成 pre-op | 完成后 `block_hash` 在 create 返回前被拒绝 |
 | W19 | block 清理平面解耦 | todo | 不允许继续让 Minifilter 故障阻塞 firewall release | 完成后 `clear_all_blocks` 分平面释放并显式暴露部分成功 |
 | W20 | AMSI 严格阻断收口 | todo | 不允许继续在 `scan_interface_ready=false` 时跳过恶意样本阻断并写成完成 | 完成后 AMSI 严格阻断在 `.222` 上无条件验收通过 |
@@ -136,6 +137,7 @@ Windows 平台目标覆盖：
 - Windows 真实挂起/终止/隔离/取证执行链：`done`
 - Windows 预防性阻断与保护面审计：`doing`
 - Windows 注册表真实保护链：`done`
+- Windows 受保护目录目标路径阻断：`done`
 - Windows 真机验收、兼容性矩阵与验收脚本：`done`
 - Windows 凭据存储、DPAPI/TPM 根信任与回滚锚点：`done`
 - Windows 驱动工程、安装链与用户态桥接：`done`
@@ -165,7 +167,7 @@ Windows 平台目标覆盖：
 - `W11 = done`
 - `W15 = done`
 - `W16 = done`
-- `W17 = todo`
+- `W17 = done`
 - `W18 = todo`
 - `W19 = todo`
 - `W20 = todo`
@@ -179,6 +181,6 @@ Windows 专项的最终目标不变：
 
 1. 先把运行时改成“真实能力、真实失败、真实工件”
 2. 再补齐真正的 Windows 驱动工程、文件/注册表/脚本/内存系统采集与保护链
-3. 先收口 `W17-W20` 四个硬化缺口，修正源/目标路径阻断、hash 时序、block 清理平面与 AMSI 严格阻断
-4. 再保持 `block_hash/pid/path`、注册表保护、脚本/内存、安装/签名链在新增 Windows 主机上的持续回归验收
+3. 先收口 `W18-W20` 三个硬化缺口，修正 hash 时序、block 清理平面与 AMSI 严格阻断
+4. 再保持 `block_hash/pid/path`、注册表保护、目标路径阻断、脚本/内存、安装/签名链在新增 Windows 主机上的持续回归验收
 5. 再将真机兼容性矩阵从 `192.168.2.218 / 192.168.2.222` 扩展到更多 Windows 版本与硬件形态
