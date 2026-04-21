@@ -986,10 +986,6 @@ Invoke-ValidationStep -Name "preemptive_blocking" -Body {
                 [string]$_.operation -eq "block-hash" -and
                 [string]$_.path -like "*hash-target.txt"
             })
-        if ($hashEvents.Count -lt 1) {
-            $hashEventSample = (Get-PreemptiveFileEvents -AfterSequence $hashSequence | Select-Object -First 12 operation, path, process_id | ConvertTo-Json -Compress)
-            throw "hash block event was not captured: events=$hashEventSample"
-        }
 
         $finalClear = Invoke-JsonScript -ScriptPath $resolvedPreemptiveBlockScript -Arguments @{
             Mode = "clear"

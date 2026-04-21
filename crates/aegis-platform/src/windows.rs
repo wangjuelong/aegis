@@ -1006,6 +1006,10 @@ struct WindowsBlockAuditArtifact {
 struct WindowsBlockClearArtifact {
     cleared_block_count: usize,
     cleared_rule_groups: Vec<String>,
+    minifilter_blocks_cleared: usize,
+    firewall_clear_error: Option<String>,
+    minifilter_clear_error: Option<String>,
+    remaining_blocks: Vec<BlockLease>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -1574,49 +1578,100 @@ impl PreemptiveBlock for WindowsPlatform {
 
     fn clear_all_blocks(&self) -> Result<()> {
         let mut state = self.state.lock().expect("windows state poisoned");
-        let cleared_block_count = state.execution.active_blocks.len();
-        let has_non_network_blocks = state
-            .execution
-            .active_blocks
-            .iter()
-            .any(|lease| lease.kind != "network");
-        if has_non_network_blocks && !state.host.file_monitor_ready() {
-            bail!(
-                "clear windows blocks requires minifilter control port {}; {}",
-                AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
-                state.host.summary()
-            );
-        }
+        let active_blocks = state.execution.active_blocks.clone();
+        let cleared_block_count = active_blocks.len();
+        let has_non_network_blocks = active_blocks.iter().any(|lease| lease.kind != "network");
+        let mut firewall_clear_error = None;
+        let mut minifilter_clear_error = None;
+        let mut minifilter_blocks_cleared = 0usize;
+        let mut cleared_rule_groups = Vec::new();
+
         if state.host.file_monitor_ready() {
-            let response = clear_windows_preemptive_blocks(
+            match clear_windows_preemptive_blocks(
                 self.runner.as_ref(),
                 AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
-            )
-            .with_context(|| "clear windows minifilter block entries")?;
-            if response.protocol_version != AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION {
-                bail!(
-                    "windows block clear protocol mismatch: expected 0x{expected:08x}, got 0x{actual:08x}",
-                    expected = AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION,
-                    actual = response.protocol_version
-                );
+            ) {
+                Ok(response) => {
+                    if response.protocol_version != AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION {
+                        minifilter_clear_error = Some(format!(
+                            "windows block clear protocol mismatch: expected 0x{expected:08x}, got 0x{actual:08x}",
+                            expected = AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION,
+                            actual = response.protocol_version
+                        ));
+                    } else {
+                        minifilter_blocks_cleared =
+                            active_blocks.iter().filter(|lease| lease.kind != "network").count();
+                        if let Err(error) =
+                            sync_windows_preemptive_block_state(&mut state, self.runner.as_ref())
+                                .with_context(
+                                    || "synchronize windows preemptive block state after clear",
+                                )
+                        {
+                            minifilter_clear_error = Some(error.to_string());
+                        }
+                    }
+                }
+                Err(error) => {
+                    minifilter_clear_error =
+                        Some(format!("clear windows minifilter block entries: {error}"));
+                }
             }
-            sync_windows_preemptive_block_state(&mut state, self.runner.as_ref())
-                .with_context(|| "synchronize windows preemptive block state after clear")?;
+        } else if has_non_network_blocks {
+            minifilter_clear_error = Some(format!(
+                "minifilter control port unavailable: {}",
+                state.host.summary()
+            ));
         }
-        let cleared_rule_groups = state.block_rule_groups.clone();
-        if !cleared_rule_groups.is_empty() {
-            clear_windows_firewall_blocks(&mut state, self.runner.as_ref(), &cleared_rule_groups)
-                .with_context(|| "clear windows firewall block rules")?;
+
+        let configured_rule_groups = state.block_rule_groups.clone();
+        if !configured_rule_groups.is_empty() {
+            match clear_windows_firewall_blocks(
+                &mut state,
+                self.runner.as_ref(),
+                &configured_rule_groups,
+            ) {
+                Ok(()) => {
+                    cleared_rule_groups = configured_rule_groups.clone();
+                }
+                Err(error) => {
+                    firewall_clear_error = Some(format!("clear windows firewall block rules: {error}"));
+                }
+            }
         }
-        state.execution.active_blocks.clear();
-        state.block_rule_groups.clear();
+
+        let remaining_blocks = active_blocks
+            .into_iter()
+            .filter(|lease| match lease.kind.as_str() {
+                "network" => firewall_clear_error.is_some(),
+                _ => minifilter_clear_error.is_some(),
+            })
+            .collect::<Vec<_>>();
+        state.execution.active_blocks = remaining_blocks.clone();
+        if firewall_clear_error.is_none() {
+            state.block_rule_groups.clear();
+        }
         let artifact_path = write_windows_block_clear_artifact(
             &mut state,
             cleared_block_count,
             cleared_rule_groups,
+            minifilter_blocks_cleared,
+            firewall_clear_error.clone(),
+            minifilter_clear_error.clone(),
+            remaining_blocks.clone(),
         )?;
         state.execution.audit_artifacts.push(artifact_path);
-        Ok(())
+        match (firewall_clear_error, minifilter_clear_error) {
+            (None, None) => Ok(()),
+            (Some(firewall), Some(minifilter)) => bail!(
+                "clear windows blocks completed partially: firewall={firewall}; minifilter={minifilter}"
+            ),
+            (Some(firewall), None) => {
+                bail!("clear windows blocks completed partially: firewall={firewall}")
+            }
+            (None, Some(minifilter)) => {
+                bail!("clear windows blocks completed partially: minifilter={minifilter}")
+            }
+        }
     }
 }
 
@@ -3826,10 +3881,18 @@ fn write_windows_block_clear_artifact(
     state: &mut WindowsState,
     cleared_block_count: usize,
     cleared_rule_groups: Vec<String>,
+    minifilter_blocks_cleared: usize,
+    firewall_clear_error: Option<String>,
+    minifilter_clear_error: Option<String>,
+    remaining_blocks: Vec<BlockLease>,
 ) -> Result<PathBuf> {
     let artifact = WindowsBlockClearArtifact {
         cleared_block_count,
         cleared_rule_groups,
+        minifilter_blocks_cleared,
+        firewall_clear_error,
+        minifilter_clear_error,
+        remaining_blocks,
     };
     let path = state
         .base_dir
@@ -4579,8 +4642,8 @@ mod tests {
         AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION, AEGIS_WINDOWS_DRIVER_SERVICE_NAME,
     };
     use crate::{
-        KernelIntegrity, KernelTransport, PlatformProtection, PlatformResponse, PlatformRuntime,
-        PlatformSensor, PreemptiveBlock,
+        BlockLease, KernelIntegrity, KernelTransport, PlatformProtection, PlatformResponse,
+        PlatformRuntime, PlatformSensor, PreemptiveBlock,
     };
     use aegis_model::{EventBuffer, ForensicSpec, IsolationRulesV2, RollbackTarget, SensorConfig};
     use anyhow::{anyhow, bail, Result};
@@ -5714,6 +5777,59 @@ mod tests {
         let clear_json = fs::read_to_string(clear_artifact).expect("read clear artifact");
         assert!(clear_json.contains("\"cleared_block_count\": 1"));
         assert!(clear_json.contains("\"cleared_rule_groups\": []"));
+    }
+
+    #[test]
+    fn windows_clear_all_blocks_releases_firewall_when_minifilter_unavailable() {
+        let platform = WindowsPlatform::with_runner_for_test(
+            Box::new(QueuedWindowsRunner::new([
+                firewall_block_output("AegisBlock-test"),
+                String::new(),
+            ])),
+            healthy_host(),
+        );
+
+        platform
+            .block_network(
+                &aegis_model::NetworkTarget {
+                    value: "10.0.0.9".to_string(),
+                },
+                Duration::from_secs(120),
+            )
+            .expect("block network should create firewall rule");
+        {
+            let mut state = platform.state.lock().expect("windows state poisoned");
+            state.execution.active_blocks.push(BlockLease {
+                kind: "pid".to_string(),
+                target: "5150".to_string(),
+                ttl_secs: 45,
+            });
+        }
+
+        let error = platform
+            .clear_all_blocks()
+            .expect_err("clear should surface minifilter failure while releasing firewall");
+        assert!(error.to_string().contains("minifilter"));
+
+        let snapshot = platform.execution_snapshot();
+        assert_eq!(snapshot.active_blocks.len(), 1);
+        assert_eq!(snapshot.active_blocks[0].kind, "pid");
+        let clear_artifact = snapshot
+            .audit_artifacts
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .map(|value| value.starts_with("clear-"))
+                    .unwrap_or(false)
+            })
+            .expect("block clear artifact should exist");
+        let clear_json = fs::read_to_string(clear_artifact).expect("read clear artifact");
+        assert!(clear_json.contains("\"cleared_rule_groups\": ["));
+        assert!(clear_json.contains("AegisBlock-test"));
+        assert!(clear_json.contains("\"minifilter_clear_error\""));
+        assert!(clear_json.contains("\"remaining_blocks\""));
+        assert!(clear_json.contains("\"kind\": \"pid\""));
     }
 
     #[test]
