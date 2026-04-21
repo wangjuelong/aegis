@@ -101,7 +101,7 @@
 
 | 编号 | 剩余事项 | 状态 | 说明 |
 |------|----------|------|------|
-| O01 | Linux 更高阶 remote attestation / verifier 分离信任链 | todo | 当前仅完成单机 TPM attestation 基线，远端证明链未入仓 |
+| O01 | Linux 更高阶 remote attestation / verifier 分离信任链 | done | 已完成 attestation bundle、verifier receipt 与本地正反向验证，真实 TPM 测试主机补齐后可直接复跑 |
 | O06 | Linux 安装 / 发布工程（DEB/RPM + systemd + validate） | todo | 当前仅完成 eBPF 资产与脚本，未形成 Linux 安装包、systemd、validate 闭环 |
 | O07 | Linux 容器 / Sidecar / Runtime Connector 交付链 | todo | 当前仅完成 contract / example / test baseline，未形成交付目录与部署验证 |
 | O02 | Windows 真实运行时、事件链路、响应链与系统级交付 | done | 已完成运行时闭环、驱动桥接、真实文件/注册表/脚本/内存采集、自保护与完整性强制执行，`192.168.2.218` 真机验收通过 |

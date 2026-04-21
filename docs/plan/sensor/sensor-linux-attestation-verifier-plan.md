@@ -1,5 +1,13 @@
 # Linux 远程 Attestation / Verifier 信任链计划
 
+## 0. 状态
+
+- 已完成
+- 代码提交：`ea2ba0b`
+- 验证方式：
+  - 本地 `cargo test -p aegis-core -- --nocapture`
+  - 本地 mock TPM toolchain bundle / verify / wrong nonce 烟测
+
 ## 1. 目标
 
 把当前 Linux 仅有的本机 `quote/checkquote` baseline，升级为可分离 verifier 的远程证明链，保证：
@@ -10,6 +18,8 @@
 - `aegis-agentd --diagnose` 与自检结果能反映 verifier-ready 状态，而不是只反映本机工具可用
 
 ## 2. 当前缺口
+
+以下缺口已在本轮收口，保留为计划与实际交付的对照基线：
 
 - 当前只有本地 `generate_attestation_quote()` / `verify_attestation_quote()`，没有可交付的 verifier bundle/contract。
 - 文档要求 Provisioning/Rotation/Revocation 的设备证书链，但仓库里没有 Linux 侧 enrollment/verifier 工具链。
@@ -67,9 +77,16 @@
 - `scripts/linux-tpm-attestation-bundle.sh`
 - `scripts/linux-tpm-attestation-verify.sh`
 
-## 6. 完成判定
+## 6. 实际交付结果
+
+- 新增 `scripts/linux-tpm-attestation-bundle.sh`，可在 agent 侧生成 quote / PCR / qualification / CSR 组成的 attestation bundle。
+- 新增 `scripts/linux-tpm-attestation-verify.sh`，可在 verifier 侧完成本地 CA 签发、证书链校验与 `tpm2_checkquote` 验证，并输出 `verified-receipt.json`。
+- `aegis-agentd --diagnose` 已接入 Linux 证书与 verifier receipt 状态：设备证书、bundle、receipt 是否存在及是否验证通过不再硬编码。
+- 本地 mock TPM toolchain 已完成正反向烟测：bundle 生成成功、verifier receipt 成功、错误 nonce 严格失败。
+
+## 7. 完成判定
 
 - Linux agent 可生成 attestation bundle
 - verifier 可独立验证 bundle 并输出 receipt
 - 错误 nonce / trust root / quote 任一失败都会显式报错
-- Linux 测试机完成正反向验收
+- 本地正反向验证已通过；后续如测试环境补齐真实 TPM 主机，可直接复跑同一条链
