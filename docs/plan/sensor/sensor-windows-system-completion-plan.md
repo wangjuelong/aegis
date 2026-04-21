@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 用户态、Windows WDM/Minifilter/WFP 驱动工程、PowerShell/SSH 真机验收、MSBuild/Windows Kits/Signtool、MSI/INF/CAT 打包与签名校验。
 
-## 当前进度（2026-04-20）
+## 当前进度（2026-04-21）
 
 | 工作包 | 状态 | 结果 |
 |--------|------|------|
@@ -18,7 +18,7 @@
 | `W12` | `done` | 已完成共享脚本解码、AMSI 脚本阻断/告警链与内存信号采集，`192.168.2.218` 真机验证通过 |
 | `W13` | `done` | 已完成开发包安装/卸载、自举自检、watchdog 状态闭环与远端真机验收，`required_failures=[]` |
 | `W14` | `done` | 已完成 release 清单、签名/验签脚本、安装前后 release gate 与 Windows 11 真机发布验证；外部证书/审批缺失时严格失败 |
-| `W15` | `todo` | 收口注册表真实保护链：接口、驱动控制面、pre-callback 阻断、真机验收 |
+| `W15` | `done` | 已完成 `protect_registry`、驱动保护表、registry pre-callback 阻断与 `192.168.2.222` 真机验收 |
 | `W16` | `todo` | 收口 `block_hash/pid/path` 真实阻断链：minifilter block map、TTL、状态查询、真机验收 |
 
 ---
@@ -34,11 +34,9 @@
 
 ## 2. 当前缺口
 
-- 开发包安装、自举、自检、watchdog 与失败回滚链已完成，但仍未形成正式发布包。
-- 缺少正式 MSI/驱动打包、驱动签名、ELAM 依赖校验、支持矩阵验收。
-- 测试机 `192.168.2.218` 可用；`192.168.1.4` 当前不可达，不能作为主验收机。
-- 新增测试机 `192.168.2.222` 可用，作为 Windows 11 补充验收主机，承接 `W15/W16` 真机闭环。
-- 当前仓库没有可用的正式代码签名证书或 `pfx/cer` 资产；正式签名链必须依赖外部凭据注入。
+- 当前唯一剩余的功能缺口是 `W16`：`block_hash/block_pid/block_path` 仍未成为真实 pre-op 阻断。
+- 测试机 `192.168.2.218` 与 `192.168.2.222` 均可用；`192.168.1.4` 当前不可达，不作为当前验收主机。
+- `W14` 需要的签名、验签、批准文件依赖已经形成严格失败链路，但正式 `pfx/cer` 资产仍由外部发布环境注入。
 
 ## 3. 研发工作包
 
@@ -222,52 +220,6 @@
 **状态**
 
 - 已完成，真机主机：`192.168.2.218`
-
-### W15: 注册表真实保护链
-
-**状态**
-
-- `todo`
-- 目标主机：`192.168.2.222`
-
-**目标**
-
-- 为 Windows 平台补齐一等注册表保护接口与真实内核阻断。
-- 让 `CmRegisterCallbackEx` 在键/值创建、修改、删除前执行实时保护判定。
-- 让保护面工件和运行时状态只反映真实已下发保护路径。
-
-**完成判定**
-
-- `protect_registry` 能下发真实保护路径并返回驱动回执。
-- 键/值创建、修改、删除在保护面上被拒绝，并进入 journal。
-- `windows-runtime-verify` 新增 `registry_protection` 必选步骤，`192.168.2.222` 真机通过。
-
-**详细计划**
-
-- `docs/plan/sensor/sensor-windows-registry-protection-plan.md`
-
-### W16: hash/pid/path 真实阻断链
-
-**状态**
-
-- `todo`
-- 目标主机：`192.168.2.222`
-
-**目标**
-
-- 为 Windows Minifilter 增加 block map、TTL 与状态查询。
-- 让 `block_hash`、`block_pid`、`block_path` 成为真实 pre-op 阻断，而不是 userspace ledger。
-- 让 `clear_all_blocks` 清空 firewall 与 minifilter 权威 block 状态。
-
-**完成判定**
-
-- `block_hash/pid/path` 审计工件全部为 `enforced=true`。
-- Minifilter 状态可查询真实 block 计数与类型分布。
-- `windows-runtime-verify` 新增 `preemptive_blocking` 必选步骤，`192.168.2.222` 真机通过。
-
-**详细计划**
-
-- `docs/plan/sensor/sensor-windows-preemptive-block-plan.md`
 - 已验证 `bundle_channel=release` 的签名、验签、安装前 release gate、安装后 release gate 与卸载闭环
 - 远端验证时间：`2026-04-20 21:09:35 +08:00`
 - 远端 payload：`C:\ProgramData\Aegis\validation\windows-package-verify-20260420-200129`
@@ -303,6 +255,66 @@
 - 修改：`docs/plan/sensor/sensor-windows-validation-matrix.md`
 - 修改：`docs/release/aegis-sensor-release-notes.md`
 
+### W15: 注册表真实保护链
+
+**状态**
+
+- 已完成，真机主机：`192.168.2.222`
+- 已验证 `protect_registry` 真实下发、保护路径状态回执、registry pre-callback 阻断与 journal `blocked=true`
+- 远端验证时间：`2026-04-21 11:17:56 +08:00`
+- 远端 payload：`C:\ProgramData\Aegis\validation\windows-runtime-verify-20260421-111712`
+- 代码提交：`9061fea`
+
+**目标**
+
+- 为 Windows 平台补齐一等注册表保护接口与真实内核阻断。
+- 让 `CmRegisterCallbackEx` 在键/值创建、修改、删除前执行实时保护判定。
+- 让保护面工件和运行时状态只反映真实已下发保护路径。
+
+**完成判定**
+
+- `protect_registry` 能下发真实保护路径并返回驱动回执。
+- 键/值创建、修改、删除在保护面上被拒绝，并进入 journal。
+- `windows-runtime-verify` 新增 `registry_protection` 必选步骤，`192.168.2.222` 真机通过。
+
+**关键文件**
+
+- 修改：`crates/aegis-platform/src/traits.rs`
+- 修改：`crates/aegis-platform/src/windows.rs`
+- 修改：`windows/driver/include/aegis_windows_driver_protocol.h`
+- 修改：`windows/driver/src/aegis_sensor_kmod.c`
+- 新增：`scripts/windows-configure-registry-protection.ps1`
+- 修改：`scripts/windows-query-registry-events.ps1`
+- 修改：`scripts/windows-runtime-verify.ps1`
+- 修改：`scripts/windows-runtime-verify.sh`
+
+**详细计划**
+
+- `docs/plan/sensor/sensor-windows-registry-protection-plan.md`
+
+### W16: hash/pid/path 真实阻断链
+
+**状态**
+
+- `todo`
+- 目标主机：`192.168.2.222`
+
+**目标**
+
+- 为 Windows Minifilter 增加 block map、TTL 与状态查询。
+- 让 `block_hash`、`block_pid`、`block_path` 成为真实 pre-op 阻断，而不是 userspace ledger。
+- 让 `clear_all_blocks` 清空 firewall 与 minifilter 权威 block 状态。
+
+**完成判定**
+
+- `block_hash/pid/path` 审计工件全部为 `enforced=true`。
+- Minifilter 状态可查询真实 block 计数与类型分布。
+- `windows-runtime-verify` 新增 `preemptive_blocking` 必选步骤，`192.168.2.222` 真机通过。
+
+**详细计划**
+
+- `docs/plan/sensor/sensor-windows-preemptive-block-plan.md`
+
 ## 4. 验证矩阵
 
 - 本地 Rust 单元测试：
@@ -324,6 +336,6 @@
 
 ## 5. 外部前提
 
-- `192.168.2.218` 当前是唯一已验证可用的 Windows 主机。
+- `192.168.2.218` 与 `192.168.2.222` 均已验证可用，分别承接 `W12-W14` 与 `W15/W16` 真机验收。
 - 正式代码签名、驱动签发、ELAM 相关验证需要外部证书与 Microsoft 签发链；仓库内不能伪造这条链路。
 - 当前仓库侧 `W14` 已通过“外部证书/批准文件注入 + 缺失即失败”的 release 验收；Microsoft 正式签发、多版本试点扩容仍属于仓库外流程，不在仓库内伪造。

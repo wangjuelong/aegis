@@ -1,5 +1,13 @@
 # Windows 注册表真实保护研发计划
 
+## 0. 状态
+
+- 已完成
+- 代码提交：`9061fea`
+- 真机主机：`192.168.2.222`
+- 远端验收时间：`2026-04-21 11:17:56 +08:00`
+- 验收 ID：`windows-runtime-20260421-111721`
+
 ## 1. 目标
 
 把 Windows 当前“注册表 journal + rollback + 静态保护面工件”的实现，升级为真正的注册表保护链路：
@@ -11,6 +19,8 @@
 - `PlatformProtection`/`provider_health`/运行时验证全部反映真实状态
 
 ## 2. 当前缺口
+
+以下缺口已在本轮收口，保留为计划与实际交付的对照基线：
 
 - `PlatformProtection` 没有 `protect_registry`，平台接口层不存在一等能力。
 - `aegis_sensor_kmod.c` 的注册表回调只记录 `RegNtPreSetValueKey` / `RegNtPreDeleteValueKey`，并始终返回 `STATUS_SUCCESS`。
@@ -39,12 +49,10 @@
 - 在 `aegis_windows_driver_protocol.h` 增加：
   - `AEGIS_IOCTL_PROTECT_REGISTRY_PATH`
   - `AEGIS_IOCTL_CLEAR_PROTECTED_REGISTRY_PATHS`
-  - `AEGIS_IOCTL_QUERY_REGISTRY_PROTECTION`
 - 增加请求/响应结构：
   - 注册表保护写入请求
-  - 注册表保护状态响应
   - 注册表保护清空响应
-- `QUERY_STATUS` 回执增加 `ProtectedRegistryPathCount`
+- 复用 `QUERY_STATUS` 回执返回 `ProtectedRegistryPathCount`，不再单独拆分新的查询 IOCTL
 
 ### 4.3 驱动数据面
 
@@ -62,7 +70,7 @@
 ### 4.4 用户态桥接
 
 - 新增 `scripts/windows-configure-registry-protection.ps1`
-- 新增 `scripts/windows-query-registry-protection.ps1`
+- 统一通过 `Mode=status/protect/clear` 完成状态查询、路径下发与保护清空
 - `windows.rs` 通过嵌入脚本调用驱动控制面
 - `record_windows_protection_surface_artifact()` 记录真实保护路径而不是静态清单
 
@@ -88,11 +96,19 @@
 - `windows/driver/include/aegis_windows_driver_protocol.h`
 - `windows/driver/src/aegis_sensor_kmod.c`
 - `scripts/windows-configure-registry-protection.ps1`
-- `scripts/windows-query-registry-protection.ps1`
 - `scripts/windows-query-registry-events.ps1`
 - `scripts/windows-runtime-verify.ps1`
 
-## 6. 完成判定
+## 6. 实际交付结果
+
+- `PlatformProtection` 已新增 `protect_registry(&self, selectors: &[String]) -> Result<()>`，并把真实受保护路径写入 `PlatformExecutionSnapshot.protected_registry_paths`。
+- Windows 驱动协议已新增 `AEGIS_IOCTL_PROTECT_REGISTRY_PATH` / `AEGIS_IOCTL_CLEAR_PROTECTED_REGISTRY_PATHS`，并在 `QUERY_STATUS` 中回传 `ProtectedRegistryPathCount`。
+- 内核驱动已维护受保护注册表路径表，并把 `RegNtPreSetValueKey`、`RegNtPreDeleteValueKey`、`RegNtPreCreateKeyEx`、`RegNtPreDeleteKey` 纳入统一 pre-callback 阻断。
+- 命中受保护路径时，驱动会写入带 `blocked=true` 的 registry journal 记录，并返回 `STATUS_ACCESS_DENIED`。
+- `windows-configure-registry-protection.ps1` 已统一提供 `status/protect/clear` 三种模式，`windows.rs` 通过该脚本下发真实内核路径，不再写入静态保护面常量。
+- `windows-runtime-verify.ps1` 已新增 `registry_protection` 必选步骤，并在 `192.168.2.222` 上验证受保护键写入被拒绝、journal 命中 `blocked=true`、最终 `required_failures=[]`。
+
+## 7. 完成判定
 
 - `protect_registry` 存在且 Windows 平台真实执行。
 - 受保护路径的注册表创建、修改、删除操作在真机 `192.168.2.222` 上被拒绝。
