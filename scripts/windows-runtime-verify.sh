@@ -19,6 +19,7 @@ MEMORY_SNAPSHOT_SCRIPT_PATH="${SCRIPT_DIR}/windows-query-memory-snapshot.ps1"
 REGISTRY_EVENT_QUERY_PATH="${SCRIPT_DIR}/windows-query-registry-events.ps1"
 REGISTRY_PROTECTION_SCRIPT_PATH="${SCRIPT_DIR}/windows-configure-registry-protection.ps1"
 FILE_EVENT_QUERY_PATH="${SCRIPT_DIR}/windows-query-file-events.ps1"
+FILE_PROTECTION_SCRIPT_PATH="${SCRIPT_DIR}/windows-configure-file-protection.ps1"
 MINIFILTER_INSTALL_SCRIPT_PATH="${SCRIPT_DIR}/windows-install-minifilter.ps1"
 MINIFILTER_UNINSTALL_SCRIPT_PATH="${SCRIPT_DIR}/windows-uninstall-minifilter.ps1"
 PREEMPTIVE_BLOCK_SCRIPT_PATH="${SCRIPT_DIR}/windows-configure-preemptive-block.ps1"
@@ -53,6 +54,7 @@ for path in \
   "$REGISTRY_EVENT_QUERY_PATH" \
   "$REGISTRY_PROTECTION_SCRIPT_PATH" \
   "$FILE_EVENT_QUERY_PATH" \
+  "$FILE_PROTECTION_SCRIPT_PATH" \
   "$MINIFILTER_INSTALL_SCRIPT_PATH" \
   "$MINIFILTER_UNINSTALL_SCRIPT_PATH" \
   "$PREEMPTIVE_BLOCK_SCRIPT_PATH"; do
@@ -87,6 +89,7 @@ sshpass -p "$PASSWORD" scp -r "${SSH_OPTS[@]}" \
   "$REGISTRY_EVENT_QUERY_PATH" \
   "$REGISTRY_PROTECTION_SCRIPT_PATH" \
   "$FILE_EVENT_QUERY_PATH" \
+  "$FILE_PROTECTION_SCRIPT_PATH" \
   "$MINIFILTER_INSTALL_SCRIPT_PATH" \
   "$MINIFILTER_UNINSTALL_SCRIPT_PATH" \
   "$PREEMPTIVE_BLOCK_SCRIPT_PATH" \
@@ -95,7 +98,7 @@ sshpass -p "$PASSWORD" scp -r "${SSH_OPTS[@]}" \
   "$USER_NAME@$HOST:${REMOTE_PAYLOAD_POSIX}/" >/dev/null
 
 RESULT_JSON=$(sshpass -p "$PASSWORD" ssh "${SSH_OPTS[@]}" "$USER_NAME@$HOST" \
-  "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${REMOTE_PAYLOAD_WIN}\\windows-runtime-verify.ps1\" -DriverRoot \"${REMOTE_PAYLOAD_WIN}\\driver\" -MinifilterRoot \"${REMOTE_PAYLOAD_WIN}\\minifilter\" -BuildScriptPath \"${REMOTE_PAYLOAD_WIN}\\windows-build-driver.ps1\" -BuildMinifilterScriptPath \"${REMOTE_PAYLOAD_WIN}\\windows-build-minifilter.ps1\" -InstallScriptPath \"${REMOTE_PAYLOAD_WIN}\\windows-install-driver.ps1\" -UninstallScriptPath \"${REMOTE_PAYLOAD_WIN}\\windows-uninstall-driver.ps1\" -InstallMinifilterScriptPath \"${REMOTE_PAYLOAD_WIN}\\windows-install-minifilter.ps1\" -UninstallMinifilterScriptPath \"${REMOTE_PAYLOAD_WIN}\\windows-uninstall-minifilter.ps1\" -FileEventQueryPath \"${REMOTE_PAYLOAD_WIN}\\windows-query-file-events.ps1\" -RegistryEventQueryPath \"${REMOTE_PAYLOAD_WIN}\\windows-query-registry-events.ps1\" -RegistryProtectionScriptPath \"${REMOTE_PAYLOAD_WIN}\\windows-configure-registry-protection.ps1\" -PreemptiveBlockScriptPath \"${REMOTE_PAYLOAD_WIN}\\windows-configure-preemptive-block.ps1\"")
+  "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${REMOTE_PAYLOAD_WIN}\\windows-runtime-verify.ps1\" -DriverRoot \"${REMOTE_PAYLOAD_WIN}\\driver\" -MinifilterRoot \"${REMOTE_PAYLOAD_WIN}\\minifilter\" -BuildScriptPath \"${REMOTE_PAYLOAD_WIN}\\windows-build-driver.ps1\" -BuildMinifilterScriptPath \"${REMOTE_PAYLOAD_WIN}\\windows-build-minifilter.ps1\" -InstallScriptPath \"${REMOTE_PAYLOAD_WIN}\\windows-install-driver.ps1\" -UninstallScriptPath \"${REMOTE_PAYLOAD_WIN}\\windows-uninstall-driver.ps1\" -InstallMinifilterScriptPath \"${REMOTE_PAYLOAD_WIN}\\windows-install-minifilter.ps1\" -UninstallMinifilterScriptPath \"${REMOTE_PAYLOAD_WIN}\\windows-uninstall-minifilter.ps1\" -FileEventQueryPath \"${REMOTE_PAYLOAD_WIN}\\windows-query-file-events.ps1\" -FileProtectionScriptPath \"${REMOTE_PAYLOAD_WIN}\\windows-configure-file-protection.ps1\" -RegistryEventQueryPath \"${REMOTE_PAYLOAD_WIN}\\windows-query-registry-events.ps1\" -RegistryProtectionScriptPath \"${REMOTE_PAYLOAD_WIN}\\windows-configure-registry-protection.ps1\" -PreemptiveBlockScriptPath \"${REMOTE_PAYLOAD_WIN}\\windows-configure-preemptive-block.ps1\"")
 
 printf '%s\n' "$RESULT_JSON" | tee "$OUTPUT_PATH"
 

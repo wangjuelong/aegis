@@ -40,6 +40,11 @@ static VOID AegisRecordFileEvent(
 static ULONG AegisProtectedPathCountUnlocked(VOID);
 static VOID AegisClearProtectedPaths(VOID);
 static NTSTATUS AegisAddProtectedPath(_In_ PCWSTR path);
+static VOID AegisCopyCanonicalPath(
+    _Out_writes_(destination_count) PWCHAR destination,
+    _In_ SIZE_T destination_count,
+    _In_opt_ PCUNICODE_STRING source
+);
 static BOOLEAN AegisPathMatchesPrefix(_In_ PCUNICODE_STRING prefix, _In_ PCUNICODE_STRING path);
 static BOOLEAN AegisPathMatchesProtectedPrefix(_In_ PCUNICODE_STRING path);
 static VOID AegisPruneExpiredBlockEntriesLocked(VOID);
@@ -68,11 +73,22 @@ static BOOLEAN AegisResolveFilePath(
     _Out_writes_(buffer_count) PWCHAR buffer,
     _In_ SIZE_T buffer_count
 );
+static BOOLEAN AegisResolveDestinationFilePath(
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _Out_writes_(buffer_count) PWCHAR buffer,
+    _In_ SIZE_T buffer_count
+);
 static BOOLEAN AegisCreateHasWriteIntent(_In_ PFLT_CALLBACK_DATA Data);
 static BOOLEAN AegisIsProtectedFileOperation(_In_ PFLT_CALLBACK_DATA Data);
 static FLT_PREOP_CALLBACK_STATUS AegisDenyFileOperation(
     _In_ PCWSTR operation,
     _Inout_ PFLT_CALLBACK_DATA Data
+);
+static FLT_PREOP_CALLBACK_STATUS AegisDenyFileOperationWithPath(
+    _In_ PCWSTR operation,
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCUNICODE_STRING Path
 );
 
 NTSTATUS
@@ -292,11 +308,75 @@ static NTSTATUS AegisAddProtectedPath(_In_ PCWSTR path) {
     return status;
 }
 
+static VOID AegisCopyCanonicalPath(
+    _Out_writes_(destination_count) PWCHAR destination,
+    _In_ SIZE_T destination_count,
+    _In_opt_ PCUNICODE_STRING source
+) {
+    PCWSTR start;
+    SIZE_T chars;
+    SIZE_T index;
+    ULONG slash_count = 0;
+
+    if (destination == NULL || destination_count == 0) {
+        return;
+    }
+
+    RtlZeroMemory(destination, destination_count * sizeof(WCHAR));
+    if (source == NULL || source->Buffer == NULL || source->Length == 0) {
+        return;
+    }
+
+    start = source->Buffer;
+    chars = source->Length / sizeof(WCHAR);
+    if (chars >= 4 &&
+        start[0] == L'\\' &&
+        start[1] == L'?' &&
+        start[2] == L'?' &&
+        start[3] == L'\\') {
+        start += 4;
+        chars -= 4;
+    }
+
+    if (chars >= 3 &&
+        ((start[0] >= L'A' && start[0] <= L'Z') || (start[0] >= L'a' && start[0] <= L'z')) &&
+        start[1] == L':' &&
+        start[2] == L'\\') {
+        start += 2;
+        chars -= 2;
+    } else if (chars >= 8 &&
+               start[0] == L'\\' &&
+               (start[1] == L'D' || start[1] == L'd')) {
+        for (index = 0; index < chars; index++) {
+            if (start[index] == L'\\') {
+                slash_count += 1;
+                if (slash_count == 3) {
+                    start += index;
+                    chars -= index;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (chars >= destination_count) {
+        chars = destination_count - 1;
+    }
+    if (chars > 0) {
+        RtlCopyMemory(destination, start, chars * sizeof(WCHAR));
+        destination[chars] = UNICODE_NULL;
+    }
+}
+
 static BOOLEAN AegisPathMatchesPrefix(
     _In_ PCUNICODE_STRING prefix,
     _In_ PCUNICODE_STRING path
 ) {
     SIZE_T prefix_chars;
+    WCHAR canonical_prefix_buffer[AEGIS_FILE_MAX_PATH_CHARS];
+    WCHAR canonical_path_buffer[AEGIS_FILE_MAX_PATH_CHARS];
+    UNICODE_STRING canonical_prefix;
+    UNICODE_STRING canonical_path;
 
     if (prefix == NULL || prefix->Buffer == NULL || prefix->Length == 0 ||
         path == NULL || path->Buffer == NULL || path->Length == 0) {
@@ -304,7 +384,26 @@ static BOOLEAN AegisPathMatchesPrefix(
     }
 
     if (!RtlPrefixUnicodeString(prefix, path, TRUE)) {
-        return FALSE;
+        AegisCopyCanonicalPath(
+            canonical_prefix_buffer,
+            RTL_NUMBER_OF(canonical_prefix_buffer),
+            prefix
+        );
+        AegisCopyCanonicalPath(
+            canonical_path_buffer,
+            RTL_NUMBER_OF(canonical_path_buffer),
+            path
+        );
+        RtlInitUnicodeString(&canonical_prefix, canonical_prefix_buffer);
+        RtlInitUnicodeString(&canonical_path, canonical_path_buffer);
+        if (canonical_prefix.Length == 0 ||
+            canonical_path.Length == 0 ||
+            !RtlPrefixUnicodeString(&canonical_prefix, &canonical_path, TRUE)) {
+            return FALSE;
+        }
+
+        prefix = &canonical_prefix;
+        path = &canonical_path;
     }
 
     prefix_chars = prefix->Length / sizeof(WCHAR);
@@ -596,6 +695,127 @@ static BOOLEAN AegisResolveFilePath(
     return buffer[0] != UNICODE_NULL;
 }
 
+static BOOLEAN AegisResolveDestinationFilePath(
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _Out_writes_(buffer_count) PWCHAR buffer,
+    _In_ SIZE_T buffer_count
+) {
+    PFLT_FILE_NAME_INFORMATION file_name_info = NULL;
+    HANDLE root_directory = NULL;
+    PWSTR file_name = NULL;
+    ULONG file_name_length = 0;
+    FILE_INFORMATION_CLASS info_class;
+    NTSTATUS status;
+    PFILE_OBJECT parent_of_target = NULL;
+
+    if (FltObjects == NULL ||
+        FltObjects->Instance == NULL ||
+        Data == NULL ||
+        buffer == NULL ||
+        buffer_count == 0) {
+        return FALSE;
+    }
+
+    RtlZeroMemory(buffer, buffer_count * sizeof(WCHAR));
+    info_class = Data->Iopb->Parameters.SetFileInformation.FileInformationClass;
+    parent_of_target = Data->Iopb->Parameters.SetFileInformation.ParentOfTarget;
+    switch (info_class) {
+        case FileRenameInformation:
+        case FileRenameInformationBypassAccessCheck:
+        case FileRenameInformationEx: {
+#ifdef FileRenameInformationExBypassAccessCheck
+        case FileRenameInformationExBypassAccessCheck:
+#endif
+            PFILE_RENAME_INFORMATION rename_info =
+                (PFILE_RENAME_INFORMATION)Data->Iopb->Parameters.SetFileInformation.InfoBuffer;
+            if (rename_info == NULL) {
+                return FALSE;
+            }
+            root_directory = rename_info->RootDirectory;
+            file_name = rename_info->FileName;
+            file_name_length = rename_info->FileNameLength;
+            break;
+        }
+        case FileLinkInformation:
+        case FileLinkInformationBypassAccessCheck:
+        case FileLinkInformationEx: {
+#ifdef FileLinkInformationExBypassAccessCheck
+        case FileLinkInformationExBypassAccessCheck:
+#endif
+            PFILE_LINK_INFORMATION link_info =
+                (PFILE_LINK_INFORMATION)Data->Iopb->Parameters.SetFileInformation.InfoBuffer;
+            if (link_info == NULL) {
+                return FALSE;
+            }
+            root_directory = link_info->RootDirectory;
+            file_name = link_info->FileName;
+            file_name_length = link_info->FileNameLength;
+            break;
+        }
+        default:
+            return FALSE;
+    }
+
+    if (file_name == NULL || file_name_length == 0) {
+        return FALSE;
+    }
+
+    if (parent_of_target != NULL && parent_of_target->FileName.Buffer != NULL) {
+        SIZE_T parent_chars;
+        SIZE_T child_chars;
+        SIZE_T offset;
+
+        AegisCopyUnicodeString(buffer, buffer_count, &parent_of_target->FileName);
+        parent_chars = wcslen(buffer);
+        offset = parent_chars;
+        if (offset > 0 && buffer[offset - 1] != L'\\') {
+            if (offset + 1 >= buffer_count) {
+                return FALSE;
+            }
+            buffer[offset++] = L'\\';
+            buffer[offset] = UNICODE_NULL;
+        }
+
+        child_chars = file_name_length / sizeof(WCHAR);
+        if (child_chars > 0 && file_name[0] == L'\\') {
+            file_name += 1;
+            child_chars -= 1;
+        }
+        if (offset + child_chars >= buffer_count) {
+            child_chars = buffer_count - offset - 1;
+        }
+        if (child_chars > 0) {
+            RtlCopyMemory(buffer + offset, file_name, child_chars * sizeof(WCHAR));
+            buffer[offset + child_chars] = UNICODE_NULL;
+            return TRUE;
+        }
+    }
+
+    if ((file_name_length / sizeof(WCHAR)) < buffer_count) {
+        RtlCopyMemory(buffer, file_name, file_name_length);
+        buffer[file_name_length / sizeof(WCHAR)] = UNICODE_NULL;
+    }
+
+    status = FltGetDestinationFileNameInformation(
+        FltObjects->Instance,
+        FltObjects->FileObject,
+        parent_of_target != NULL ? parent_of_target : root_directory,
+        file_name,
+        file_name_length,
+        FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_FILESYSTEM_ONLY,
+        &file_name_info
+    );
+    if (!NT_SUCCESS(status) || file_name_info == NULL) {
+        return buffer[0] != UNICODE_NULL;
+    }
+
+    FltParseFileNameInformation(file_name_info);
+    AegisCopyUnicodeString(buffer, buffer_count, &file_name_info->Name);
+    FltReleaseFileNameInformation(file_name_info);
+    return buffer[0] != UNICODE_NULL;
+}
+
 static NTSTATUS AegisComputeFileSha256Hex(
     _In_ PFLT_INSTANCE instance,
     _In_ PFILE_OBJECT file_object,
@@ -850,7 +1070,28 @@ static FLT_PREOP_CALLBACK_STATUS AegisDenyFileOperation(
     _In_ PCWSTR operation,
     _Inout_ PFLT_CALLBACK_DATA Data
 ) {
-    AegisRecordFileEvent(operation, Data);
+    return AegisDenyFileOperationWithPath(operation, Data, NULL);
+}
+
+static FLT_PREOP_CALLBACK_STATUS AegisDenyFileOperationWithPath(
+    _In_ PCWSTR operation,
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCUNICODE_STRING Path
+) {
+    AEGIS_FILE_EVENT_RECORD record;
+
+    RtlZeroMemory(&record, sizeof(record));
+    KeQuerySystemTime(&record.Timestamp);
+    record.ProcessId = (ULONG)FltGetRequestorProcessId(Data);
+    if (operation != NULL) {
+        RtlStringCchCopyW(record.Operation, RTL_NUMBER_OF(record.Operation), operation);
+    }
+    if (Path != NULL) {
+        AegisCopyUnicodeString(record.Path, RTL_NUMBER_OF(record.Path), Path);
+    } else {
+        AegisResolveFilePath(Data, record.Path, RTL_NUMBER_OF(record.Path));
+    }
+    AegisFileJournalPush(&record);
     Data->IoStatus.Status = STATUS_ACCESS_DENIED;
     Data->IoStatus.Information = 0;
     return FLT_PREOP_COMPLETE;
@@ -1211,12 +1452,16 @@ AegisFilePreSetInformation(
     FILE_INFORMATION_CLASS info_class;
     ULONG requestor_pid = (ULONG)FltGetRequestorProcessId(Data);
     WCHAR resolved_path_buffer[AEGIS_FILE_MAX_PATH_CHARS];
+    WCHAR destination_path_buffer[AEGIS_FILE_MAX_PATH_CHARS];
     UNICODE_STRING resolved_path;
+    UNICODE_STRING destination_path;
+    BOOLEAN has_destination_path = FALSE;
 
     UNREFERENCED_PARAMETER(FltObjects);
     UNREFERENCED_PARAMETER(CompletionContext);
 
     RtlZeroMemory(resolved_path_buffer, sizeof(resolved_path_buffer));
+    RtlZeroMemory(destination_path_buffer, sizeof(destination_path_buffer));
     if (AegisRequestorPidBlocked(requestor_pid)) {
         return AegisDenyFileOperation(L"block-pid", Data);
     }
@@ -1228,11 +1473,73 @@ AegisFilePreSetInformation(
     }
 
     info_class = Data->Iopb->Parameters.SetFileInformation.FileInformationClass;
-    if (info_class == FileRenameInformation || info_class == FileRenameInformationEx) {
+    has_destination_path = AegisResolveDestinationFilePath(
+        FltObjects,
+        Data,
+        destination_path_buffer,
+        RTL_NUMBER_OF(destination_path_buffer)
+    );
+    if (has_destination_path) {
+        RtlInitUnicodeString(&destination_path, destination_path_buffer);
+    }
+    if (info_class == FileRenameInformation ||
+        info_class == FileRenameInformationBypassAccessCheck ||
+        info_class == FileRenameInformationEx ||
+#ifdef FileRenameInformationExBypassAccessCheck
+        info_class == FileRenameInformationExBypassAccessCheck ||
+#endif
+        info_class == FileLinkInformation ||
+        info_class == FileLinkInformationBypassAccessCheck ||
+        info_class == FileLinkInformationEx
+#ifdef FileLinkInformationExBypassAccessCheck
+        || info_class == FileLinkInformationExBypassAccessCheck
+#endif
+        ) {
+        if (has_destination_path && AegisPathMatchesBlockPrefix(&destination_path)) {
+            return AegisDenyFileOperationWithPath(
+                L"block-pth-dst",
+                Data,
+                &destination_path
+            );
+        }
+    }
+
+    if (info_class == FileRenameInformation ||
+        info_class == FileRenameInformationBypassAccessCheck ||
+        info_class == FileRenameInformationEx
+#ifdef FileRenameInformationExBypassAccessCheck
+        || info_class == FileRenameInformationExBypassAccessCheck
+#endif
+        ) {
         if (AegisIsProtectedFileOperation(Data)) {
             return AegisDenyFileOperation(L"block-rename", Data);
         }
+        if (has_destination_path && AegisPathMatchesProtectedPrefix(&destination_path)) {
+            return AegisDenyFileOperationWithPath(
+                L"block-ren-dst",
+                Data,
+                &destination_path
+            );
+        }
         AegisRecordFileEvent(L"rename", Data);
+    } else if (info_class == FileLinkInformation ||
+               info_class == FileLinkInformationBypassAccessCheck ||
+               info_class == FileLinkInformationEx
+#ifdef FileLinkInformationExBypassAccessCheck
+               || info_class == FileLinkInformationExBypassAccessCheck
+#endif
+               ) {
+        if (AegisIsProtectedFileOperation(Data)) {
+            return AegisDenyFileOperation(L"block-link", Data);
+        }
+        if (has_destination_path && AegisPathMatchesProtectedPrefix(&destination_path)) {
+            return AegisDenyFileOperationWithPath(
+                L"block-lnk-dst",
+                Data,
+                &destination_path
+            );
+        }
+        AegisRecordFileEvent(L"link", Data);
     } else if (info_class == FileDispositionInformation ||
                info_class == FileDispositionInformationEx) {
         if (AegisIsProtectedFileOperation(Data)) {

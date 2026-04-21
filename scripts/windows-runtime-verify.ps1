@@ -11,6 +11,7 @@ param(
     [string]$ScriptEventQueryPath = (Join-Path $PSScriptRoot "windows-query-script-events.ps1"),
     [string]$MemorySnapshotScriptPath = (Join-Path $PSScriptRoot "windows-query-memory-snapshot.ps1"),
     [string]$FileEventQueryPath = (Join-Path $PSScriptRoot "windows-query-file-events.ps1"),
+    [string]$FileProtectionScriptPath = (Join-Path $PSScriptRoot "windows-configure-file-protection.ps1"),
     [string]$RegistryEventQueryPath = (Join-Path $PSScriptRoot "windows-query-registry-events.ps1"),
     [string]$RegistryProtectionScriptPath = (Join-Path $PSScriptRoot "windows-configure-registry-protection.ps1"),
     [string]$PreemptiveBlockScriptPath = (Join-Path $PSScriptRoot "windows-configure-preemptive-block.ps1"),
@@ -647,6 +648,175 @@ Invoke-ValidationStep -Name "registry_protection" -Body {
         } | Out-Null
         & reg.exe delete "HKLM\SOFTWARE\AegisValidation\RegistryProtection\$validationId" /f | Out-Null
         & reg.exe delete "HKLM\SOFTWARE\AegisValidation\RegistryWarmup\$validationId" /f | Out-Null
+    }
+}
+
+Invoke-ValidationStep -Name "file_target_path_protection" -Body {
+    $resolvedFileEventQuery = Resolve-ExistingPath -Path $FileEventQueryPath -Description "file event query script"
+    $resolvedFileProtectionScript = Resolve-ExistingPath -Path $FileProtectionScriptPath -Description "file protection script"
+    $validationRootPath = Join-Path $validationRoot "file-target-protection"
+    $protectedRoot = Join-Path $validationRootPath "protected"
+    $sourceRoot = Join-Path $validationRootPath "source"
+    $warmupRoot = Join-Path $validationRootPath "warmup"
+    $moveSourceFile = Join-Path $sourceRoot "move-source.txt"
+    $moveTargetFile = Join-Path $protectedRoot "moved.txt"
+    $linkSourceFile = Join-Path $sourceRoot "link-source.txt"
+    $linkTargetFile = Join-Path $protectedRoot "linked.txt"
+    $warmupSourceFile = Join-Path $warmupRoot "warmup-source.txt"
+    $warmupMoveTargetFile = Join-Path $warmupRoot "warmup-moved.txt"
+    $warmupLinkTargetFile = Join-Path $warmupRoot "warmup-linked.txt"
+    $nativeHelperType = @"
+using System;
+using System.Runtime.InteropServices;
+namespace AegisValidation {
+    public static class FileOps {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool MoveFileEx(string existingFileName, string newFileName, uint flags);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool CreateHardLink(string fileName, string existingFileName, IntPtr securityAttributes);
+    }
+}
+"@
+
+    if (-not ("AegisValidation.FileOps" -as [type])) {
+        Add-Type -TypeDefinition $nativeHelperType | Out-Null
+    }
+
+    function Get-TargetProtectionFileEvents {
+        param(
+            [Parameter(Mandatory = $true)]
+            [uint32]$AfterSequence
+        )
+
+        $events = @()
+        $cursor = [uint32]$AfterSequence
+        for ($page = 0; $page -lt 16; $page++) {
+            $payload = Invoke-JsonScript -ScriptPath $resolvedFileEventQuery -Arguments @{
+                Mode = "events"
+                LastSequence = [string]$cursor
+                MaxEntries = "256"
+            }
+            $pageEvents = @($payload.events)
+            if ($pageEvents.Count -gt 0) {
+                $events += $pageEvents
+                $cursor = [uint32]($pageEvents | Select-Object -Last 1).sequence
+            } else {
+                $cursor = [uint32]$payload.current_sequence
+            }
+            if ([uint32]$payload.returned_count -eq 0 -or $cursor -ge [uint32]$payload.current_sequence) {
+                break
+            }
+        }
+
+        @($events)
+    }
+
+    New-Item -ItemType Directory -Path $protectedRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path $sourceRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path $warmupRoot -Force | Out-Null
+    Set-Content -LiteralPath $moveSourceFile -Value "move-source" -Encoding UTF8
+    Set-Content -LiteralPath $linkSourceFile -Value "link-source" -Encoding UTF8
+    Set-Content -LiteralPath $warmupSourceFile -Value "warmup-source" -Encoding UTF8
+
+    try {
+        Invoke-JsonScript -ScriptPath $resolvedFileProtectionScript -Arguments @{
+            Mode = "clear"
+        } | Out-Null
+
+        $protectResult = Invoke-JsonScript -ScriptPath $resolvedFileProtectionScript -Arguments @{
+            Mode = "protect"
+            Path = $protectedRoot
+        }
+
+        if (-not [AegisValidation.FileOps]::MoveFileEx($warmupSourceFile, $warmupMoveTargetFile, [uint32]0)) {
+            throw ("warmup MoveFileEx failed: Win32={0}" -f [Runtime.InteropServices.Marshal]::GetLastWin32Error())
+        }
+        if (-not [AegisValidation.FileOps]::CreateHardLink($warmupLinkTargetFile, $warmupMoveTargetFile, [IntPtr]::Zero)) {
+            throw ("warmup CreateHardLink failed: Win32={0}" -f [Runtime.InteropServices.Marshal]::GetLastWin32Error())
+        }
+
+        $statusBefore = Invoke-JsonScript -ScriptPath $resolvedFileEventQuery -Arguments @{
+            Mode = "status"
+        }
+        $lastSequence = [uint32]$statusBefore.current_sequence
+
+        $moveCommand = @"
+Add-Type -TypeDefinition @'
+$nativeHelperType
+'@ | Out-Null
+if ([AegisValidation.FileOps]::MoveFileEx('$moveSourceFile', '$moveTargetFile', [uint32]0)) {
+    exit 0
+}
+exit [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+"@
+        $moveProc = Start-Process -FilePath "powershell" -ArgumentList "-NoProfile", "-NonInteractive", "-Command", $moveCommand -PassThru -WindowStyle Hidden
+        $moveProc.WaitForExit()
+        $moveSucceeded = Test-Path -LiteralPath $moveTargetFile
+        $moveError = ("MoveFileEx helper exit={0}; source_exists={1}; target_exists={2}" -f $moveProc.ExitCode, (Test-Path -LiteralPath $moveSourceFile), (Test-Path -LiteralPath $moveTargetFile))
+
+        $linkCommand = @"
+Add-Type -TypeDefinition @'
+$nativeHelperType
+'@ | Out-Null
+if ([AegisValidation.FileOps]::CreateHardLink('$linkTargetFile', '$linkSourceFile', [IntPtr]::Zero)) {
+    exit 0
+}
+exit [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+"@
+        $linkProc = Start-Process -FilePath "powershell" -ArgumentList "-NoProfile", "-NonInteractive", "-Command", $linkCommand -PassThru -WindowStyle Hidden
+        $linkProc.WaitForExit()
+        $linkSucceeded = Test-Path -LiteralPath $linkTargetFile
+        $linkError = ("CreateHardLink helper exit={0}; target_exists={1}" -f $linkProc.ExitCode, (Test-Path -LiteralPath $linkTargetFile))
+
+        $allFileEvents = @(Get-TargetProtectionFileEvents -AfterSequence $lastSequence)
+        $moveTargetName = [System.IO.Path]::GetFileName($moveTargetFile)
+        $linkTargetName = [System.IO.Path]::GetFileName($linkTargetFile)
+        $moveEvents = @($allFileEvents | Where-Object {
+                [string]$_.operation -like "block-*" -and
+                [uint32]$_.process_id -eq [uint32]$moveProc.Id -and
+                [string]$_.path -like "*$moveTargetName"
+            })
+        $linkEvents = @($allFileEvents | Where-Object {
+                [string]$_.operation -like "block-*" -and
+                [uint32]$_.process_id -eq [uint32]$linkProc.Id -and
+                [string]$_.path -like "*$linkTargetName"
+            })
+        if ($moveSucceeded) {
+            $sample = ($allFileEvents | Where-Object {
+                    [uint32]$_.process_id -eq [uint32]$moveProc.Id
+                } | Select-Object -First 32 operation, path, process_id | ConvertTo-Json -Compress)
+            throw "move into protected directory succeeded unexpectedly: $sample"
+        }
+        if ($linkSucceeded) {
+            $sample = ($allFileEvents | Where-Object {
+                    [uint32]$_.process_id -eq [uint32]$linkProc.Id
+                } | Select-Object -First 32 operation, path, process_id | ConvertTo-Json -Compress)
+            throw "hardlink into protected directory succeeded unexpectedly: $sample"
+        }
+        [ordered]@{
+            protect = $protectResult
+            move_error = $moveError
+            hardlink_error = $linkError
+            events = [ordered]@{
+                move = $moveEvents | Select-Object -First 1
+                hardlink = $linkEvents | Select-Object -First 1
+            }
+        }
+    } finally {
+        Invoke-JsonScript -ScriptPath $resolvedFileProtectionScript -Arguments @{
+            Mode = "clear"
+        } | Out-Null
+        Remove-Item -LiteralPath $moveTargetFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $linkTargetFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $moveSourceFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $linkSourceFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $warmupLinkTargetFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $warmupMoveTargetFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $warmupSourceFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $validationRootPath -Force -Recurse -ErrorAction SilentlyContinue
     }
 }
 
