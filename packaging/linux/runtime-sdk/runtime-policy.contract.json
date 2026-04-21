@@ -1,0 +1,12 @@
+{
+  "contract_version": "serverless.v1",
+  "policy_version": "policy-7",
+  "blocked_env_keys": [
+    "AWS_SECRET_ACCESS_KEY"
+  ],
+  "blocked_destinations": [
+    "169.254.169.254"
+  ],
+  "max_request_body_bytes": 8192,
+  "require_response_sampling": true
+}
