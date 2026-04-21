@@ -930,8 +930,8 @@ Invoke-ValidationStep -Name "preemptive_blocking" -Body {
         }
         $pidSequence = [uint32]$pidStatusBefore.current_sequence
 
-        $pidScript = "Start-Sleep -Seconds 3; Set-Content -LiteralPath '$pidTargetFile' -Value 'blocked-write' -Encoding UTF8 -ErrorAction Stop"
-        $pidProc = Start-Process -FilePath "powershell" -ArgumentList "-NoProfile", "-NonInteractive", "-Command", $pidScript -PassThru -WindowStyle Hidden
+        $pidCommand = "timeout /t 2 /nobreak >nul & echo blocked-write>>`"$pidTargetFile`""
+        $pidProc = Start-Process -FilePath $env:ComSpec -ArgumentList "/c", $pidCommand -PassThru -WindowStyle Hidden
         Start-Sleep -Milliseconds 500
 
         $pidBlock = Invoke-JsonScript -ScriptPath $resolvedPreemptiveBlockScript -Arguments @{
