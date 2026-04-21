@@ -1,0 +1,38 @@
+{
+  "contract_version": "serverless.v1",
+  "tenant_id": "tenant-a",
+  "agent_id": "runtime-sdk",
+  "sequence_hint": 1,
+  "signal_kind": "HttpRequest",
+  "metadata": {
+    "provider": "AwsLambda",
+    "service": "orders-api",
+    "runtime": "python3.12",
+    "region": "ap-southeast-1",
+    "account_id": "123456789012",
+    "invocation_id": "invoke-1",
+    "cold_start": true,
+    "function_name": "orders-handler",
+    "container_id": null
+  },
+  "process": {
+    "pid": 7,
+    "name": "python",
+    "cmdline": "",
+    "user": null,
+    "integrity": "Unknown",
+    "signature": null,
+    "token_elevation": null,
+    "container_id": null,
+    "namespace_ids": [],
+    "working_directory": null,
+    "env_vars": {}
+  },
+  "labels": {
+    "route": "/orders"
+  },
+  "attributes": {
+    "method": "POST"
+  },
+  "occurred_at_ms": 1713000000000
+}

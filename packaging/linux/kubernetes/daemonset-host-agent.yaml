@@ -1,0 +1,146 @@
+{
+  "apiVersion": "apps/v1",
+  "kind": "DaemonSet",
+  "metadata": {
+    "name": "aegis-host-agent",
+    "namespace": "aegis-system",
+    "labels": {
+      "app.kubernetes.io/name": "aegis-host-agent",
+      "app.kubernetes.io/component": "sensor"
+    }
+  },
+  "spec": {
+    "selector": {
+      "matchLabels": {
+        "app.kubernetes.io/name": "aegis-host-agent"
+      }
+    },
+    "template": {
+      "metadata": {
+        "labels": {
+          "app.kubernetes.io/name": "aegis-host-agent"
+        }
+      },
+      "spec": {
+        "serviceAccountName": "aegis-host-agent",
+        "hostPID": true,
+        "hostNetwork": false,
+        "containers": [
+          {
+            "name": "aegis-host-agent",
+            "image": "ghcr.io/aegis/sensor-host-agent:latest",
+            "imagePullPolicy": "IfNotPresent",
+            "command": [
+              "/opt/aegis/bin/aegis-agentd",
+              "--state-root",
+              "/var/lib/aegis",
+              "--config",
+              "/etc/aegis/agent.toml"
+            ],
+            "env": [
+              {
+                "name": "AEGIS_STATE_ROOT",
+                "value": "/var/lib/aegis"
+              },
+              {
+                "name": "AEGIS_CONFIG",
+                "value": "/etc/aegis/agent.toml"
+              }
+            ],
+            "securityContext": {
+              "privileged": false,
+              "readOnlyRootFilesystem": true,
+              "runAsNonRoot": false,
+              "allowPrivilegeEscalation": false,
+              "capabilities": {
+                "drop": [
+                  "ALL"
+                ],
+                "add": [
+                  "BPF",
+                  "PERFMON",
+                  "SYS_ADMIN",
+                  "SYS_PTRACE",
+                  "NET_ADMIN",
+                  "SYS_RESOURCE"
+                ]
+              }
+            },
+            "volumeMounts": [
+              {
+                "name": "bpffs",
+                "mountPath": "/sys/fs/bpf"
+              },
+              {
+                "name": "procfs",
+                "mountPath": "/proc",
+                "readOnly": true
+              },
+              {
+                "name": "aegis-state",
+                "mountPath": "/var/lib/aegis"
+              },
+              {
+                "name": "aegis-socket",
+                "mountPath": "/var/run/aegis"
+              },
+              {
+                "name": "kubelet",
+                "mountPath": "/var/lib/kubelet",
+                "readOnly": true
+              },
+              {
+                "name": "containerd-socket",
+                "mountPath": "/var/run/containerd/containerd.sock",
+                "readOnly": true
+              }
+            ]
+          }
+        ],
+        "volumes": [
+          {
+            "name": "bpffs",
+            "hostPath": {
+              "path": "/sys/fs/bpf",
+              "type": "Directory"
+            }
+          },
+          {
+            "name": "procfs",
+            "hostPath": {
+              "path": "/proc",
+              "type": "Directory"
+            }
+          },
+          {
+            "name": "aegis-state",
+            "hostPath": {
+              "path": "/var/lib/aegis",
+              "type": "DirectoryOrCreate"
+            }
+          },
+          {
+            "name": "aegis-socket",
+            "hostPath": {
+              "path": "/var/run/aegis",
+              "type": "DirectoryOrCreate"
+            }
+          },
+          {
+            "name": "kubelet",
+            "hostPath": {
+              "path": "/var/lib/kubelet",
+              "type": "DirectoryOrCreate"
+            }
+          },
+          {
+            "name": "containerd-socket",
+            "hostPath": {
+              "path": "/var/run/containerd/containerd.sock"
+            }
+          }
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "platform": "linux",
+  "bundle_channel": "development",
+  "install_root": "/opt/aegis",
+  "state_root": "/var/lib/aegis",
+  "config_root": "/etc/aegis",
+  "service_units": [
+    {
+      "name": "agentd",
+      "unit_name": "aegis-agentd.service",
+      "required": true
+    },
+    {
+      "name": "watchdog",
+      "unit_name": "aegis-watchdog.service",
+      "required": true
+    }
+  ],
+  "components": [
+    {
+      "name": "bin_tree",
+      "kind": "binary",
+      "source_relative_path": "bin",
+      "install_relative_path": "bin",
+      "required": true
+    },
+    {
+      "name": "ebpf_tree",
+      "kind": "metadata",
+      "source_relative_path": "ebpf",
+      "install_relative_path": "ebpf",
+      "required": true
+    },
+    {
+      "name": "systemd_tree",
+      "kind": "metadata",
+      "source_relative_path": "systemd",
+      "install_relative_path": "systemd",
+      "required": true
+    },
+    {
+      "name": "scripts_tree",
+      "kind": "script",
+      "source_relative_path": "scripts",
+      "install_relative_path": "scripts",
+      "required": true
+    }
+  ]
+}

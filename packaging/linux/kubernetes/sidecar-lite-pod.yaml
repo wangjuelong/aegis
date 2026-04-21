@@ -1,0 +1,82 @@
+{
+  "apiVersion": "v1",
+  "kind": "Pod",
+  "metadata": {
+    "name": "orders-api-with-aegis-sidecar",
+    "namespace": "default",
+    "labels": {
+      "app": "orders-api"
+    }
+  },
+  "spec": {
+    "hostPID": false,
+    "hostNetwork": false,
+    "volumes": [
+      {
+        "name": "aegis-control",
+        "emptyDir": {}
+      },
+      {
+        "name": "aegis-cache",
+        "emptyDir": {}
+      }
+    ],
+    "containers": [
+      {
+        "name": "orders-api",
+        "image": "ghcr.io/aegis/orders-api:latest",
+        "ports": [
+          {
+            "containerPort": 8080
+          }
+        ]
+      },
+      {
+        "name": "aegis-sidecar-lite",
+        "image": "ghcr.io/aegis/sensor-sidecar-lite:latest",
+        "imagePullPolicy": "IfNotPresent",
+        "env": [
+          {
+            "name": "AEGIS_SIDECAR_CONTROL_SOCKET",
+            "value": "/var/run/aegis/sidecar.sock"
+          },
+          {
+            "name": "AEGIS_SIDECAR_CACHE_ROOT",
+            "value": "/var/lib/aegis-sidecar/cache"
+          }
+        ],
+        "resources": {
+          "requests": {
+            "cpu": "50m",
+            "memory": "32Mi"
+          },
+          "limits": {
+            "cpu": "250m",
+            "memory": "64Mi"
+          }
+        },
+        "securityContext": {
+          "privileged": false,
+          "runAsNonRoot": true,
+          "allowPrivilegeEscalation": false,
+          "readOnlyRootFilesystem": true,
+          "capabilities": {
+            "drop": [
+              "ALL"
+            ]
+          }
+        },
+        "volumeMounts": [
+          {
+            "name": "aegis-control",
+            "mountPath": "/var/run/aegis"
+          },
+          {
+            "name": "aegis-cache",
+            "mountPath": "/var/lib/aegis-sidecar/cache"
+          }
+        ]
+      }
+    ]
+  }
+}

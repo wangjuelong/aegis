@@ -28,6 +28,7 @@ dependencies = [
  "aegis-core",
  "aegis-model",
  "anyhow",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

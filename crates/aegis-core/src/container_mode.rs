@@ -101,19 +101,81 @@ pub struct DaemonSetHostAgentConfig {
     pub host_pid: bool,
     pub host_network: bool,
     pub privileged: bool,
+    pub read_only_root_filesystem: bool,
+    pub run_as_non_root: bool,
+    pub added_capabilities: Vec<String>,
+    pub dropped_capabilities: Vec<String>,
     pub mount_points: Vec<PathBuf>,
 }
 
 impl DaemonSetHostAgentConfig {
+    pub fn required_capabilities() -> &'static [&'static str] {
+        &[
+            "BPF",
+            "PERFMON",
+            "SYS_ADMIN",
+            "SYS_PTRACE",
+            "NET_ADMIN",
+            "SYS_RESOURCE",
+        ]
+    }
+
+    pub fn required_mount_points() -> &'static [&'static str] {
+        &["/sys/fs/bpf", "/proc", "/var/lib/aegis", "/var/run/aegis"]
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.namespace.is_empty() || self.service_account.is_empty() {
             bail!("daemonset config requires namespace and service account");
         }
-        if !self.host_pid || !self.host_network || !self.privileged {
-            bail!("host agent daemonset must run with host pid/network and privileged access");
+        if !self.host_pid {
+            bail!("host agent daemonset must run with host pid enabled");
+        }
+        if self.host_network {
+            bail!("host agent daemonset must keep host network disabled");
+        }
+        if self.privileged {
+            bail!("host agent daemonset must not run privileged");
+        }
+        if !self.read_only_root_filesystem {
+            bail!("host agent daemonset must keep root filesystem read-only");
+        }
+        if self.run_as_non_root {
+            bail!("host agent daemonset must run as root to load eBPF programs");
+        }
+        if !self
+            .dropped_capabilities
+            .iter()
+            .any(|capability| capability == "ALL")
+        {
+            bail!("host agent daemonset must drop all Linux capabilities before re-adding required ones");
+        }
+        for required_capability in Self::required_capabilities() {
+            if !self
+                .added_capabilities
+                .iter()
+                .any(|capability| capability == required_capability)
+            {
+                bail!(
+                    "host agent daemonset is missing required capability {}",
+                    required_capability
+                );
+            }
         }
         if self.mount_points.is_empty() {
             bail!("host agent daemonset requires host mount points");
+        }
+        for required_mount in Self::required_mount_points() {
+            if !self
+                .mount_points
+                .iter()
+                .any(|mount| mount == &PathBuf::from(required_mount))
+            {
+                bail!(
+                    "host agent daemonset is missing required mount point {}",
+                    required_mount
+                );
+            }
         }
         Ok(())
     }
@@ -349,9 +411,23 @@ mod tests {
             namespace: "aegis-system".to_string(),
             service_account: "aegis-host-agent".to_string(),
             host_pid: true,
-            host_network: true,
-            privileged: true,
-            mount_points: vec![PathBuf::from("/var/lib/kubelet")],
+            host_network: false,
+            privileged: false,
+            read_only_root_filesystem: true,
+            run_as_non_root: false,
+            added_capabilities: DaemonSetHostAgentConfig::required_capabilities()
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+            dropped_capabilities: vec!["ALL".to_string()],
+            mount_points: vec![
+                PathBuf::from("/sys/fs/bpf"),
+                PathBuf::from("/proc"),
+                PathBuf::from("/var/lib/aegis"),
+                PathBuf::from("/var/run/aegis"),
+                PathBuf::from("/var/lib/kubelet"),
+                PathBuf::from("/var/run/containerd/containerd.sock"),
+            ],
         };
         let sidecar = SidecarLiteContract {
             control_socket_path: PathBuf::from("/var/run/aegis/sidecar.sock"),

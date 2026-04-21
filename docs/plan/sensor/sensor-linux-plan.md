@@ -27,11 +27,14 @@ Linux 平台目标覆盖：
 - quote / checkquote attestation baseline
 - PCR policy session 绑定的 sealed-object 解封
 - Linux 容器验证与诊断面集成
+- Linux 安装/发布工程
+- Linux 远程 attestation / verifier 分离信任链
+- Linux 容器 / sidecar / runtime connector 交付链
 
 ## 4. 当前总体结论
 
 - 当前开发机与 Linux 测试机可闭合的 Linux 研发项已完成。
-- 剩余未完成项已经收缩为更高阶 remote attestation / verifier 分离信任链，以及更高阶生产部署/发行工程。
+- 当前仓库范围内，Linux 已无剩余未完成项。
 
 ## 5. Linux 研发计划与状态
 
@@ -47,8 +50,9 @@ Linux 平台目标覆盖：
 | L08 | TPM quote / checkquote attestation baseline | done | 已完成 AK/PCR 配置、quote/checkquote 运行时、诊断状态与真机正反向验收 |
 | L09 | TPM PCR policy session 绑定 | done | 已完成 `linux_tpm_master_key_pcrs`、policy digest、`session:<ctx>` 解封与真机正反向验收 |
 | L10 | Linux 容器验证与诊断集成 | done | 已完成 Linux 容器内 `cargo test` 基线验证与 `aegis-agentd -- --diagnose` 诊断接线 |
-| L11 | 更高阶 remote attestation / verifier 分离信任链 | todo | 当前仅完成单机 TPM attestation baseline，未完成远端 verifier、信任根与证明链 |
-| L12 | Linux 生产部署、签名与发行工程 | todo | 当前已具备测试机闭环，但更高阶生产打包、发行与长期运维工程未单独收口 |
+| L11 | 更高阶 remote attestation / verifier 分离信任链 | done | 已完成 attestation bundle、verifier receipt、设备证书/receipt 诊断状态与本地正反向烟测 |
+| L12 | Linux 生产部署、签名与发行工程 | done | 已完成 install manifest、systemd、`DEB/RPM` 组装、原生 RPM 安装/自检/watchdog/卸载与 `scripts/linux-package-verify.sh` 真机闭环 |
+| L13 | Linux 容器 / Sidecar / Runtime Connector 交付链 | done | 已完成 Host Agent DaemonSet、Sidecar Lite Pod 样例、Runtime SDK / Cloud Connector 样例目录与 `scripts/linux-container-validate.sh` 校验链 |
 
 ## 6. 已完成验证
 
@@ -70,6 +74,11 @@ Linux 测试机已完成：
 - `scripts/linux-tpm-sealed-verify.sh`
 - `scripts/linux-tpm-quote-verify.sh`
 - `scripts/linux-tpm-policy-verify.sh`
+- `scripts/linux-package-verify.sh`
+
+本地容器 / Sidecar 交付验证已完成：
+
+- `scripts/linux-container-validate.sh`
 
 ## 7. Linux 完成定义
 
@@ -83,5 +92,6 @@ Linux 测试机已完成：
 按当前事实，Linux 文档应保持：
 
 - `L01-L10 = done`
-- `L11-L12 = todo`
-
+- `L11 = done`
+- `L12 = done`
+- `L13 = done`

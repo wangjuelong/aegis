@@ -1,0 +1,10 @@
+version: "3.9"
+
+services:
+  linux-builder:
+    image: rust:1.94-bookworm
+    environment:
+      PATH: /usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    working_dir: /workspace
+    volumes:
+      - ../..:/workspace
