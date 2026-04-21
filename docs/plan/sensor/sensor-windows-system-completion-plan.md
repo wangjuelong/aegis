@@ -20,6 +20,10 @@
 | `W14` | `done` | 已完成 release 清单、签名/验签脚本、安装前后 release gate 与 Windows 11 真机发布验证；外部证书/审批缺失时严格失败 |
 | `W15` | `done` | 已完成 `protect_registry`、驱动保护表、registry pre-callback 阻断与 `192.168.2.222` 真机验收 |
 | `W16` | `done` | 已完成 Minifilter 权威 block map、TTL、状态查询与 `192.168.2.222` 真机验收 |
+| `W17` | `todo` | 收口目标路径阻断：外部文件 rename/move/link 进入受保护目录必须被拒绝 |
+| `W18` | `todo` | 收口 `block_hash` 严格 pre-create 阻断，不再依赖 `post-create + FltCancelFileOpen` |
+| `W19` | `todo` | 收口 `clear_all_blocks` 平面解耦：防火墙与 Minifilter 独立释放、部分成功显式可见 |
+| `W20` | `todo` | 收口 AMSI 严格阻断：恶意样本阻断不能再走 skip 分支，能力声明与真机结果一致 |
 
 ---
 
@@ -34,7 +38,8 @@
 
 ## 2. 当前结论
 
-- 仓库侧 Windows 功能缺口已清零，`W09-W16` 全部完成，系统级交付链路已可重新标记为 `done`。
+- 新一轮代码审查重新发现 4 个剩余缺口：目标路径 rename/move 绕过、`block_hash` 非严格 pre-create、`clear_all_blocks` 平面耦合、AMSI 严格阻断仍是条件成立。
+- 因此仓库侧 Windows 功能不能继续诚实标记为“缺口已清零 / 系统级交付 done”；当前状态回退为 `doing`，待 `W17-W20` 收口。
 - 测试机 `192.168.2.218` 与 `192.168.2.222` 均可用；`192.168.1.4` 当前不可达，不作为当前验收主机。
 - `W14` 需要的签名、验签、批准文件依赖已经形成严格失败链路，但正式 `pfx/cer` 资产仍由外部发布环境注入。
 
@@ -330,6 +335,90 @@
 **详细计划**
 
 - `docs/plan/sensor/sensor-windows-preemptive-block-plan.md`
+
+### W17: 受保护目录目标路径阻断收口
+
+**状态**
+
+- `todo`
+- 目标主机：`192.168.2.222`
+
+**目标**
+
+- 收口 rename / move / link 进入受保护目录的目标路径绕过。
+- 让 `protect_files` 与 `block_path` 同时覆盖源路径与目标路径判定。
+
+**完成判定**
+
+- 外部文件无法通过 rename / move / link 进入受保护目录。
+- 真机 `192.168.2.222` 可验证目标路径阻断与事件回传。
+
+**详细计划**
+
+- `docs/plan/sensor/sensor-windows-protected-destination-rename-plan.md`
+
+### W18: hash 严格 pre-create 阻断链
+
+**状态**
+
+- `todo`
+- 目标主机：`192.168.2.222`
+
+**目标**
+
+- 把 `block_hash` 从 `post-create + FltCancelFileOpen` 收口为严格 create 入口阻断。
+- 保证文档中的“preemptive block”与内核真实时序一致。
+
+**完成判定**
+
+- `block_hash` 不再依赖 post-create cancel。
+- 命中 hash 的文件在 create 返回前被拒绝。
+
+**详细计划**
+
+- `docs/plan/sensor/sensor-windows-hash-precreate-block-plan.md`
+
+### W19: block 清理平面解耦
+
+**状态**
+
+- `todo`
+- 目标主机：`192.168.2.222`
+
+**目标**
+
+- 让 `clear_all_blocks()` 分平面清理 Windows 防火墙与 Minifilter block。
+- 某一平面失效时，另一平面仍能完成 release，并把部分成功显式写入工件。
+
+**完成判定**
+
+- Minifilter 失效时 network release 仍能完成。
+- 清理工件显式包含分平面结果与残留状态。
+
+**详细计划**
+
+- `docs/plan/sensor/sensor-windows-block-release-decoupling-plan.md`
+
+### W20: AMSI 严格阻断收口
+
+**状态**
+
+- `todo`
+- 目标主机：`192.168.2.222`
+
+**目标**
+
+- 收口 AMSI 严格阻断只能条件成立的问题。
+- 让 `supports_amsi` / `AmsiStatus` / 验收脚本与真实主机阻断能力一致。
+
+**完成判定**
+
+- `.222` 上官方 AMSI test sample 被严格阻断，不能再走 skip 分支。
+- 文档不再把条件性能力写成无条件完成。
+
+**详细计划**
+
+- `docs/plan/sensor/sensor-windows-amsi-strict-enforcement-plan.md`
 
 ## 4. 验证矩阵
 
