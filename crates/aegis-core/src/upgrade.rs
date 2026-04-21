@@ -447,6 +447,12 @@ pub struct DiagnoseConnectionStatus {
 pub struct DiagnoseCertificateStatus {
     pub device_certificate_loaded: bool,
     pub last_rotation_succeeded: bool,
+    #[serde(default)]
+    pub attestation_bundle_loaded: bool,
+    #[serde(default)]
+    pub attestation_verifier_receipt_loaded: bool,
+    #[serde(default)]
+    pub attestation_verifier_receipt_verified: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1250,6 +1256,9 @@ mod tests {
             DiagnoseCertificateStatus {
                 device_certificate_loaded: true,
                 last_rotation_succeeded: true,
+                attestation_bundle_loaded: false,
+                attestation_verifier_receipt_loaded: false,
+                attestation_verifier_receipt_verified: false,
             },
             DiagnoseSensorStatus {
                 enabled_sensors: vec!["process".to_string(), "network".to_string()],
@@ -1356,6 +1365,9 @@ mod tests {
             certificates: DiagnoseCertificateStatus {
                 device_certificate_loaded: true,
                 last_rotation_succeeded: true,
+                attestation_bundle_loaded: false,
+                attestation_verifier_receipt_loaded: false,
+                attestation_verifier_receipt_verified: false,
             },
             sensors: DiagnoseSensorStatus {
                 enabled_sensors: vec!["process".to_string()],
@@ -1610,6 +1622,9 @@ mod tests {
             certificates: DiagnoseCertificateStatus {
                 device_certificate_loaded: true,
                 last_rotation_succeeded: true,
+                attestation_bundle_loaded: false,
+                attestation_verifier_receipt_loaded: false,
+                attestation_verifier_receipt_verified: false,
             },
             sensors: DiagnoseSensorStatus {
                 enabled_sensors: vec!["process".to_string()],

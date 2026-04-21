@@ -20,6 +20,7 @@ use aegis_model::{
     RuntimeHealthSignals, TelemetryIntegrity,
 };
 use anyhow::{bail, Result};
+use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -472,6 +473,8 @@ fn build_agent_runtime_snapshot(
         },
     );
 
+    let certificates = diagnose_certificate_status(config);
+
     AgentRuntimeSnapshot {
         captured_at_ms: now_unix_ms(),
         supervisor_heartbeat: AgentSupervisorHeartbeat {
@@ -489,10 +492,7 @@ fn build_agent_runtime_snapshot(
             control_plane_url: config.control_plane_url.clone(),
             reachable: communication.channels.iter().any(|channel| channel.healthy),
         },
-        certificates: DiagnoseCertificateStatus {
-            device_certificate_loaded: true,
-            last_rotation_succeeded: true,
-        },
+        certificates,
         sensors: DiagnoseSensorStatus {
             enabled_sensors: vec![
                 "process".to_string(),
@@ -525,6 +525,41 @@ fn build_agent_runtime_snapshot(
         runtime_bridge,
         plugin_status,
         self_protection_posture: protection_posture_from_key_status(&key_protection),
+    }
+}
+
+#[derive(Deserialize)]
+struct LinuxAttestationVerifierReceipt {
+    verified: bool,
+}
+
+fn diagnose_certificate_status(config: &AppConfig) -> DiagnoseCertificateStatus {
+    if cfg!(target_os = "linux") {
+        let identity_root = config.storage.state_root.join("identity");
+        let attestation_root = config.storage.state_root.join("attestation").join("current");
+        let device_certificate_path = identity_root.join("device.crt");
+        let bundle_path = attestation_root.join("bundle.json");
+        let receipt_path = attestation_root.join("verified-receipt.json");
+        let receipt = fs::read(&receipt_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<LinuxAttestationVerifierReceipt>(&bytes).ok());
+        return DiagnoseCertificateStatus {
+            device_certificate_loaded: device_certificate_path.exists(),
+            last_rotation_succeeded: device_certificate_path.exists(),
+            attestation_bundle_loaded: bundle_path.exists(),
+            attestation_verifier_receipt_loaded: receipt_path.exists(),
+            attestation_verifier_receipt_verified: receipt
+                .map(|receipt| receipt.verified)
+                .unwrap_or(false),
+        };
+    }
+
+    DiagnoseCertificateStatus {
+        device_certificate_loaded: true,
+        last_rotation_succeeded: true,
+        attestation_bundle_loaded: false,
+        attestation_verifier_receipt_loaded: false,
+        attestation_verifier_receipt_verified: false,
     }
 }
 
