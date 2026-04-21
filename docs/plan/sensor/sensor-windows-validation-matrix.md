@@ -10,6 +10,7 @@
 - W17 本地输出：`target/windows-validation/192.168.2.222.json`
 - W18 本地输出：`target/windows-validation/192.168.2.222.json`
 - W19 本地输出：`target/windows-validation/192.168.2.222.json`
+- W20 本地输出：`target/windows-validation/192.168.2.222.json`
 - 实际验证时间：`2026-04-20 18:05:12 +08:00`
 - 实际验证 ID：`windows-runtime-20260420-180434`
 - W10 补充验证时间：`2026-04-20 16:46:03 +08:00`
@@ -32,6 +33,8 @@
 - W18 补充验证方式：远端重构建并安装 `AegisSensorKmod + AegisFileMonitor`，重新执行 `preemptive_blocking`，验证 `block_hash` 在 create 返回前拒绝且整机 `required_failures=[]`
 - W19 补充验证时间：`2026-04-21 14:37:59 +08:00`
 - W19 补充验证方式：本地执行 `cargo test -p aegis-platform windows_clear_all_blocks_releases_firewall_when_minifilter_unavailable`，并在 `192.168.2.222` 重跑整机 `windows-runtime-verify.sh`，验证正常双平面清理链无回归
+- W20 补充验证时间：`2026-04-21 14:58:20 +08:00`
+- W20 补充验证方式：本地执行 `cargo test -p aegis-platform windows_descriptor_requires_strict_amsi_blocking_for_support`，并在 `192.168.2.222` 重跑整机 `windows-runtime-verify.sh`，验证 `.222` 上 `strict_block_ready=false` 时平台不再 overclaim `supports_amsi=true`
 
 ## 2. 主机选择结果
 
@@ -69,8 +72,8 @@
 | `module_inventory` | pass | 成功读取 `1Password.exe` 进程模块清单 |
 | `vss_inventory` | pass | 成功读取 `3` 条 `Win32_ShadowCopy` 样本 |
 | `device_inventory` | pass | 成功读取 `Display / AudioEndpoint / Firmware / System` 设备样本 |
-| `amsi_surface` | pass | `has_amsi_runtime=true`，`scan_interface_ready=true`，`session_opened=true`，`has_script_block_logging=false` |
-| `script_surface_roundtrip` | pass | benign script `Write-Output 'Aegis script surface allow'` 已产出 4104 事件；官方 AMSI test sample 被 `AmsiScanBuffer` 以 `amsi_result=32768` 阻断 |
+| `amsi_surface` | pass | `192.168.2.218` 上 `scan_interface_ready=true`；`192.168.2.222` 上 `scan_interface_ready=false`、`strict_block_ready=false`，平台不再 overclaim 支持状态 |
+| `script_surface_roundtrip` | pass | benign script 仍产出 4104 事件；`192.168.2.218` 上官方 AMSI sample 被阻断，`192.168.2.222` 上显式返回 `host_amsi_strict_enforcement_unavailable` |
 | `memory_signal_roundtrip` | pass | 真实拉起 `powershell(pid=2512)` 并分配约 `160411648` bytes 私有内存，快照可见进程与增量 |
 | `suspend_kill_response` | pass | 真实执行 `NtSuspendProcess + Stop-Process`，目标 `pid=6984` |
 | `quarantine_response` | pass | 真实移动文件到 `C:\ProgramData\Aegis\quarantine\windows-runtime-20260420-180434-quarantine-input.txt` |
@@ -128,6 +131,9 @@
 - W19 验收摘要：`C:\ProgramData\Aegis\validation\windows-runtime-20260421-143528\summary.json`
 - W19 远端 payload 根目录：`C:\ProgramData\Aegis\validation\windows-runtime-verify-20260421-143518`
 - W19 关键结果：`{"runtime_verify_required_failures":[],"partial_release_unit_test_passed":true}`
+- W20 验收摘要：`C:\ProgramData\Aegis\validation\windows-runtime-20260421-145549\summary.json`
+- W20 远端 payload 根目录：`C:\ProgramData\Aegis\validation\windows-runtime-verify-20260421-145539`
+- W20 关键结果：`{"strict_block_ready":false,"script_surface_roundtrip_skip_reason":"host_amsi_strict_enforcement_unavailable","required_failures":[]}`
 
 ## 6. 结论
 
@@ -143,4 +149,5 @@
 - `W17` 已额外验证通过目标路径保护链：`protect_files` 已能阻断外部文件 move / hardlink 进入受保护目录，目标路径绕过缺口已关闭。
 - `W18` 已额外验证通过 hash 严格预阻断链：`block_hash` 不再依赖 `AegisFilePostCreate + FltCancelFileOpen`，真机可验证命中 hash 的文件在 create 返回前被拒绝。
 - `W19` 已额外验证通过 block 清理平面解耦：Minifilter 不可用时 firewall 仍可释放，且正常真机整机验收未回归。
+- `W20` 已额外验证通过 AMSI 能力 truthfulness：`.222` 上 strict blocking 仍不可用，但平台与验收脚本已显式声明 unsupported，不再把 skip 分支写成“严格阻断已完成”。
 - `security_4688` 的验收口径以“日志可读、record_id 可取”为准；`cmd.exe` 临时探针命中率被保留为观察项，不作为失败条件。

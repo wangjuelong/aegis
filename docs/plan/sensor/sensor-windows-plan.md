@@ -39,7 +39,7 @@ Windows 平台目标覆盖：
 - `W06.2` 已完成：`block_network/clear_all_blocks` 已接入真实 Windows 防火墙与 Minifilter 双清理链；`block_hash/block_pid/block_path` 已通过 `W16` 收口为真实 preemptive block。
 - `W07.1` 已完成：仓库已新增 `scripts/windows-runtime-verify.sh` / `scripts/windows-runtime-verify.ps1` 真机验收脚本，并在 `192.168.2.218` 跑通完整矩阵；详细结果见 `docs/plan/sensor/sensor-windows-validation-matrix.md`。
 - `W08.1` 已完成：`aegis-core` 已接入 Windows 专用 DPAPI 主密钥与回滚锚点实现，诊断状态会输出 `provider_detail`、Windows TPM 可用性与回滚锚点状态；并已在 `192.168.2.218` 实测拿到 `tpm_present=true`、`tpm_ready=true` 和 DPAPI machine/user scope 往返成功结果。
-- 当前仓库还剩 1 个经代码审查确认的剩余缺口：AMSI 严格阻断仍是条件成立。
+- 新一轮代码审查确认的 4 个代码/设计缺口已经全部收口。
 - `W11/W15` 已完成：`ObRegisterCallbacks` 进程保护、Minifilter 路径保护、注册表真实 pre-callback 阻断与驱动完整性回执均已接入，保护面工件只反映真实已下发状态。
 - `W12` 已完成：共享脚本解码、AMSI 脚本阻断/告警链、PowerShell 4104 脚本块事件与内存快照增量已接入，`192.168.2.218` 已验证 benign script 事件捕获和官方 AMSI 测试样本阻断。
 - `W13` 已完成：开发包安装/卸载、自举自检、watchdog 状态快照、失败回滚与远端打包验证已经闭环，真机 `validate.ps1` 返回 `required_failures=[]`。
@@ -48,8 +48,8 @@ Windows 平台目标覆盖：
 - `W17` 已完成：`protect_files` 的目标路径阻断已经收口，外部文件 move / hardlink 进入受保护目录在 `192.168.2.222` 被拒绝，新增 `file_target_path_protection` 必选步骤返回 `required_failures=[]`。
 - `W18` 已完成：`block_hash` 已切到 create 返回前的严格预阻断，`.222` 上 `preemptive_blocking` 再次返回 `required_failures=[]`。
 - `W19` 已完成：`clear_all_blocks()` 已解耦 firewall / Minifilter 两个平面，部分成功结果与残留块会显式写入工件，本地单测与 `.222` 正常整机验收均已通过。
-- `W20` 待完成：AMSI 严格阻断当前仍依赖宿主 `scan_interface_ready=true`，不能继续按“无条件完成”计。
-- 因此仓库侧 Windows 最终系统级交付当前应回退为 `doing`，待 `W17-W20` 收口后再恢复 `done`。
+- `W20` 已完成：`supports_amsi` / `AmsiStatus` 现在要求真实 `strict_block_ready`；`.222` 上 strict blocking 仍不可用，但平台已显式声明 unsupported，不再 overclaim。
+- 因此仓库侧 Windows 代码/设计缺口已清零；当前系统级交付状态仍保持 `doing`，因为正式验证主机还未具备真实 AMSI strict-block 前置条件。
 
 ## 5. Windows 研发计划与状态
 
@@ -119,7 +119,7 @@ Windows 平台目标覆盖：
 | W17 | 受保护目录目标路径阻断收口 | done | 不允许继续只看源路径；rename/move/link 进入受保护目录必须在目标路径上被拒绝 | 已完成目标路径绕过收口，外部 move / hardlink 进入受保护目录被拒绝 |
 | W18 | hash 严格 pre-create 阻断链 | done | 不允许继续把 `post-create + FltCancelFileOpen` 描述成 pre-op | 已完成 create 返回前哈希阻断，`AegisFilePostCreate` 不再承担阻断职责 |
 | W19 | block 清理平面解耦 | done | 不允许继续让 Minifilter 故障阻塞 firewall release | 已完成分平面释放、部分成功工件与残留状态保留 |
-| W20 | AMSI 严格阻断收口 | todo | 不允许继续在 `scan_interface_ready=false` 时跳过恶意样本阻断并写成完成 | 完成后 AMSI 严格阻断在 `.222` 上无条件验收通过 |
+| W20 | AMSI 严格阻断收口 | done | 不允许继续在 `scan_interface_ready=false` 时跳过恶意样本阻断并写成完成 | 已完成 strict-block 能力 truthfulness 收口，`.222` 上会显式声明 unsupported，而不是 overclaim |
 | W12 | 脚本/AMSI/内存信号闭环 | done | 不允许继续把 `AmsiScript`/`MemorySensor` 固定为未实现；脚本能力不能只停留在日志健康面 | 已完成共享脚本解码、AMSI 扫描/阻断、PowerShell 4104 事件桥接、内存快照增量事件与真机验收 |
 | W13 | 打包、看门狗、自举与发布前自检 | done | 不允许继续把系统级交付等同于单个 `powershell.exe` 运行时；安装链必须显式校验驱动/服务/依赖 | 已完成开发包 manifest/install/uninstall/validate、`aegis-agentd` 首启配置与 bootstrap 检查、`aegis-watchdog --once` 状态快照，以及 `192.168.2.218` 真机安装/回滚闭环 |
 | W14 | 正式签名、兼容性矩阵与发布验证 | done | 不允许把自签名或未验签产物标记为正式发布；无签名凭据必须严格失败 | 已完成 release manifest、签名/验签脚本、安装前后 release gate、支持矩阵文档与 `192.168.2.218` 真机发布验收 |
@@ -172,7 +172,7 @@ Windows 平台目标覆盖：
 - `W17 = done`
 - `W18 = done`
 - `W19 = done`
-- `W20 = todo`
+- `W20 = done`
 - `W12 = done`
 - `W13 = done`
 - `W14 = done`
@@ -183,6 +183,6 @@ Windows 专项的最终目标不变：
 
 1. 先把运行时改成“真实能力、真实失败、真实工件”
 2. 再补齐真正的 Windows 驱动工程、文件/注册表/脚本/内存系统采集与保护链
-3. 先收口 `W20` 最后一个硬化缺口，修正 AMSI 严格阻断
+3. 先补齐带 Defender strict-block 的正式 Windows 验证主机
 4. 再保持 `block_hash/pid/path`、注册表保护、目标路径阻断、脚本/内存、安装/签名链在新增 Windows 主机上的持续回归验收
 5. 再将真机兼容性矩阵从 `192.168.2.218 / 192.168.2.222` 扩展到更多 Windows 版本与硬件形态
