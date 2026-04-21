@@ -9,6 +9,7 @@
 - W16 本地输出：`target/windows-validation/192.168.2.222.json`
 - W17 本地输出：`target/windows-validation/192.168.2.222.json`
 - W18 本地输出：`target/windows-validation/192.168.2.222.json`
+- W19 本地输出：`target/windows-validation/192.168.2.222.json`
 - 实际验证时间：`2026-04-20 18:05:12 +08:00`
 - 实际验证 ID：`windows-runtime-20260420-180434`
 - W10 补充验证时间：`2026-04-20 16:46:03 +08:00`
@@ -29,6 +30,8 @@
 - W17 补充验证方式：远端重构建并安装 `AegisSensorKmod + AegisFileMonitor`，执行 `file_target_path_protection`，验证外部文件 `move` / `hardlink` 进入受保护目录失败
 - W18 补充验证时间：`2026-04-21 14:23:50 +08:00`
 - W18 补充验证方式：远端重构建并安装 `AegisSensorKmod + AegisFileMonitor`，重新执行 `preemptive_blocking`，验证 `block_hash` 在 create 返回前拒绝且整机 `required_failures=[]`
+- W19 补充验证时间：`2026-04-21 14:37:59 +08:00`
+- W19 补充验证方式：本地执行 `cargo test -p aegis-platform windows_clear_all_blocks_releases_firewall_when_minifilter_unavailable`，并在 `192.168.2.222` 重跑整机 `windows-runtime-verify.sh`，验证正常双平面清理链无回归
 
 ## 2. 主机选择结果
 
@@ -122,6 +125,9 @@
 - W18 验收摘要：`C:\ProgramData\Aegis\validation\windows-runtime-20260421-142041\summary.json`
 - W18 远端 payload 根目录：`C:\ProgramData\Aegis\validation\windows-runtime-verify-20260421-142031`
 - W18 关键结果：`{"hash_blocked_before_create_return":true,"preemptive_blocking_passed":true,"required_failures":[]}`
+- W19 验收摘要：`C:\ProgramData\Aegis\validation\windows-runtime-20260421-143528\summary.json`
+- W19 远端 payload 根目录：`C:\ProgramData\Aegis\validation\windows-runtime-verify-20260421-143518`
+- W19 关键结果：`{"runtime_verify_required_failures":[],"partial_release_unit_test_passed":true}`
 
 ## 6. 结论
 
@@ -136,4 +142,5 @@
 - `W16` 已额外验证通过 `block_hash` / `block_pid` / `block_path` 真实阻断链：Minifilter 权威 block map、TTL、事件回传与清空链路已经闭环，`WindowsPlatform` 不再把这三项能力维持在 audit-only 工件阶段。
 - `W17` 已额外验证通过目标路径保护链：`protect_files` 已能阻断外部文件 move / hardlink 进入受保护目录，目标路径绕过缺口已关闭。
 - `W18` 已额外验证通过 hash 严格预阻断链：`block_hash` 不再依赖 `AegisFilePostCreate + FltCancelFileOpen`，真机可验证命中 hash 的文件在 create 返回前被拒绝。
+- `W19` 已额外验证通过 block 清理平面解耦：Minifilter 不可用时 firewall 仍可释放，且正常真机整机验收未回归。
 - `security_4688` 的验收口径以“日志可读、record_id 可取”为准；`cmd.exe` 临时探针命中率被保留为观察项，不作为失败条件。

@@ -1,5 +1,13 @@
 # Windows block 清理平面解耦计划
 
+## 0. 状态
+
+- 已完成
+- 代码提交：`65b198f`
+- 真机主机：`192.168.2.222`
+- 远端验收时间：`2026-04-21 14:37:59 +08:00`
+- 验收 ID：`windows-runtime-20260421-143528`
+
 ## 1. 目标
 
 收口当前 `clear_all_blocks()` 的耦合设计，保证：
@@ -9,6 +17,8 @@
 - 返回结果和审计工件显式暴露各平面的成功/失败状态
 
 ## 2. 当前缺口
+
+以下缺口已在本轮收口，保留为计划与实际交付的对照基线：
 
 - 只要本地仍有非 network block 且 Minifilter 控制口不可用，`clear_all_blocks()` 会直接失败。
 - 这会连带阻塞已独立存在的 Windows 防火墙规则释放。
@@ -55,15 +65,23 @@
   - artifact 能反映部分成功
 - 真机 `192.168.2.222` 覆盖：
   - 正常双平面清空
-  - 受控模拟 Minifilter 不可用时 network release 仍生效
+  - 整机 `windows-runtime-verify.sh` 重跑后 `required_failures=[]`
 
 ## 5. 交付物
 
 - `crates/aegis-platform/src/windows.rs`
+- `crates/aegis-platform/src/traits.rs`
 - `scripts/windows-runtime-verify.ps1`
-- `docs/plan/sensor/sensor-windows-validation-matrix.md`
 
-## 6. 完成判定
+## 6. 实际交付结果
+
+- `clear_all_blocks()` 已改为 firewall / Minifilter 双平面独立清理：某一平面失败不会阻塞另一平面 release。
+- `WindowsBlockClearArtifact` 已新增 `minifilter_blocks_cleared`、`firewall_clear_error`、`minifilter_clear_error`、`remaining_blocks`，可复盘部分成功状态。
+- `PlatformExecutionSnapshot.active_blocks` 已改为按平面保留真实残留状态；只有成功清掉的平面会从快照中移除。
+- Rust 单测已新增 `windows_clear_all_blocks_releases_firewall_when_minifilter_unavailable`，覆盖 Minifilter 不可用时 firewall 仍被释放的场景。
+- `.222` 上重新跑整机 `windows-runtime-verify.sh` 返回 `required_failures=[]`，验证正常双平面清理链未回归。
+
+## 7. 完成判定
 
 - `clear_all_blocks()` 不再因单一平面故障阻塞另一平面的 release
 - clear artifact 能反映分平面成功/失败与残留状态
