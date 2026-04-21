@@ -31,6 +31,10 @@ const WINDOWS_QUERY_FILE_EVENTS_SCRIPT: &str =
     include_str!("../../../scripts/windows-query-file-events.ps1");
 const WINDOWS_CONFIGURE_FILE_PROTECTION_SCRIPT: &str =
     include_str!("../../../scripts/windows-configure-file-protection.ps1");
+const WINDOWS_CONFIGURE_PREEMPTIVE_BLOCK_SCRIPT: &str =
+    include_str!("../../../scripts/windows-configure-preemptive-block.ps1");
+const WINDOWS_CONFIGURE_REGISTRY_PROTECTION_SCRIPT: &str =
+    include_str!("../../../scripts/windows-configure-registry-protection.ps1");
 const WINDOWS_QUERY_REGISTRY_EVENTS_SCRIPT: &str =
     include_str!("../../../scripts/windows-query-registry-events.ps1");
 const WINDOWS_ROLLBACK_REGISTRY_SCRIPT: &str =
@@ -221,9 +225,14 @@ struct WindowsHostCapabilities {
     file_monitor_queue_capacity: Option<u32>,
     file_monitor_current_sequence: Option<u32>,
     file_monitor_status_detail: Option<String>,
+    file_block_entry_count: Option<u32>,
+    hash_block_count: Option<u32>,
+    pid_block_count: Option<u32>,
+    path_block_count: Option<u32>,
     registry_callback_registered: bool,
     registry_journal_capacity: Option<u32>,
     registry_current_sequence: Option<u32>,
+    protected_registry_path_count: Option<u32>,
     registry_status_detail: Option<String>,
     ob_callback_registered: bool,
     protected_process_count: Option<u32>,
@@ -367,7 +376,7 @@ impl WindowsHostCapabilities {
         facts.push(format!("memory_inventory={}", self.has_memory_inventory));
         facts.push(self.driver_transport_summary());
         facts.push(format!(
-            "file_monitor={};file_protocol={};file_queue={};protected_paths={};file_detail={}",
+            "file_monitor={};file_protocol={};file_queue={};protected_paths={};blocks={};hash_blocks={};pid_blocks={};path_blocks={};file_detail={}",
             self.file_monitor_ready(),
             self.file_monitor_protocol_version
                 .map(|value| format!("0x{value:08x}"))
@@ -378,14 +387,29 @@ impl WindowsHostCapabilities {
             self.protected_file_path_count
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".to_string()),
+            self.file_block_entry_count
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            self.hash_block_count
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            self.pid_block_count
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            self.path_block_count
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
             self.file_monitor_status_detail
                 .clone()
                 .unwrap_or_else(|| "-".to_string())
         ));
         facts.push(format!(
-            "registry_provider={};registry_journal_capacity={};registry_detail={}",
+            "registry_provider={};registry_journal_capacity={};protected_registry_paths={};registry_detail={}",
             self.registry_provider_ready(),
             self.registry_journal_capacity
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            self.protected_registry_path_count
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".to_string()),
             self.registry_status_detail
@@ -456,11 +480,21 @@ struct WindowsCapabilityProbe {
     #[serde(default)]
     file_monitor_status_detail: Option<String>,
     #[serde(default)]
+    file_block_entry_count: Option<u32>,
+    #[serde(default)]
+    hash_block_count: Option<u32>,
+    #[serde(default)]
+    pid_block_count: Option<u32>,
+    #[serde(default)]
+    path_block_count: Option<u32>,
+    #[serde(default)]
     registry_callback_registered: bool,
     #[serde(default)]
     registry_journal_capacity: Option<u32>,
     #[serde(default)]
     registry_current_sequence: Option<u32>,
+    #[serde(default)]
+    protected_registry_path_count: Option<u32>,
     #[serde(default)]
     registry_status_detail: Option<String>,
 }
@@ -651,6 +685,14 @@ struct WindowsFileMonitorStatus {
     current_sequence: u32,
     #[serde(default)]
     protected_path_count: u32,
+    #[serde(default)]
+    block_entry_count: u32,
+    #[serde(default)]
+    hash_block_count: u32,
+    #[serde(default)]
+    pid_block_count: u32,
+    #[serde(default)]
+    path_block_count: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -672,6 +714,14 @@ struct WindowsFileMonitorQuery {
     overflowed: bool,
     #[serde(default)]
     protected_path_count: u32,
+    #[serde(default)]
+    block_entry_count: u32,
+    #[serde(default)]
+    hash_block_count: u32,
+    #[serde(default)]
+    pid_block_count: u32,
+    #[serde(default)]
+    path_block_count: u32,
     events: Vec<WindowsFileMonitorEvent>,
 }
 
@@ -684,11 +734,51 @@ struct WindowsFileProtectionResponse {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsPreemptiveBlockEntry {
+    kind: String,
+    process_id: u32,
+    ttl_seconds_remaining: u32,
+    target: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsPreemptiveBlockStatus {
+    protocol_version: u32,
+    block_entry_count: u32,
+    hash_block_count: u32,
+    pid_block_count: u32,
+    path_block_count: u32,
+    #[serde(default)]
+    entries: Vec<WindowsPreemptiveBlockEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsPreemptiveBlockResponse {
+    protocol_version: u32,
+    block_entry_count: u32,
+    hash_block_count: u32,
+    pid_block_count: u32,
+    path_block_count: u32,
+    #[serde(default)]
+    resolved_target: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsRegistryProtectionResponse {
+    protocol_version: u32,
+    protected_path_count: u32,
+    #[serde(default)]
+    resolved_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 struct WindowsRegistryMonitorStatus {
     protocol_version: u32,
     registry_callback_registered: bool,
     journal_capacity: u32,
     current_sequence: u32,
+    #[serde(default)]
+    protected_path_count: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -698,6 +788,8 @@ struct WindowsRegistryMonitorEvent {
     operation: String,
     key_path: String,
     value_name: String,
+    #[serde(default)]
+    blocked: bool,
     old_value_present: bool,
     new_value_present: bool,
     old_value: Option<String>,
@@ -880,7 +972,7 @@ impl WindowsDeviceSnapshot {
 struct WindowsProtectionSurfaceArtifact {
     protected_pids: Vec<u32>,
     protected_paths: Vec<String>,
-    registry_protection_surface: Vec<String>,
+    protected_registry_paths: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -890,7 +982,7 @@ struct WindowsRegistryRollbackArtifact {
     applied_count: u32,
     current_sequence: u32,
     protected_paths: Vec<String>,
-    registry_protection_surface: Vec<String>,
+    protected_registry_paths: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -902,6 +994,8 @@ struct WindowsFirewallBlockReceipt {
 struct WindowsBlockAuditArtifact {
     kind: String,
     target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolved_target: Option<String>,
     ttl_secs: u64,
     enforced: bool,
     enforcement_plane: String,
@@ -1330,14 +1424,39 @@ impl PlatformResponse for WindowsPlatform {
 impl PreemptiveBlock for WindowsPlatform {
     fn block_hash(&self, hash: &str, ttl: Duration) -> Result<()> {
         let mut state = self.state.lock().expect("windows state poisoned");
-        push_block(&mut state.execution, "hash", hash.to_string(), ttl);
+        ensure_windows_driver_transport(&state.host, "apply windows hash block")?;
+        if !state.host.file_monitor_ready() {
+            bail!(
+                "apply windows hash block requires minifilter control port {}; {}",
+                AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
+                state.host.summary()
+            );
+        }
+        let normalized_hash = hash.trim().to_ascii_lowercase();
+        let response = apply_windows_hash_block(
+            self.runner.as_ref(),
+            AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
+            &normalized_hash,
+            ttl,
+        )
+        .with_context(|| format!("apply windows hash block {}", normalized_hash))?;
+        if response.protocol_version != AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION {
+            bail!(
+                "windows hash block protocol mismatch: expected 0x{expected:08x}, got 0x{actual:08x}",
+                expected = AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION,
+                actual = response.protocol_version
+            );
+        }
+        sync_windows_preemptive_block_state(&mut state, self.runner.as_ref())
+            .with_context(|| "synchronize windows preemptive block state after hash block")?;
         let artifact_path = write_windows_block_artifact(
             &mut state,
             "hash",
-            hash.to_string(),
+            normalized_hash,
+            response.resolved_target,
             ttl,
-            false,
-            "userspace-ledger",
+            true,
+            "windows-minifilter",
             None,
         )?;
         state.execution.audit_artifacts.push(artifact_path);
@@ -1346,14 +1465,38 @@ impl PreemptiveBlock for WindowsPlatform {
 
     fn block_pid(&self, pid: u32, ttl: Duration) -> Result<()> {
         let mut state = self.state.lock().expect("windows state poisoned");
-        push_block(&mut state.execution, "pid", pid.to_string(), ttl);
+        ensure_windows_driver_transport(&state.host, "apply windows pid block")?;
+        if !state.host.file_monitor_ready() {
+            bail!(
+                "apply windows pid block requires minifilter control port {}; {}",
+                AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
+                state.host.summary()
+            );
+        }
+        let response = apply_windows_pid_block(
+            self.runner.as_ref(),
+            AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
+            pid,
+            ttl,
+        )
+        .with_context(|| format!("apply windows pid block {}", pid))?;
+        if response.protocol_version != AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION {
+            bail!(
+                "windows pid block protocol mismatch: expected 0x{expected:08x}, got 0x{actual:08x}",
+                expected = AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION,
+                actual = response.protocol_version
+            );
+        }
+        sync_windows_preemptive_block_state(&mut state, self.runner.as_ref())
+            .with_context(|| "synchronize windows preemptive block state after pid block")?;
         let artifact_path = write_windows_block_artifact(
             &mut state,
             "pid",
             pid.to_string(),
+            response.resolved_target,
             ttl,
-            false,
-            "userspace-ledger",
+            true,
+            "windows-minifilter",
             None,
         )?;
         state.execution.audit_artifacts.push(artifact_path);
@@ -1362,15 +1505,39 @@ impl PreemptiveBlock for WindowsPlatform {
 
     fn block_path(&self, path: &Path, ttl: Duration) -> Result<()> {
         let mut state = self.state.lock().expect("windows state poisoned");
+        ensure_windows_driver_transport(&state.host, "apply windows path block")?;
+        if !state.host.file_monitor_ready() {
+            bail!(
+                "apply windows path block requires minifilter control port {}; {}",
+                AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
+                state.host.summary()
+            );
+        }
         let target = path.display().to_string();
-        push_block(&mut state.execution, "path", target.clone(), ttl);
+        let response = apply_windows_path_block(
+            self.runner.as_ref(),
+            AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
+            path,
+            ttl,
+        )
+        .with_context(|| format!("apply windows path block {}", target))?;
+        if response.protocol_version != AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION {
+            bail!(
+                "windows path block protocol mismatch: expected 0x{expected:08x}, got 0x{actual:08x}",
+                expected = AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION,
+                actual = response.protocol_version
+            );
+        }
+        sync_windows_preemptive_block_state(&mut state, self.runner.as_ref())
+            .with_context(|| "synchronize windows preemptive block state after path block")?;
         let artifact_path = write_windows_block_artifact(
             &mut state,
             "path",
             target,
+            response.resolved_target,
             ttl,
-            false,
-            "userspace-ledger",
+            true,
+            "windows-minifilter",
             None,
         )?;
         state.execution.audit_artifacts.push(artifact_path);
@@ -1395,6 +1562,7 @@ impl PreemptiveBlock for WindowsPlatform {
             &mut state,
             "network",
             target_value,
+            None,
             ttl,
             true,
             "windows-firewall",
@@ -1406,12 +1574,40 @@ impl PreemptiveBlock for WindowsPlatform {
 
     fn clear_all_blocks(&self) -> Result<()> {
         let mut state = self.state.lock().expect("windows state poisoned");
+        let cleared_block_count = state.execution.active_blocks.len();
+        let has_non_network_blocks = state
+            .execution
+            .active_blocks
+            .iter()
+            .any(|lease| lease.kind != "network");
+        if has_non_network_blocks && !state.host.file_monitor_ready() {
+            bail!(
+                "clear windows blocks requires minifilter control port {}; {}",
+                AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
+                state.host.summary()
+            );
+        }
+        if state.host.file_monitor_ready() {
+            let response = clear_windows_preemptive_blocks(
+                self.runner.as_ref(),
+                AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
+            )
+            .with_context(|| "clear windows minifilter block entries")?;
+            if response.protocol_version != AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION {
+                bail!(
+                    "windows block clear protocol mismatch: expected 0x{expected:08x}, got 0x{actual:08x}",
+                    expected = AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION,
+                    actual = response.protocol_version
+                );
+            }
+            sync_windows_preemptive_block_state(&mut state, self.runner.as_ref())
+                .with_context(|| "synchronize windows preemptive block state after clear")?;
+        }
         let cleared_rule_groups = state.block_rule_groups.clone();
         if !cleared_rule_groups.is_empty() {
             clear_windows_firewall_blocks(&mut state, self.runner.as_ref(), &cleared_rule_groups)
                 .with_context(|| "clear windows firewall block rules")?;
         }
-        let cleared_block_count = state.execution.active_blocks.len();
         state.execution.active_blocks.clear();
         state.block_rule_groups.clear();
         let artifact_path = write_windows_block_clear_artifact(
@@ -1560,6 +1756,65 @@ impl PlatformProtection for WindowsPlatform {
         state.host.protected_file_path_count = Some(protected_path_count);
         refresh_windows_driver_surfaces(&mut state.host, self.runner.as_ref())
             .with_context(|| "refresh windows driver surfaces after protect_files")?;
+        record_windows_protection_surface_artifact(&mut state)
+            .with_context(|| "write windows protection surface artifact")?;
+        Ok(())
+    }
+
+    fn protect_registry(&self, selectors: &[String]) -> Result<()> {
+        let mut state = self.state.lock().expect("windows state poisoned");
+        ensure_windows_driver_transport(&state.host, "protect windows registry")?;
+        if !state.host.registry_provider_ready() {
+            bail!(
+                "protect windows registry requires registry callback journal: {}",
+                state.host.summary()
+            );
+        }
+
+        let mut merged_paths = state.execution.protected_registry_paths.clone();
+        for selector in selectors {
+            let resolved = resolve_windows_registry_key_path(self.runner.as_ref(), selector)
+                .with_context(|| format!("resolve windows registry selector {}", selector))?;
+            if !merged_paths.iter().any(|existing| existing == &resolved) {
+                merged_paths.push(resolved);
+            }
+        }
+
+        let clear = clear_windows_registry_protection(
+            self.runner.as_ref(),
+            AEGIS_WINDOWS_DRIVER_SERVICE_NAME,
+        )
+        .with_context(|| "clear windows protected registry paths before apply")?;
+        if clear.protocol_version != AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION {
+            bail!(
+                "registry protection clear protocol mismatch: expected 0x{expected:08x}, got 0x{actual:08x}",
+                expected = AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION,
+                actual = clear.protocol_version
+            );
+        }
+
+        let mut protected_path_count = clear.protected_path_count;
+        for key_path in &merged_paths {
+            let response = protect_windows_registry_path(
+                self.runner.as_ref(),
+                AEGIS_WINDOWS_DRIVER_SERVICE_NAME,
+                key_path,
+            )
+            .with_context(|| format!("protect windows registry path {}", key_path))?;
+            if response.protocol_version != AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION {
+                bail!(
+                    "registry protection protocol mismatch: expected 0x{expected:08x}, got 0x{actual:08x}",
+                    expected = AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION,
+                    actual = response.protocol_version
+                );
+            }
+            protected_path_count = response.protected_path_count;
+        }
+
+        state.execution.protected_registry_paths = merged_paths;
+        state.host.protected_registry_path_count = Some(protected_path_count);
+        refresh_windows_driver_surfaces(&mut state.host, self.runner.as_ref())
+            .with_context(|| "refresh windows driver surfaces after protect_registry")?;
         record_windows_protection_surface_artifact(&mut state)
             .with_context(|| "write windows protection surface artifact")?;
         Ok(())
@@ -1971,9 +2226,14 @@ $data | ConvertTo-Json -Compress
         file_monitor_queue_capacity: probe.file_monitor_queue_capacity,
         file_monitor_current_sequence: probe.file_monitor_current_sequence,
         file_monitor_status_detail: probe.file_monitor_status_detail,
+        file_block_entry_count: probe.file_block_entry_count,
+        hash_block_count: probe.hash_block_count,
+        pid_block_count: probe.pid_block_count,
+        path_block_count: probe.path_block_count,
         registry_callback_registered: probe.registry_callback_registered,
         registry_journal_capacity: probe.registry_journal_capacity,
         registry_current_sequence: probe.registry_current_sequence,
+        protected_registry_path_count: probe.protected_registry_path_count,
         registry_status_detail: probe.registry_status_detail,
         ob_callback_registered: false,
         protected_process_count: None,
@@ -2037,13 +2297,21 @@ fn refresh_windows_driver_surfaces(
             host.file_monitor_queue_capacity = Some(status.queue_capacity);
             host.file_monitor_current_sequence = Some(status.current_sequence);
             host.protected_file_path_count = Some(status.protected_path_count);
+            host.file_block_entry_count = Some(status.block_entry_count);
+            host.hash_block_count = Some(status.hash_block_count);
+            host.pid_block_count = Some(status.pid_block_count);
+            host.path_block_count = Some(status.path_block_count);
             host.file_monitor_status_detail = Some(format!(
-                "port={};protocol=0x{:08x};queue_capacity={};current_sequence={};protected_paths={}",
+                "port={};protocol=0x{:08x};queue_capacity={};current_sequence={};protected_paths={};blocks={};hash_blocks={};pid_blocks={};path_blocks={}",
                 AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
                 status.protocol_version,
                 status.queue_capacity,
                 status.current_sequence,
-                status.protected_path_count
+                status.protected_path_count,
+                status.block_entry_count,
+                status.hash_block_count,
+                status.pid_block_count,
+                status.path_block_count
             ));
         }
         Err(error) => {
@@ -2052,6 +2320,10 @@ fn refresh_windows_driver_surfaces(
             host.file_monitor_queue_capacity = None;
             host.file_monitor_current_sequence = None;
             host.protected_file_path_count = None;
+            host.file_block_entry_count = None;
+            host.hash_block_count = None;
+            host.pid_block_count = None;
+            host.path_block_count = None;
             host.file_monitor_status_detail = Some(error.to_string());
         }
     }
@@ -2062,19 +2334,22 @@ fn refresh_windows_driver_surfaces(
                 && status.protocol_version == AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION;
             host.registry_journal_capacity = Some(status.journal_capacity);
             host.registry_current_sequence = Some(status.current_sequence);
+            host.protected_registry_path_count = Some(status.protected_path_count);
             host.registry_status_detail = Some(format!(
-                "service={};protocol=0x{:08x};journal_capacity={};current_sequence={};registered={}",
+                "service={};protocol=0x{:08x};journal_capacity={};current_sequence={};registered={};protected_paths={}",
                 AEGIS_WINDOWS_DRIVER_SERVICE_NAME,
                 status.protocol_version,
                 status.journal_capacity,
                 status.current_sequence,
-                status.registry_callback_registered
+                status.registry_callback_registered,
+                status.protected_path_count
             ));
         }
         Err(error) => {
             host.registry_callback_registered = false;
             host.registry_journal_capacity = None;
             host.registry_current_sequence = None;
+            host.protected_registry_path_count = None;
             host.registry_status_detail = Some(error.to_string());
         }
     }
@@ -2312,6 +2587,118 @@ fn protect_windows_file_path(
     )
 }
 
+fn query_windows_preemptive_block_state(
+    runner: &dyn WindowsCommandRunner,
+    port_name: &str,
+) -> Result<WindowsPreemptiveBlockStatus> {
+    run_embedded_powershell_json(
+        runner,
+        WINDOWS_CONFIGURE_PREEMPTIVE_BLOCK_SCRIPT,
+        &[
+            ("Mode", "status".to_string()),
+            ("PortName", port_name.to_string()),
+        ],
+    )
+}
+
+fn apply_windows_hash_block(
+    runner: &dyn WindowsCommandRunner,
+    port_name: &str,
+    hash: &str,
+    ttl: Duration,
+) -> Result<WindowsPreemptiveBlockResponse> {
+    run_embedded_powershell_json(
+        runner,
+        WINDOWS_CONFIGURE_PREEMPTIVE_BLOCK_SCRIPT,
+        &[
+            ("Mode", "block-hash".to_string()),
+            ("PortName", port_name.to_string()),
+            ("Hash", hash.to_string()),
+            ("TtlSeconds", ttl.as_secs().to_string()),
+        ],
+    )
+}
+
+fn apply_windows_pid_block(
+    runner: &dyn WindowsCommandRunner,
+    port_name: &str,
+    pid: u32,
+    ttl: Duration,
+) -> Result<WindowsPreemptiveBlockResponse> {
+    run_embedded_powershell_json(
+        runner,
+        WINDOWS_CONFIGURE_PREEMPTIVE_BLOCK_SCRIPT,
+        &[
+            ("Mode", "block-pid".to_string()),
+            ("PortName", port_name.to_string()),
+            ("ProcessId", pid.to_string()),
+            ("TtlSeconds", ttl.as_secs().to_string()),
+        ],
+    )
+}
+
+fn apply_windows_path_block(
+    runner: &dyn WindowsCommandRunner,
+    port_name: &str,
+    path: &Path,
+    ttl: Duration,
+) -> Result<WindowsPreemptiveBlockResponse> {
+    run_embedded_powershell_json(
+        runner,
+        WINDOWS_CONFIGURE_PREEMPTIVE_BLOCK_SCRIPT,
+        &[
+            ("Mode", "block-path".to_string()),
+            ("PortName", port_name.to_string()),
+            ("Path", path.display().to_string()),
+            ("TtlSeconds", ttl.as_secs().to_string()),
+        ],
+    )
+}
+
+fn clear_windows_preemptive_blocks(
+    runner: &dyn WindowsCommandRunner,
+    port_name: &str,
+) -> Result<WindowsPreemptiveBlockResponse> {
+    run_embedded_powershell_json(
+        runner,
+        WINDOWS_CONFIGURE_PREEMPTIVE_BLOCK_SCRIPT,
+        &[
+            ("Mode", "clear".to_string()),
+            ("PortName", port_name.to_string()),
+        ],
+    )
+}
+
+fn clear_windows_registry_protection(
+    runner: &dyn WindowsCommandRunner,
+    service_name: &str,
+) -> Result<WindowsRegistryProtectionResponse> {
+    run_embedded_powershell_json(
+        runner,
+        WINDOWS_CONFIGURE_REGISTRY_PROTECTION_SCRIPT,
+        &[
+            ("Mode", "clear".to_string()),
+            ("ServiceName", service_name.to_string()),
+        ],
+    )
+}
+
+fn protect_windows_registry_path(
+    runner: &dyn WindowsCommandRunner,
+    service_name: &str,
+    key_path: &str,
+) -> Result<WindowsRegistryProtectionResponse> {
+    run_embedded_powershell_json(
+        runner,
+        WINDOWS_CONFIGURE_REGISTRY_PROTECTION_SCRIPT,
+        &[
+            ("Mode", "protect".to_string()),
+            ("ServiceName", service_name.to_string()),
+            ("KeyPath", key_path.to_string()),
+        ],
+    )
+}
+
 fn resolve_windows_registry_key_path(
     runner: &dyn WindowsCommandRunner,
     selector: &str,
@@ -2378,9 +2765,10 @@ fn file_monitor_event_subject(event: &WindowsFileMonitorEvent) -> String {
 
 fn registry_monitor_event_subject(event: &WindowsRegistryMonitorEvent) -> String {
     truncate_subject(&format!(
-        "sequence={};operation={};key={};value={};old={};new={}",
+        "sequence={};operation={};blocked={};key={};value={};old={};new={}",
         event.sequence,
         event.operation,
+        event.blocked,
         event.key_path,
         if event.value_name.is_empty() {
             "-"
@@ -2390,6 +2778,47 @@ fn registry_monitor_event_subject(event: &WindowsRegistryMonitorEvent) -> String
         event.old_value.as_deref().unwrap_or("-"),
         event.new_value.as_deref().unwrap_or("-")
     ))
+}
+
+fn sync_windows_preemptive_block_state(
+    state: &mut WindowsState,
+    runner: &dyn WindowsCommandRunner,
+) -> Result<()> {
+    let status = query_windows_preemptive_block_state(runner, AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME)?;
+    if status.protocol_version != AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION {
+        bail!(
+            "preemptive block protocol mismatch: expected 0x{expected:08x}, got 0x{actual:08x}",
+            expected = AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION,
+            actual = status.protocol_version
+        );
+    }
+
+    state.host.file_block_entry_count = Some(status.block_entry_count);
+    state.host.hash_block_count = Some(status.hash_block_count);
+    state.host.pid_block_count = Some(status.pid_block_count);
+    state.host.path_block_count = Some(status.path_block_count);
+
+    let mut reconciled = state
+        .execution
+        .active_blocks
+        .iter()
+        .filter(|lease| lease.kind == "network")
+        .cloned()
+        .collect::<Vec<_>>();
+    for entry in status.entries {
+        let target = if entry.kind == "pid" {
+            entry.process_id.to_string()
+        } else {
+            entry.target
+        };
+        reconciled.push(BlockLease {
+            kind: entry.kind,
+            target,
+            ttl_secs: u64::from(entry.ttl_seconds_remaining),
+        });
+    }
+    state.execution.active_blocks = reconciled;
+    Ok(())
 }
 
 fn collect_file_monitor_events(
@@ -2416,13 +2845,21 @@ fn collect_file_monitor_events(
     state.host.file_monitor_queue_capacity = Some(response.queue_capacity);
     state.host.file_monitor_current_sequence = Some(response.current_sequence);
     state.host.protected_file_path_count = Some(response.protected_path_count);
+    state.host.file_block_entry_count = Some(response.block_entry_count);
+    state.host.hash_block_count = Some(response.hash_block_count);
+    state.host.pid_block_count = Some(response.pid_block_count);
+    state.host.path_block_count = Some(response.path_block_count);
     state.host.file_monitor_status_detail = Some(format!(
-        "port={};current_sequence={};returned_count={};overflowed={};protected_paths={}",
+        "port={};current_sequence={};returned_count={};overflowed={};protected_paths={};blocks={};hash_blocks={};pid_blocks={};path_blocks={}",
         AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
         response.current_sequence,
         response.returned_count,
         response.overflowed,
-        response.protected_path_count
+        response.protected_path_count,
+        response.block_entry_count,
+        response.hash_block_count,
+        response.pid_block_count,
+        response.path_block_count
     ));
     state.file_monitor_cursor = Some(response.current_sequence);
 
@@ -2461,11 +2898,12 @@ fn collect_registry_monitor_events(
     state.host.registry_callback_registered = true;
     state.host.registry_current_sequence = Some(response.current_sequence);
     state.host.registry_status_detail = Some(format!(
-        "service={};current_sequence={};returned_count={};overflowed={}",
+        "service={};current_sequence={};returned_count={};overflowed={};protected_paths={}",
         AEGIS_WINDOWS_DRIVER_SERVICE_NAME,
         response.current_sequence,
         response.returned_count,
-        response.overflowed
+        response.overflowed,
+        state.host.protected_registry_path_count.unwrap_or_default()
     ));
     state.registry_monitor_cursor = Some(response.current_sequence);
 
@@ -2473,7 +2911,11 @@ fn collect_registry_monitor_events(
         state.pending_events.push_back(
             WindowsEventStub {
                 provider: WindowsProviderKind::RegistryCallback,
-                operation: format!("registry-{}", event.operation),
+                operation: if event.blocked {
+                    format!("registry-block-{}", event.operation)
+                } else {
+                    format!("registry-{}", event.operation)
+                },
                 subject: registry_monitor_event_subject(&event),
             }
             .encode(),
@@ -3287,14 +3729,6 @@ fn write_windows_response_script(
     Ok(path)
 }
 
-const WINDOWS_REGISTRY_PROTECTION_SURFACE: [&str; 5] = [
-    r"HKLM\Software\Microsoft\Windows\CurrentVersion\Run",
-    r"HKLM\SYSTEM\CurrentControlSet\Services",
-    r"HKLM\Software\Microsoft\Windows NT\CurrentVersion\Image File Execution Options",
-    r"HKLM\Software\Classes\CLSID",
-    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-];
-
 fn write_windows_protection_surface_artifact(state: &mut WindowsState) -> Result<PathBuf> {
     let artifact = WindowsProtectionSurfaceArtifact {
         protected_pids: state.execution.protected_pids.clone(),
@@ -3304,10 +3738,7 @@ fn write_windows_protection_surface_artifact(state: &mut WindowsState) -> Result
             .iter()
             .map(|path| path.display().to_string())
             .collect(),
-        registry_protection_surface: WINDOWS_REGISTRY_PROTECTION_SURFACE
-            .iter()
-            .map(|path| (*path).to_string())
-            .collect(),
+        protected_registry_paths: state.execution.protected_registry_paths.clone(),
     };
     let path = state
         .base_dir
@@ -3346,10 +3777,7 @@ fn write_windows_registry_rollback_artifact(
             .iter()
             .map(|path| path.display().to_string())
             .collect(),
-        registry_protection_surface: WINDOWS_REGISTRY_PROTECTION_SURFACE
-            .iter()
-            .map(|path| (*path).to_string())
-            .collect(),
+        protected_registry_paths: state.execution.protected_registry_paths.clone(),
     };
     let path = state
         .base_dir
@@ -3367,6 +3795,7 @@ fn write_windows_block_artifact(
     state: &mut WindowsState,
     kind: &str,
     target: String,
+    resolved_target: Option<String>,
     ttl: Duration,
     enforced: bool,
     enforcement_plane: &str,
@@ -3375,6 +3804,7 @@ fn write_windows_block_artifact(
     let artifact = WindowsBlockAuditArtifact {
         kind: kind.to_string(),
         target,
+        resolved_target,
         ttl_secs: ttl.as_secs(),
         enforced,
         enforcement_plane: enforcement_plane.to_string(),
@@ -4235,9 +4665,14 @@ mod tests {
             file_monitor_queue_capacity: None,
             file_monitor_current_sequence: None,
             file_monitor_status_detail: None,
+            file_block_entry_count: None,
+            hash_block_count: None,
+            pid_block_count: None,
+            path_block_count: None,
             registry_callback_registered: false,
             registry_journal_capacity: None,
             registry_current_sequence: None,
+            protected_registry_path_count: None,
             registry_status_detail: None,
             ob_callback_registered: false,
             protected_process_count: None,
@@ -4273,15 +4708,20 @@ mod tests {
         host.file_monitor_queue_capacity = Some(256);
         host.file_monitor_current_sequence = Some(1200);
         host.protected_file_path_count = Some(1);
+        host.file_block_entry_count = Some(0);
+        host.hash_block_count = Some(0);
+        host.pid_block_count = Some(0);
+        host.path_block_count = Some(0);
         host.file_monitor_status_detail = Some(
-            "port=\\AegisFileMonitorPort;protocol=0x00010000;queue_capacity=256;current_sequence=1200;protected_paths=1"
+            "port=\\AegisFileMonitorPort;protocol=0x00010000;queue_capacity=256;current_sequence=1200;protected_paths=1;blocks=0;hash_blocks=0;pid_blocks=0;path_blocks=0"
                 .to_string(),
         );
         host.registry_callback_registered = true;
         host.registry_journal_capacity = Some(256);
         host.registry_current_sequence = Some(640);
+        host.protected_registry_path_count = Some(1);
         host.registry_status_detail = Some(
-            "service=AegisSensorKmod;protocol=0x00010000;journal_capacity=256;current_sequence=640;registered=True"
+            "service=AegisSensorKmod;protocol=0x00010000;journal_capacity=256;current_sequence=640;registered=True;protected_paths=1"
                 .to_string(),
         );
         host.ob_callback_registered = true;
@@ -4636,7 +5076,7 @@ mod tests {
         protected_path_count: u32,
     ) -> String {
         format!(
-            r#"{{"port_name":"\\AegisFileMonitorPort","protocol_version":65536,"queue_capacity":{queue_capacity},"current_sequence":{current_sequence},"protected_path_count":{protected_path_count}}}"#
+            r#"{{"port_name":"\\AegisFileMonitorPort","protocol_version":65536,"queue_capacity":{queue_capacity},"current_sequence":{current_sequence},"protected_path_count":{protected_path_count},"block_entry_count":0,"hash_block_count":0,"pid_block_count":0,"path_block_count":0}}"#
         )
     }
 
@@ -4656,7 +5096,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         format!(
-            r#"{{"port_name":"\\AegisFileMonitorPort","protocol_version":65536,"queue_capacity":{queue_capacity},"oldest_sequence":0,"current_sequence":{current_sequence},"returned_count":{},"overflowed":false,"protected_path_count":1,"events":[{}]}}"#,
+            r#"{{"port_name":"\\AegisFileMonitorPort","protocol_version":65536,"queue_capacity":{queue_capacity},"oldest_sequence":0,"current_sequence":{current_sequence},"returned_count":{},"overflowed":false,"protected_path_count":1,"block_entry_count":0,"hash_block_count":0,"pid_block_count":0,"path_block_count":0,"events":[{}]}}"#,
             events.len(),
             rows.join(",")
         )
@@ -4671,9 +5111,63 @@ mod tests {
         )
     }
 
-    fn registry_status_output(current_sequence: u32, journal_capacity: u32) -> String {
+    fn preemptive_block_response_output(
+        block_entry_count: u32,
+        hash_block_count: u32,
+        pid_block_count: u32,
+        path_block_count: u32,
+        resolved_target: Option<&str>,
+    ) -> String {
+        let resolved_target = resolved_target
+            .map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+            .unwrap_or_else(|| "null".to_string());
         format!(
-            r#"{{"service_name":"AegisSensorKmod","protocol_version":65536,"registry_callback_registered":true,"journal_capacity":{journal_capacity},"journal_count":1,"oldest_sequence":1,"current_sequence":{current_sequence}}}"#
+            r#"{{"protocol_version":65536,"block_entry_count":{block_entry_count},"hash_block_count":{hash_block_count},"pid_block_count":{pid_block_count},"path_block_count":{path_block_count},"resolved_target":{resolved_target}}}"#
+        )
+    }
+
+    fn preemptive_block_status_output(
+        entries: &[(&str, u32, u32, &str)],
+        hash_block_count: u32,
+        pid_block_count: u32,
+        path_block_count: u32,
+    ) -> String {
+        let rows = entries
+            .iter()
+            .map(|(kind, process_id, ttl_seconds_remaining, target)| {
+                format!(
+                    "{{\"kind\":\"{}\",\"process_id\":{process_id},\"ttl_seconds_remaining\":{ttl_seconds_remaining},\"target\":\"{}\"}}",
+                    kind.replace('\\', "\\\\").replace('"', "\\\""),
+                    target.replace('\\', "\\\\").replace('"', "\\\"")
+                )
+            })
+            .collect::<Vec<_>>();
+        format!(
+            r#"{{"protocol_version":65536,"block_entry_count":{},"hash_block_count":{hash_block_count},"pid_block_count":{pid_block_count},"path_block_count":{path_block_count},"entries":[{}]}}"#,
+            entries.len(),
+            rows.join(",")
+        )
+    }
+
+    fn registry_status_output(
+        current_sequence: u32,
+        journal_capacity: u32,
+        protected_path_count: u32,
+    ) -> String {
+        format!(
+            r#"{{"service_name":"AegisSensorKmod","protocol_version":65536,"registry_callback_registered":true,"journal_capacity":{journal_capacity},"journal_count":1,"oldest_sequence":1,"current_sequence":{current_sequence},"protected_path_count":{protected_path_count}}}"#
+        )
+    }
+
+    fn registry_protection_output(
+        protected_path_count: u32,
+        resolved_path: Option<&str>,
+    ) -> String {
+        let resolved_path = resolved_path
+            .map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+            .unwrap_or_else(|| "null".to_string());
+        format!(
+            r#"{{"protocol_version":65536,"protected_path_count":{protected_path_count},"resolved_path":{resolved_path}}}"#
         )
     }
 
@@ -4695,12 +5189,21 @@ mod tests {
 
     fn registry_events_output(
         current_sequence: u32,
-        events: &[(u32, i64, &str, &str, &str, Option<&str>, Option<&str>)],
+        events: &[(u32, i64, &str, bool, &str, &str, Option<&str>, Option<&str>)],
     ) -> String {
         let rows = events
             .iter()
             .map(
-                |(sequence, timestamp, operation, key_path, value_name, old_value, new_value)| {
+                |(
+                    sequence,
+                    timestamp,
+                    operation,
+                    blocked,
+                    key_path,
+                    value_name,
+                    old_value,
+                    new_value,
+                )| {
                     let old_value = old_value
                         .map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
                         .unwrap_or_else(|| "null".to_string());
@@ -4708,7 +5211,7 @@ mod tests {
                         .map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
                         .unwrap_or_else(|| "null".to_string());
                     format!(
-                        "{{\"sequence\":{sequence},\"timestamp\":{timestamp},\"operation\":\"{}\",\"key_path\":\"{}\",\"value_name\":\"{}\",\"old_value_present\":{},\"new_value_present\":{},\"old_value\":{old_value},\"new_value\":{new_value}}}",
+                        "{{\"sequence\":{sequence},\"timestamp\":{timestamp},\"operation\":\"{}\",\"blocked\":{blocked},\"key_path\":\"{}\",\"value_name\":\"{}\",\"old_value_present\":{},\"new_value_present\":{},\"old_value\":{old_value},\"new_value\":{new_value}}}",
                         operation.replace('\\', "\\\\").replace('"', "\\\""),
                         key_path.replace('\\', "\\\\").replace('"', "\\\""),
                         value_name.replace('\\', "\\\\").replace('"', "\\\""),
@@ -4807,7 +5310,19 @@ mod tests {
                 file_protection_output(0, None),
                 file_protection_output(1, Some(r"\Device\HarddiskVolume4\temp\payload.exe")),
                 file_status_output(1200, 256, 1),
-                registry_status_output(641, 256),
+                registry_status_output(641, 256, 0),
+                driver_integrity_output(1, false, 0x00000401),
+                r#"{"key_path":"\\REGISTRY\\MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options"}"#
+                    .to_string(),
+                registry_protection_output(0, None),
+                registry_protection_output(
+                    1,
+                    Some(
+                        r"\REGISTRY\MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options",
+                    ),
+                ),
+                file_status_output(1200, 256, 1),
+                registry_status_output(641, 256, 1),
                 driver_integrity_output(1, false, 0x00000401),
                 quarantine_receipt_output(&quarantine_path, "deadbeef"),
                 artifact_bundle_output(artifact_id, &bundle_path),
@@ -4819,6 +5334,8 @@ mod tests {
                     "AegisIsolation-test",
                 ),
                 String::new(),
+                preemptive_block_response_output(1, 1, 0, 0, None),
+                preemptive_block_status_output(&[("hash", 0, 90, "deadbeef")], 1, 0, 0),
             ])),
             healthy_host_with_driver_surfaces(),
         )
@@ -4831,6 +5348,18 @@ mod tests {
                 String::new(),
             ])),
             healthy_host(),
+        )
+    }
+
+    fn platform_with_probe_for_preemptive_clear() -> WindowsPlatform {
+        WindowsPlatform::with_runner_for_test(
+            Box::new(QueuedWindowsRunner::new([
+                preemptive_block_response_output(1, 0, 1, 0, None),
+                preemptive_block_status_output(&[("pid", 5150, 45, "")], 0, 1, 0),
+                preemptive_block_response_output(0, 0, 0, 0, None),
+                preemptive_block_status_output(&[], 0, 0, 0),
+            ])),
+            healthy_host_with_driver_surfaces(),
         )
     }
 
@@ -4965,6 +5494,12 @@ mod tests {
         platform
             .protect_files(&[PathBuf::from("C:/temp/payload.exe")])
             .expect("protect files should record");
+        platform
+            .protect_registry(&[
+                r"HKLM\Software\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+                    .to_string(),
+            ])
+            .expect("protect registry should record");
         let receipt = platform
             .quarantine_file(Path::new("C:/temp/payload.exe"))
             .expect("quarantine should execute");
@@ -5002,6 +5537,13 @@ mod tests {
             snapshot.protected_paths,
             vec![PathBuf::from("C:/temp/payload.exe")]
         );
+        assert_eq!(
+            snapshot.protected_registry_paths,
+            vec![
+                r"\REGISTRY\MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+                    .to_string()
+            ]
+        );
         assert_eq!(snapshot.quarantined_files.len(), 1);
         assert_eq!(snapshot.quarantined_files[0], receipt);
         assert!(snapshot.quarantined_files[0].vault_path.exists());
@@ -5036,13 +5578,18 @@ mod tests {
         let protection_json =
             fs::read_to_string(protection_artifact).expect("read protection artifact");
         assert!(protection_json.contains("C:/temp/payload.exe"));
-        assert!(protection_json.contains("Image File Execution Options"));
+        assert!(protection_json.contains(
+            r"\\REGISTRY\\MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options"
+        ));
         let rollback_json = fs::read_to_string(rollback_artifact).expect("read rollback artifact");
         assert!(rollback_json.contains(r"HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"));
         assert!(rollback_json
             .contains(r"\\REGISTRY\\MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"));
         assert!(rollback_json.contains("\"applied_count\": 1"));
         assert!(rollback_json.contains("C:/temp/payload.exe"));
+        assert!(rollback_json.contains(
+            r"\\REGISTRY\\MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options"
+        ));
         let block_artifact = snapshot
             .audit_artifacts
             .iter()
@@ -5056,6 +5603,8 @@ mod tests {
         let block_json = fs::read_to_string(block_artifact).expect("read block artifact");
         assert!(block_json.contains("\"kind\": \"hash\""));
         assert!(block_json.contains("deadbeef"));
+        assert!(block_json.contains("\"enforced\": true"));
+        assert!(block_json.contains("\"enforcement_plane\": \"windows-minifilter\""));
         assert!(!snapshot.network_isolation_active);
         assert_eq!(
             snapshot
@@ -5125,6 +5674,46 @@ mod tests {
         let clear_json = fs::read_to_string(clear_artifact).expect("read clear artifact");
         assert!(clear_json.contains("\"cleared_block_count\": 1"));
         assert!(clear_json.contains("AegisBlock-test"));
+    }
+
+    #[test]
+    fn windows_clear_all_blocks_clears_minifilter_state() {
+        let platform = platform_with_probe_for_preemptive_clear();
+
+        platform
+            .block_pid(5150, Duration::from_secs(45))
+            .expect("block pid should be enforced by minifilter");
+        platform.clear_all_blocks().expect("clear all blocks");
+
+        let snapshot = platform.execution_snapshot();
+        assert!(snapshot.active_blocks.is_empty());
+        let block_artifact = snapshot
+            .audit_artifacts
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .map(|value| value.starts_with("block-"))
+                    .unwrap_or(false)
+            })
+            .expect("pid block artifact should exist");
+        let block_json = fs::read_to_string(block_artifact).expect("read pid block artifact");
+        assert!(block_json.contains("\"kind\": \"pid\""));
+        assert!(block_json.contains("\"enforced\": true"));
+        assert!(block_json.contains("\"enforcement_plane\": \"windows-minifilter\""));
+        let clear_artifact = snapshot
+            .audit_artifacts
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .map(|value| value.starts_with("clear-"))
+                    .unwrap_or(false)
+            })
+            .expect("block clear artifact should exist");
+        let clear_json = fs::read_to_string(clear_artifact).expect("read clear artifact");
+        assert!(clear_json.contains("\"cleared_block_count\": 1"));
+        assert!(clear_json.contains("\"cleared_rule_groups\": []"));
     }
 
     #[test]
@@ -5291,6 +5880,7 @@ mod tests {
                         641,
                         1713612020,
                         "set",
+                        false,
                         r"\REGISTRY\MACHINE\SOFTWARE\AegisW10Test",
                         "SampleValue",
                         Some("before"),

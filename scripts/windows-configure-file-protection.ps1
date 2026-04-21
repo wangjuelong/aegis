@@ -34,6 +34,10 @@ namespace AegisFileProtectionBridge {
         public UInt32 ReturnedCount;
         public UInt32 Overflowed;
         public UInt32 ProtectedPathCount;
+        public UInt32 BlockEntryCount;
+        public UInt32 HashBlockCount;
+        public UInt32 PidBlockCount;
+        public UInt32 PathBlockCount;
     }
 
     [StructLayout(LayoutKind.Sequential, Pack = 1, CharSet = CharSet.Unicode)]
@@ -207,6 +211,10 @@ try {
             queue_capacity = [uint32]$response.QueueCapacity
             current_sequence = [uint32]$response.CurrentSequence
             protected_path_count = [uint32]$response.ProtectedPathCount
+            block_entry_count = [uint32]$response.BlockEntryCount
+            hash_block_count = [uint32]$response.HashBlockCount
+            pid_block_count = [uint32]$response.PidBlockCount
+            path_block_count = [uint32]$response.PathBlockCount
         } | ConvertTo-Json -Compress
         return
     }

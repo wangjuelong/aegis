@@ -69,13 +69,16 @@ if ($LASTEXITCODE -ne 0) {
     throw "pnputil /add-driver failed with exit code $LASTEXITCODE"
 }
 
-fltmc load $ServiceName | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    throw "fltmc load failed with exit code $LASTEXITCODE"
-}
-
-Start-Sleep -Seconds 1
 $filterState = Get-LoadedFilter -Name $ServiceName
+if ($null -eq $filterState) {
+    fltmc load $ServiceName | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "fltmc load failed with exit code $LASTEXITCODE"
+    }
+
+    Start-Sleep -Seconds 1
+    $filterState = Get-LoadedFilter -Name $ServiceName
+}
 if ($null -eq $filterState) {
     throw "minifilter is not loaded after installation"
 }

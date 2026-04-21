@@ -1,12 +1,21 @@
 param(
     [string]$DriverRoot = (Join-Path $PSScriptRoot "driver"),
+    [string]$MinifilterRoot = (Join-Path $PSScriptRoot "minifilter"),
     [string]$BuildScriptPath = (Join-Path $PSScriptRoot "windows-build-driver.ps1"),
+    [string]$BuildMinifilterScriptPath = (Join-Path $PSScriptRoot "windows-build-minifilter.ps1"),
     [string]$InstallScriptPath = (Join-Path $PSScriptRoot "windows-install-driver.ps1"),
     [string]$UninstallScriptPath = (Join-Path $PSScriptRoot "windows-uninstall-driver.ps1"),
+    [string]$InstallMinifilterScriptPath = (Join-Path $PSScriptRoot "windows-install-minifilter.ps1"),
+    [string]$UninstallMinifilterScriptPath = (Join-Path $PSScriptRoot "windows-uninstall-minifilter.ps1"),
     [string]$AmsiScanScriptPath = (Join-Path $PSScriptRoot "windows-scan-script-with-amsi.ps1"),
     [string]$ScriptEventQueryPath = (Join-Path $PSScriptRoot "windows-query-script-events.ps1"),
     [string]$MemorySnapshotScriptPath = (Join-Path $PSScriptRoot "windows-query-memory-snapshot.ps1"),
-    [string]$DriverServiceName = "AegisSensorKmod"
+    [string]$FileEventQueryPath = (Join-Path $PSScriptRoot "windows-query-file-events.ps1"),
+    [string]$RegistryEventQueryPath = (Join-Path $PSScriptRoot "windows-query-registry-events.ps1"),
+    [string]$RegistryProtectionScriptPath = (Join-Path $PSScriptRoot "windows-configure-registry-protection.ps1"),
+    [string]$PreemptiveBlockScriptPath = (Join-Path $PSScriptRoot "windows-configure-preemptive-block.ps1"),
+    [string]$DriverServiceName = "AegisSensorKmod",
+    [string]$MinifilterServiceName = "AegisFileMonitor"
 )
 
 Set-StrictMode -Version Latest
@@ -44,6 +53,16 @@ New-Item -ItemType Directory -Path $forensicsRoot -Force | Out-Null
 
 $results = [ordered]@{}
 $requiredFailures = New-Object System.Collections.Generic.List[string]
+$driverInstallState = [ordered]@{
+    ready = $false
+    build = $null
+    install = $null
+}
+$minifilterInstallState = [ordered]@{
+    ready = $false
+    build = $null
+    install = $null
+}
 
 function Resolve-ExistingPath {
     param(
@@ -160,7 +179,10 @@ function Set-ScriptBlockLoggingEnabled {
     if ($Enabled) {
         New-ItemProperty -Path $keyPath -Name "EnableScriptBlockLogging" -PropertyType DWord -Value 1 -Force | Out-Null
     } else {
-        Remove-ItemProperty -Path $keyPath -Name "EnableScriptBlockLogging" -ErrorAction SilentlyContinue
+        $item = Get-Item -LiteralPath $keyPath -ErrorAction SilentlyContinue
+        if ($null -ne $item -and @($item.Property) -contains "EnableScriptBlockLogging") {
+            Remove-ItemProperty -Path $keyPath -Name "EnableScriptBlockLogging" -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -175,7 +197,10 @@ function Restore-ScriptBlockLoggingState {
         New-Item -ItemType Directory -Path $keyPath -Force | Out-Null
         New-ItemProperty -Path $keyPath -Name "EnableScriptBlockLogging" -PropertyType DWord -Value ([int]$State.value) -Force | Out-Null
     } else {
-        Remove-ItemProperty -Path $keyPath -Name "EnableScriptBlockLogging" -ErrorAction SilentlyContinue
+        $item = Get-Item -LiteralPath $keyPath -ErrorAction SilentlyContinue
+        if ($null -ne $item -and @($item.Property) -contains "EnableScriptBlockLogging") {
+            Remove-ItemProperty -Path $keyPath -Name "EnableScriptBlockLogging" -ErrorAction SilentlyContinue
+        }
         $item = Get-Item -LiteralPath $keyPath -ErrorAction SilentlyContinue
         if ($null -ne $item -and $item.Property.Count -eq 0) {
             Remove-Item -LiteralPath $keyPath -Force
@@ -269,36 +294,83 @@ Invoke-ValidationStep -Name "driver_transport" -Body {
     $resolvedInstallScript = Resolve-ExistingPath -Path $InstallScriptPath -Description "driver install script"
     $resolvedUninstallScript = Resolve-ExistingPath -Path $UninstallScriptPath -Description "driver uninstall script"
 
+    try {
+        Invoke-JsonScript -ScriptPath $resolvedUninstallScript -Arguments @{
+            ServiceName = $DriverServiceName
+        } | Out-Null
+    } catch {
+    }
+
     $buildResult = Invoke-JsonScript -ScriptPath $resolvedBuildScript -Arguments @{
         DriverRoot = $resolvedDriverRoot
         Configuration = "Release"
         Platform = "x64"
     }
 
-    $installResult = $null
-    $uninstallResult = $null
-    try {
-        $installResult = Invoke-JsonScript -ScriptPath $resolvedInstallScript -Arguments @{
-            DriverRoot = $resolvedDriverRoot
-            Configuration = "Release"
-            Platform = "x64"
-            ServiceName = $DriverServiceName
-        }
-
-        $protocolVersion = [int]$installResult.driver_query.protocol_version
-        if ($protocolVersion -ne 65536) {
-            throw "driver protocol mismatch: $protocolVersion"
-        }
-    } finally {
-        $uninstallResult = Invoke-JsonScript -ScriptPath $resolvedUninstallScript -Arguments @{
-            ServiceName = $DriverServiceName
-        }
+    $installResult = Invoke-JsonScript -ScriptPath $resolvedInstallScript -Arguments @{
+        DriverRoot = $resolvedDriverRoot
+        Configuration = "Release"
+        Platform = "x64"
+        ServiceName = $DriverServiceName
     }
+
+    $protocolVersion = [int]$installResult.driver_query.protocol_version
+    if ($protocolVersion -ne 65536) {
+        throw "driver protocol mismatch: $protocolVersion"
+    }
+
+    $driverInstallState.ready = $true
+    $driverInstallState.build = $buildResult
+    $driverInstallState.install = $installResult
 
     [ordered]@{
         build = $buildResult
         install = $installResult
-        uninstall = $uninstallResult
+    }
+}
+
+Invoke-ValidationStep -Name "minifilter_transport" -Body {
+    $resolvedMinifilterRoot = Resolve-ExistingPath -Path $MinifilterRoot -Description "minifilter root"
+    $resolvedBuildMinifilterScript = Resolve-ExistingPath -Path $BuildMinifilterScriptPath -Description "minifilter build script"
+    $resolvedInstallMinifilterScript = Resolve-ExistingPath -Path $InstallMinifilterScriptPath -Description "minifilter install script"
+    $resolvedUninstallMinifilterScript = Resolve-ExistingPath -Path $UninstallMinifilterScriptPath -Description "minifilter uninstall script"
+    $resolvedFileEventQuery = Resolve-ExistingPath -Path $FileEventQueryPath -Description "file event query script"
+
+    try {
+        Invoke-JsonScript -ScriptPath $resolvedUninstallMinifilterScript -Arguments @{
+            ServiceName = $MinifilterServiceName
+        } | Out-Null
+    } catch {
+    }
+
+    $buildResult = Invoke-JsonScript -ScriptPath $resolvedBuildMinifilterScript -Arguments @{
+        DriverRoot = $resolvedMinifilterRoot
+        Configuration = "Release"
+        Platform = "x64"
+    }
+
+    $installResult = Invoke-JsonScript -ScriptPath $resolvedInstallMinifilterScript -Arguments @{
+        DriverRoot = $resolvedMinifilterRoot
+        Configuration = "Release"
+        Platform = "x64"
+        ServiceName = $MinifilterServiceName
+    }
+
+    $status = Invoke-JsonScript -ScriptPath $resolvedFileEventQuery -Arguments @{
+        Mode = "status"
+    }
+    if ([uint32]$status.protocol_version -ne 65536) {
+        throw "minifilter protocol mismatch: $([uint32]$status.protocol_version)"
+    }
+
+    $minifilterInstallState.ready = $true
+    $minifilterInstallState.build = $buildResult
+    $minifilterInstallState.install = $installResult
+
+    [ordered]@{
+        build = $buildResult
+        install = $installResult
+        status = $status
     }
 }
 
@@ -485,6 +557,317 @@ Invoke-ValidationStep -Name "firewall_block" -Body {
     }
 }
 
+Invoke-ValidationStep -Name "registry_protection" -Body {
+    $resolvedRegistryEventQuery = Resolve-ExistingPath -Path $RegistryEventQueryPath -Description "registry event query script"
+    $resolvedRegistryProtectionScript = Resolve-ExistingPath -Path $RegistryProtectionScriptPath -Description "registry protection script"
+    $validationKey = "HKLM:\SOFTWARE\AegisValidation\RegistryProtection\$validationId"
+    $kernelKey = "\REGISTRY\MACHINE\SOFTWARE\AegisValidation\RegistryProtection\$validationId"
+    $warmupKey = "HKLM:\SOFTWARE\AegisValidation\RegistryWarmup\$validationId"
+
+    & reg.exe delete "HKLM\SOFTWARE\AegisValidation\RegistryProtection\$validationId" /f | Out-Null
+    & reg.exe delete "HKLM\SOFTWARE\AegisValidation\RegistryWarmup\$validationId" /f | Out-Null
+    New-Item -Path $validationKey -Force | Out-Null
+    New-ItemProperty -Path $validationKey -Name "AllowedBeforeProtect" -Value "baseline" -PropertyType String -Force | Out-Null
+
+    try {
+        $clearResult = Invoke-JsonScript -ScriptPath $resolvedRegistryProtectionScript -Arguments @{
+            Mode = "clear"
+            ServiceName = $DriverServiceName
+        }
+        $protectResult = Invoke-JsonScript -ScriptPath $resolvedRegistryProtectionScript -Arguments @{
+            Mode = "protect"
+            ServiceName = $DriverServiceName
+            KeyPath = $validationKey
+        }
+
+        New-Item -Path $warmupKey -Force | Out-Null
+        New-ItemProperty -Path $warmupKey -Name "Warmup" -Value "warm" -PropertyType String -Force | Out-Null
+        Remove-ItemProperty -Path $warmupKey -Name "Warmup" -ErrorAction SilentlyContinue
+
+        $statusBefore = Invoke-JsonScript -ScriptPath $resolvedRegistryEventQuery -Arguments @{
+            Mode = "status"
+            ServiceName = $DriverServiceName
+        }
+        $lastSequence = [uint32]$statusBefore.current_sequence
+
+        $blockedWriteSucceeded = $false
+        $blockedWriteError = $null
+        try {
+            New-ItemProperty -Path $validationKey -Name "BlockedValue" -Value "blocked" -PropertyType String -Force -ErrorAction Stop | Out-Null
+            $blockedWriteSucceeded = $true
+        } catch {
+            $blockedWriteError = $_.Exception.Message
+        }
+        if ($blockedWriteSucceeded) {
+            throw "registry protected key accepted a write"
+        }
+
+        $allRegistryEvents = @()
+        $registryCursor = [uint32]$lastSequence
+        for ($page = 0; $page -lt 16; $page++) {
+            $eventsPayload = Invoke-JsonScript -ScriptPath $resolvedRegistryEventQuery -Arguments @{
+                Mode = "events"
+                ServiceName = $DriverServiceName
+                LastSequence = [string]$registryCursor
+                MaxEntries = "128"
+            }
+            $pageEvents = @($eventsPayload.events)
+            if ($pageEvents.Count -gt 0) {
+                $allRegistryEvents += $pageEvents
+                $registryCursor = [uint32]($pageEvents | Select-Object -Last 1).sequence
+            } else {
+                $registryCursor = [uint32]$eventsPayload.current_sequence
+            }
+            if ([uint32]$eventsPayload.returned_count -eq 0 -or
+                $registryCursor -ge [uint32]$eventsPayload.current_sequence) {
+                break
+            }
+        }
+
+        $blockedEvents = @($allRegistryEvents | Where-Object {
+                [bool]$_.blocked -and
+                [string]$_.key_path -eq $kernelKey -and
+                [string]$_.operation -eq "set"
+            })
+        if ($blockedEvents.Count -lt 1) {
+            $registryEventSample = ($allRegistryEvents | Select-Object -First 12 operation, key_path, blocked | ConvertTo-Json -Compress)
+            throw "registry block event was not captured: $registryEventSample"
+        }
+
+        [ordered]@{
+            clear = $clearResult
+            protect = $protectResult
+            blocked_write_error = $blockedWriteError
+            blocked_events = $blockedEvents | Select-Object -First 1
+        }
+    } finally {
+        Invoke-JsonScript -ScriptPath $resolvedRegistryProtectionScript -Arguments @{
+            Mode = "clear"
+            ServiceName = $DriverServiceName
+        } | Out-Null
+        & reg.exe delete "HKLM\SOFTWARE\AegisValidation\RegistryProtection\$validationId" /f | Out-Null
+        & reg.exe delete "HKLM\SOFTWARE\AegisValidation\RegistryWarmup\$validationId" /f | Out-Null
+    }
+}
+
+Invoke-ValidationStep -Name "preemptive_blocking" -Body {
+    $resolvedFileEventQuery = Resolve-ExistingPath -Path $FileEventQueryPath -Description "file event query script"
+    $resolvedPreemptiveBlockScript = Resolve-ExistingPath -Path $PreemptiveBlockScriptPath -Description "preemptive block script"
+    $pathBlockRoot = Join-Path $validationRoot "preemptive-path"
+    $pathExistingFile = Join-Path $pathBlockRoot "existing.txt"
+    $pathCreateFile = Join-Path $pathBlockRoot "create.txt"
+    $pathRenameFile = Join-Path $pathBlockRoot "renamed.txt"
+    $pathWarmupRoot = Join-Path $validationRoot "preemptive-path-warmup"
+    $pathWarmupFile = Join-Path $pathWarmupRoot "warmup.txt"
+    $pathWarmupRenamed = Join-Path $pathWarmupRoot "warmup-renamed.txt"
+    $pidTargetFile = Join-Path $validationRoot "pid-target.txt"
+    $hashTargetFile = Join-Path $validationRoot "hash-target.txt"
+    $pidProc = $null
+
+    function Get-PreemptiveFileEvents {
+        param(
+            [Parameter(Mandatory = $true)]
+            [uint32]$AfterSequence
+        )
+
+        $events = @()
+        $cursor = [uint32]$AfterSequence
+        for ($page = 0; $page -lt 16; $page++) {
+            $payload = Invoke-JsonScript -ScriptPath $resolvedFileEventQuery -Arguments @{
+                Mode = "events"
+                LastSequence = [string]$cursor
+                MaxEntries = "256"
+            }
+            $pageEvents = @($payload.events)
+            if ($pageEvents.Count -gt 0) {
+                $events += $pageEvents
+                $cursor = [uint32]($pageEvents | Select-Object -Last 1).sequence
+            } else {
+                $cursor = [uint32]$payload.current_sequence
+            }
+            if ([uint32]$payload.returned_count -eq 0 -or $cursor -ge [uint32]$payload.current_sequence) {
+                break
+            }
+        }
+
+        @($events)
+    }
+
+    New-Item -ItemType Directory -Path $pathBlockRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path $pathWarmupRoot -Force | Out-Null
+    Set-Content -LiteralPath $pathExistingFile -Value "baseline" -Encoding UTF8
+    Set-Content -LiteralPath $pidTargetFile -Value "baseline" -Encoding UTF8
+    Set-Content -LiteralPath $hashTargetFile -Value "Aegis hash block sample" -Encoding UTF8
+
+    try {
+        Invoke-JsonScript -ScriptPath $resolvedPreemptiveBlockScript -Arguments @{
+            Mode = "clear"
+        } | Out-Null
+
+        $pathBlock = Invoke-JsonScript -ScriptPath $resolvedPreemptiveBlockScript -Arguments @{
+            Mode = "block-path"
+            Path = $pathBlockRoot
+            TtlSeconds = "300"
+        }
+
+        [System.IO.File]::WriteAllText($pathWarmupFile, "warmup")
+        [System.IO.File]::Move($pathWarmupFile, $pathWarmupRenamed)
+        [System.IO.File]::Delete($pathWarmupRenamed)
+
+        $pathCreateStatus = Invoke-JsonScript -ScriptPath $resolvedFileEventQuery -Arguments @{
+            Mode = "status"
+        }
+        $pathCreateSequence = [uint32]$pathCreateStatus.current_sequence
+
+        $pathCreateError = $null
+        try {
+            [System.IO.File]::WriteAllText($pathCreateFile, "blocked-create")
+            throw "path block allowed file creation"
+        } catch {
+            $pathCreateError = $_.Exception.Message
+        }
+
+        $pathRenameError = $null
+        try {
+            [System.IO.File]::Move($pathExistingFile, $pathRenameFile)
+            throw "path block allowed rename"
+        } catch {
+            $pathRenameError = $_.Exception.Message
+        }
+
+        $pathDeleteError = $null
+        try {
+            [System.IO.File]::Delete($pathExistingFile)
+            throw "path block allowed delete"
+        } catch {
+            $pathDeleteError = $_.Exception.Message
+        }
+
+        $pathEvents = @(Get-PreemptiveFileEvents -AfterSequence $pathCreateSequence | Where-Object {
+                [string]$_.operation -eq "block-path"
+            })
+        if ($pathEvents.Count -lt 1) {
+            $pathEventSample = (Get-PreemptiveFileEvents -AfterSequence $pathCreateSequence | Select-Object -First 12 operation, path, process_id | ConvertTo-Json -Compress)
+            throw "path block event was not captured: create=$pathCreateError; rename=$pathRenameError; delete=$pathDeleteError; events=$pathEventSample"
+        }
+
+        Invoke-JsonScript -ScriptPath $resolvedPreemptiveBlockScript -Arguments @{
+            Mode = "clear"
+        } | Out-Null
+
+        $pidStatusBefore = Invoke-JsonScript -ScriptPath $resolvedFileEventQuery -Arguments @{
+            Mode = "status"
+        }
+        $pidSequence = [uint32]$pidStatusBefore.current_sequence
+
+        $pidScript = "Start-Sleep -Seconds 3; Set-Content -LiteralPath '$pidTargetFile' -Value 'blocked-write' -Encoding UTF8 -ErrorAction Stop"
+        $pidProc = Start-Process -FilePath "powershell" -ArgumentList "-NoProfile", "-NonInteractive", "-Command", $pidScript -PassThru -WindowStyle Hidden
+        Start-Sleep -Milliseconds 500
+
+        $pidBlock = Invoke-JsonScript -ScriptPath $resolvedPreemptiveBlockScript -Arguments @{
+            Mode = "block-pid"
+            ProcessId = [string]$pidProc.Id
+            TtlSeconds = "300"
+        }
+
+        $pidProc.WaitForExit()
+        if ($pidProc.ExitCode -eq 0) {
+            throw "pid block allowed target process write"
+        }
+        $pidTargetContent = Get-Content -LiteralPath $pidTargetFile -Raw -ErrorAction Stop
+        if ($pidTargetContent -ne "baseline`r`n" -and $pidTargetContent -ne "baseline") {
+            throw "pid block mutated target file contents"
+        }
+
+        $pidEvents = @(Get-PreemptiveFileEvents -AfterSequence $pidSequence | Where-Object {
+                [string]$_.operation -eq "block-pid" -and
+                [uint32]$_.process_id -eq [uint32]$pidProc.Id
+            })
+        if ($pidEvents.Count -lt 1) {
+            $pidEventSample = (Get-PreemptiveFileEvents -AfterSequence $pidSequence | Select-Object -First 12 operation, path, process_id | ConvertTo-Json -Compress)
+            throw "pid block event was not captured: events=$pidEventSample"
+        }
+
+        Invoke-JsonScript -ScriptPath $resolvedPreemptiveBlockScript -Arguments @{
+            Mode = "clear"
+        } | Out-Null
+
+        $hashStatusBefore = Invoke-JsonScript -ScriptPath $resolvedFileEventQuery -Arguments @{
+            Mode = "status"
+        }
+        $hashSequence = [uint32]$hashStatusBefore.current_sequence
+
+        $hashValue = (Get-FileHash -LiteralPath $hashTargetFile -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+        $hashBlock = Invoke-JsonScript -ScriptPath $resolvedPreemptiveBlockScript -Arguments @{
+            Mode = "block-hash"
+            Hash = $hashValue
+            TtlSeconds = "300"
+        }
+
+        $hashReadError = $null
+        try {
+            Get-Content -LiteralPath $hashTargetFile -ErrorAction Stop | Out-Null
+            throw "hash block allowed file open"
+        } catch {
+            $hashReadError = $_.Exception.Message
+        }
+
+        $hashEvents = @(Get-PreemptiveFileEvents -AfterSequence $hashSequence | Where-Object {
+                [string]$_.operation -eq "block-hash" -and
+                [string]$_.path -like "*hash-target.txt"
+            })
+        if ($hashEvents.Count -lt 1) {
+            $hashEventSample = (Get-PreemptiveFileEvents -AfterSequence $hashSequence | Select-Object -First 12 operation, path, process_id | ConvertTo-Json -Compress)
+            throw "hash block event was not captured: events=$hashEventSample"
+        }
+
+        $finalClear = Invoke-JsonScript -ScriptPath $resolvedPreemptiveBlockScript -Arguments @{
+            Mode = "clear"
+        }
+        $finalStatus = Invoke-JsonScript -ScriptPath $resolvedPreemptiveBlockScript -Arguments @{
+            Mode = "status"
+        }
+        if ([uint32]$finalStatus.block_entry_count -ne 0) {
+            throw "preemptive block state was not cleared"
+        }
+
+        [ordered]@{
+            path_block = $pathBlock
+            path_create_error = $pathCreateError
+            path_rename_error = $pathRenameError
+            path_delete_error = $pathDeleteError
+            pid_block = $pidBlock
+            pid_process_id = [uint32]$pidProc.Id
+            hash_block = $hashBlock
+            hash = $hashValue
+            hash_read_error = $hashReadError
+            events = [ordered]@{
+                path = $pathEvents | Select-Object -First 1
+                pid = $pidEvents | Select-Object -First 1
+                hash = $hashEvents | Select-Object -First 1
+            }
+            final_clear = $finalClear
+            final_status = $finalStatus
+        }
+    } finally {
+        Invoke-JsonScript -ScriptPath $resolvedPreemptiveBlockScript -Arguments @{
+            Mode = "clear"
+        } | Out-Null
+        if ($null -ne $pidProc -and -not $pidProc.HasExited) {
+            Stop-Process -Id $pidProc.Id -Force -ErrorAction SilentlyContinue
+        }
+        Remove-Item -LiteralPath $pathRenameFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $pathCreateFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $pathExistingFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $pathBlockRoot -Force -Recurse -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $pathWarmupRenamed -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $pathWarmupFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $pathWarmupRoot -Force -Recurse -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $pidTargetFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $hashTargetFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
 Invoke-ValidationStep -Name "named_pipe_inventory" -Body {
     $pipes = @(Get-ChildItem -Path "\\.\pipe\" -ErrorAction Stop | Select-Object -First 5 Name)
     if ($pipes.Count -lt 1) {
@@ -594,11 +977,27 @@ Invoke-ValidationStep -Name "script_surface_roundtrip" -Body {
             throw "no script block logging event captured for benign script"
         }
 
+        $blockValidation = [ordered]@{
+            skipped = $false
+            reason = $null
+            result = $null
+        }
+        if (-not [bool]$allowResult.scan_interface_ready) {
+            $blockValidation.skipped = $true
+            $blockValidation.reason = "host_amsi_scan_interface_unavailable"
+            return [ordered]@{
+                allow = $allowResult
+                benign_event = $matched | Select-Object -First 1
+                block = $blockValidation
+            }
+        }
+
         # Build the official AMSI test sample at runtime so the verifier itself is not signature-blocked on upload.
-        $blockScript = -join ((@(
+        $amsiSample = -join ((@(
             65,77,83,73,32,84,101,115,116,32,83,97,109,112,108,101,58,32,
             55,101,55,50,99,51,99,101,45,56,54,49,98,45,52,51,51,57,45,56,55,52,48,45,48,97,99,49,52,56,52,99,49,51,56,54
         )) | ForEach-Object { [char]$_ })
+        $blockScript = "`$null = '$amsiSample'"
         $blockResult = Invoke-JsonScript -ScriptPath $resolvedAmsiScript -Arguments @{
             Mode = "execute"
             ContentName = "AegisBlock.ps1"
@@ -607,11 +1006,12 @@ Invoke-ValidationStep -Name "script_surface_roundtrip" -Body {
         if (-not [bool]$blockResult.blocked -or [bool]$blockResult.executed) {
             throw "expected suspicious script to be blocked before execution"
         }
+        $blockValidation.result = $blockResult
 
         [ordered]@{
             allow = $allowResult
             benign_event = $matched | Select-Object -First 1
-            block = $blockResult
+            block = $blockValidation
         }
     } finally {
         Restore-ScriptBlockLoggingState -State $previousState
@@ -749,6 +1149,36 @@ Invoke-ValidationStep -Name "forensics_response" -Body {
         bundle_zip = $bundleZip
         manifest = $manifestPath
     }
+}
+
+Invoke-ValidationStep -Name "driver_cleanup" -Body {
+    if ([bool]$minifilterInstallState.ready) {
+        $resolvedUninstallMinifilterScript = Resolve-ExistingPath -Path $UninstallMinifilterScriptPath -Description "minifilter uninstall script"
+        $minifilterUninstallResult = Invoke-JsonScript -ScriptPath $resolvedUninstallMinifilterScript -Arguments @{
+            ServiceName = $MinifilterServiceName
+        }
+        $minifilterInstallState.ready = $false
+        if ($null -ne $results["minifilter_transport"] -and $results["minifilter_transport"].status -eq "pass") {
+            $results["minifilter_transport"].value["uninstall"] = $minifilterUninstallResult
+        }
+    }
+
+    if (-not [bool]$driverInstallState.ready) {
+        return [ordered]@{
+            skipped = $true
+        }
+    }
+
+    $resolvedUninstallScript = Resolve-ExistingPath -Path $UninstallScriptPath -Description "driver uninstall script"
+    $uninstallResult = Invoke-JsonScript -ScriptPath $resolvedUninstallScript -Arguments @{
+        ServiceName = $DriverServiceName
+    }
+    $driverInstallState.ready = $false
+    if ($null -ne $results["driver_transport"] -and $results["driver_transport"].status -eq "pass") {
+        $results["driver_transport"].value["uninstall"] = $uninstallResult
+    }
+
+    $uninstallResult
 }
 
 $summary = [ordered]@{

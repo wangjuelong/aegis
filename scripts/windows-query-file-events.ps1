@@ -34,6 +34,10 @@ namespace AegisFileBridge {
         public UInt32 ReturnedCount;
         public UInt32 Overflowed;
         public UInt32 ProtectedPathCount;
+        public UInt32 BlockEntryCount;
+        public UInt32 HashBlockCount;
+        public UInt32 PidBlockCount;
+        public UInt32 PathBlockCount;
     }
 
     [StructLayout(LayoutKind.Sequential, Pack = 1, CharSet = CharSet.Unicode)]
@@ -184,6 +188,10 @@ try {
         returned_count = [uint32]$header.ReturnedCount
         overflowed = ([uint32]$header.Overflowed) -ne 0
         protected_path_count = [uint32]$header.ProtectedPathCount
+        block_entry_count = [uint32]$header.BlockEntryCount
+        hash_block_count = [uint32]$header.HashBlockCount
+        pid_block_count = [uint32]$header.PidBlockCount
+        path_block_count = [uint32]$header.PathBlockCount
         events = $records
     } | ConvertTo-Json -Depth 6 -Compress
 } finally {

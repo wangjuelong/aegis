@@ -97,10 +97,14 @@ typedef struct _AEGIS_REGISTRY_VALUE_CAPTURE {
 } AEGIS_REGISTRY_VALUE_CAPTURE, *PAEGIS_REGISTRY_VALUE_CAPTURE;
 
 static FAST_MUTEX gRegistryJournalLock;
+static FAST_MUTEX gProtectedRegistryPathLock;
 static AEGIS_REGISTRY_EVENT_RECORD gRegistryJournal[AEGIS_REGISTRY_JOURNAL_CAPACITY];
+static WCHAR gProtectedRegistryPaths[AEGIS_REGISTRY_PROTECTED_PATH_CAPACITY]
+                                   [AEGIS_REGISTRY_MAX_KEY_PATH_CHARS];
 static ULONG gRegistryJournalHead = 0;
 static ULONG gRegistryJournalCount = 0;
 static ULONG gRegistryNextSequence = 1;
+static ULONG gProtectedRegistryPathCount = 0;
 static LARGE_INTEGER gRegistryCallbackCookie;
 static BOOLEAN gRegistryCallbackRegistered = FALSE;
 static KSPIN_LOCK gProtectedProcessLock;
@@ -119,6 +123,12 @@ static VOID AegisCaptureBytes(
 );
 
 static VOID AegisCopyUnicodeString(
+    _Out_writes_(destination_count) PWCHAR destination,
+    _In_ SIZE_T destination_count,
+    _In_opt_ PCUNICODE_STRING source
+);
+
+static NTSTATUS AegisCopyNormalizedUnicodeString(
     _Out_writes_(destination_count) PWCHAR destination,
     _In_ SIZE_T destination_count,
     _In_opt_ PCUNICODE_STRING source
@@ -153,6 +163,38 @@ static NTSTATUS AegisProtectProcessId(
     _In_ ULONG process_id
 );
 
+static ULONG AegisProtectedRegistryPathCountUnlocked(VOID);
+
+static ULONG AegisProtectedRegistryPathCount(VOID);
+
+static VOID AegisClearProtectedRegistryPaths(VOID);
+
+static NTSTATUS AegisProtectRegistryPath(
+    _In_ PCUNICODE_STRING key_path
+);
+
+static BOOLEAN AegisRegistryPathMatchesSelector(
+    _In_ PCUNICODE_STRING key_path,
+    _In_ PCUNICODE_STRING selector
+);
+
+static BOOLEAN AegisIsProtectedRegistryPath(
+    _In_ PCUNICODE_STRING key_path
+);
+
+static NTSTATUS AegisCaptureKeyPathFromObject(
+    _In_ PVOID key_object,
+    _Out_writes_(destination_count) PWCHAR destination,
+    _In_ SIZE_T destination_count
+);
+
+static NTSTATUS AegisResolveRegistryPathFromRootAndName(
+    _In_opt_ PVOID root_object,
+    _In_opt_ PCUNICODE_STRING complete_name,
+    _Out_writes_(destination_count) PWCHAR destination,
+    _In_ SIZE_T destination_count
+);
+
 static ACCESS_MASK AegisStripProtectedProcessAccess(
     _In_ ACCESS_MASK desired_access
 );
@@ -185,6 +227,19 @@ static ULONG AegisJournalCurrentSequenceUnlocked(VOID) {
     return gRegistryNextSequence - 1;
 }
 
+static ULONG AegisProtectedRegistryPathCountUnlocked(VOID) {
+    return gProtectedRegistryPathCount;
+}
+
+static ULONG AegisProtectedRegistryPathCount(VOID) {
+    ULONG count;
+
+    ExAcquireFastMutex(&gProtectedRegistryPathLock);
+    count = AegisProtectedRegistryPathCountUnlocked();
+    ExReleaseFastMutex(&gProtectedRegistryPathLock);
+    return count;
+}
+
 static BOOLEAN AegisIsProtectedProcessId(
     _In_ ULONG process_id
 ) {
@@ -213,6 +268,13 @@ static ULONG AegisProtectedProcessCount(VOID) {
     return count;
 }
 
+static VOID AegisClearProtectedRegistryPaths(VOID) {
+    ExAcquireFastMutex(&gProtectedRegistryPathLock);
+    gProtectedRegistryPathCount = 0;
+    RtlZeroMemory(gProtectedRegistryPaths, sizeof(gProtectedRegistryPaths));
+    ExReleaseFastMutex(&gProtectedRegistryPathLock);
+}
+
 static NTSTATUS AegisProtectProcessId(
     _In_ ULONG process_id
 ) {
@@ -239,6 +301,57 @@ static NTSTATUS AegisProtectProcessId(
         gProtectedProcessCount += 1;
     }
     KeReleaseSpinLock(&gProtectedProcessLock, previous_irql);
+
+    return status;
+}
+
+static NTSTATUS AegisProtectRegistryPath(
+    _In_ PCUNICODE_STRING key_path
+) {
+    WCHAR normalized_path[AEGIS_REGISTRY_MAX_KEY_PATH_CHARS];
+    UNICODE_STRING candidate;
+    KIRQL previous_irql;
+    ULONG index;
+    NTSTATUS status = STATUS_SUCCESS;
+
+    UNREFERENCED_PARAMETER(previous_irql);
+
+    status = AegisCopyNormalizedUnicodeString(
+        normalized_path,
+        RTL_NUMBER_OF(normalized_path),
+        key_path
+    );
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    RtlInitUnicodeString(&candidate, normalized_path);
+    if (candidate.Length == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    ExAcquireFastMutex(&gProtectedRegistryPathLock);
+    for (index = 0; index < gProtectedRegistryPathCount; index++) {
+        UNICODE_STRING existing;
+
+        RtlInitUnicodeString(&existing, gProtectedRegistryPaths[index]);
+        if (RtlEqualUnicodeString(&candidate, &existing, TRUE)) {
+            ExReleaseFastMutex(&gProtectedRegistryPathLock);
+            return STATUS_SUCCESS;
+        }
+    }
+
+    if (gProtectedRegistryPathCount >= AEGIS_REGISTRY_PROTECTED_PATH_CAPACITY) {
+        status = STATUS_INSUFFICIENT_RESOURCES;
+    } else {
+        RtlStringCchCopyW(
+            gProtectedRegistryPaths[gProtectedRegistryPathCount],
+            RTL_NUMBER_OF(gProtectedRegistryPaths[gProtectedRegistryPathCount]),
+            normalized_path
+        );
+        gProtectedRegistryPathCount += 1;
+    }
+    ExReleaseFastMutex(&gProtectedRegistryPathLock);
 
     return status;
 }
@@ -419,6 +532,40 @@ static VOID AegisCopyUnicodeString(
     destination[copy_chars] = UNICODE_NULL;
 }
 
+static NTSTATUS AegisCopyNormalizedUnicodeString(
+    _Out_writes_(destination_count) PWCHAR destination,
+    _In_ SIZE_T destination_count,
+    _In_opt_ PCUNICODE_STRING source
+) {
+    SIZE_T copy_chars = 0;
+
+    if (destination == NULL || destination_count == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    RtlZeroMemory(destination, destination_count * sizeof(WCHAR));
+    if (source == NULL || source->Buffer == NULL || source->Length == 0) {
+        return STATUS_SUCCESS;
+    }
+
+    copy_chars = source->Length / sizeof(WCHAR);
+    if (copy_chars >= destination_count) {
+        return STATUS_NAME_TOO_LONG;
+    }
+
+    if (copy_chars > 0) {
+        RtlCopyMemory(destination, source->Buffer, copy_chars * sizeof(WCHAR));
+    }
+    destination[copy_chars] = UNICODE_NULL;
+
+    while (copy_chars > 1 && destination[copy_chars - 1] == L'\\') {
+        destination[copy_chars - 1] = UNICODE_NULL;
+        copy_chars -= 1;
+    }
+
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS AegisQueryValueByPath(
     _In_ PCUNICODE_STRING key_path,
     _In_opt_ PCUNICODE_STRING value_name,
@@ -520,6 +667,158 @@ static NTSTATUS AegisOpenKeyForRollback(
     return ZwOpenKey(key_handle, KEY_SET_VALUE | KEY_QUERY_VALUE, &attributes);
 }
 
+static BOOLEAN AegisRegistryPathMatchesSelector(
+    _In_ PCUNICODE_STRING key_path,
+    _In_ PCUNICODE_STRING selector
+) {
+    USHORT selector_chars;
+
+    if (key_path == NULL || selector == NULL) {
+        return FALSE;
+    }
+    if (!RtlPrefixUnicodeString(selector, key_path, TRUE)) {
+        return FALSE;
+    }
+    if (key_path->Length == selector->Length) {
+        return TRUE;
+    }
+
+    selector_chars = selector->Length / sizeof(WCHAR);
+    return key_path->Buffer[selector_chars] == L'\\';
+}
+
+static BOOLEAN AegisIsProtectedRegistryPath(
+    _In_ PCUNICODE_STRING key_path
+) {
+    WCHAR normalized_path[AEGIS_REGISTRY_MAX_KEY_PATH_CHARS];
+    UNICODE_STRING candidate;
+    ULONG index;
+    BOOLEAN found = FALSE;
+
+    if (!NT_SUCCESS(AegisCopyNormalizedUnicodeString(
+            normalized_path,
+            RTL_NUMBER_OF(normalized_path),
+            key_path
+        ))) {
+        return FALSE;
+    }
+
+    RtlInitUnicodeString(&candidate, normalized_path);
+    if (candidate.Length == 0) {
+        return FALSE;
+    }
+
+    ExAcquireFastMutex(&gProtectedRegistryPathLock);
+    for (index = 0; index < gProtectedRegistryPathCount; index++) {
+        UNICODE_STRING selector;
+
+        RtlInitUnicodeString(&selector, gProtectedRegistryPaths[index]);
+        if (AegisRegistryPathMatchesSelector(&candidate, &selector)) {
+            found = TRUE;
+            break;
+        }
+    }
+    ExReleaseFastMutex(&gProtectedRegistryPathLock);
+
+    return found;
+}
+
+static NTSTATUS AegisCaptureKeyPathFromObject(
+    _In_ PVOID key_object,
+    _Out_writes_(destination_count) PWCHAR destination,
+    _In_ SIZE_T destination_count
+) {
+    NTSTATUS status;
+    PUNICODE_STRING object_name = NULL;
+
+    if (key_object == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    status = CmCallbackGetKeyObjectIDEx(
+        &gRegistryCallbackCookie,
+        key_object,
+        NULL,
+        &object_name,
+        0
+    );
+    if (!NT_SUCCESS(status) || object_name == NULL) {
+        return status;
+    }
+
+    status = AegisCopyNormalizedUnicodeString(destination, destination_count, object_name);
+    CmCallbackReleaseKeyObjectIDEx(object_name);
+    return status;
+}
+
+static NTSTATUS AegisResolveRegistryPathFromRootAndName(
+    _In_opt_ PVOID root_object,
+    _In_opt_ PCUNICODE_STRING complete_name,
+    _Out_writes_(destination_count) PWCHAR destination,
+    _In_ SIZE_T destination_count
+) {
+    NTSTATUS status;
+    size_t current_length = 0;
+
+    if (destination == NULL || destination_count == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    RtlZeroMemory(destination, destination_count * sizeof(WCHAR));
+
+    if (complete_name != NULL &&
+        complete_name->Buffer != NULL &&
+        complete_name->Length > 0 &&
+        complete_name->Buffer[0] == L'\\') {
+        return AegisCopyNormalizedUnicodeString(destination, destination_count, complete_name);
+    }
+
+    if (root_object == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    status = AegisCaptureKeyPathFromObject(root_object, destination, destination_count);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    if (complete_name == NULL || complete_name->Buffer == NULL || complete_name->Length == 0) {
+        return STATUS_SUCCESS;
+    }
+
+    status = RtlStringCchLengthW(destination, destination_count, &current_length);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+    if (current_length > 0 && destination[current_length - 1] != L'\\') {
+        status = RtlStringCchCatW(destination, destination_count, L"\\");
+        if (!NT_SUCCESS(status)) {
+            return status;
+        }
+    }
+
+    status = RtlStringCchCatNW(
+        destination,
+        destination_count,
+        complete_name->Buffer,
+        complete_name->Length / sizeof(WCHAR)
+    );
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    status = RtlStringCchLengthW(destination, destination_count, &current_length);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+    while (current_length > 1 && destination[current_length - 1] == L'\\') {
+        destination[current_length - 1] = UNICODE_NULL;
+        current_length -= 1;
+    }
+
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS AegisApplyRollbackRecord(
     _In_ const AEGIS_REGISTRY_EVENT_RECORD* record
 ) {
@@ -582,7 +881,7 @@ _Use_decl_annotations_
 NTSTATUS AegisRegistryCallback(PVOID callback_context, PVOID argument1, PVOID argument2) {
     REG_NOTIFY_CLASS notify_class;
     AEGIS_REGISTRY_EVENT_RECORD record;
-    PUNICODE_STRING object_name = NULL;
+    UNICODE_STRING key_path;
     NTSTATUS status;
 
     UNREFERENCED_PARAMETER(callback_context);
@@ -592,7 +891,10 @@ NTSTATUS AegisRegistryCallback(PVOID callback_context, PVOID argument1, PVOID ar
     }
 
     notify_class = (REG_NOTIFY_CLASS)(ULONG_PTR)argument1;
-    if (notify_class != RegNtPreSetValueKey && notify_class != RegNtPreDeleteValueKey) {
+    if (notify_class != RegNtPreSetValueKey &&
+        notify_class != RegNtPreDeleteValueKey &&
+        notify_class != RegNtPreCreateKeyEx &&
+        notify_class != RegNtPreDeleteKey) {
         return STATUS_SUCCESS;
     }
 
@@ -608,22 +910,23 @@ NTSTATUS AegisRegistryCallback(PVOID callback_context, PVOID argument1, PVOID ar
             return STATUS_SUCCESS;
         }
 
-        status = CmCallbackGetKeyObjectIDEx(
-            &gRegistryCallbackCookie,
+        status = AegisCaptureKeyPathFromObject(
             info->Object,
-            NULL,
-            &object_name,
-            0
+            record.KeyPath,
+            RTL_NUMBER_OF(record.KeyPath)
         );
-        if (!NT_SUCCESS(status) || object_name == NULL) {
+        if (!NT_SUCCESS(status)) {
             return STATUS_SUCCESS;
         }
 
-        AegisCopyUnicodeString(record.KeyPath, RTL_NUMBER_OF(record.KeyPath), object_name);
         AegisCopyUnicodeString(record.ValueName, RTL_NUMBER_OF(record.ValueName), info->ValueName);
-        record.Operation = AEGIS_REGISTRY_OPERATION_SET;
+        record.Operation = AEGIS_REGISTRY_OPERATION_SET_VALUE;
+        record.Blocked = 0UL;
         RtlZeroMemory(&old_capture, sizeof(old_capture));
-        status = AegisQueryValueByPath(object_name, info->ValueName, &old_capture);
+        RtlInitUnicodeString(&key_path, record.KeyPath);
+
+        RtlZeroMemory(&old_capture, sizeof(old_capture));
+        status = AegisQueryValueByPath(&key_path, info->ValueName, &old_capture);
         if (NT_SUCCESS(status)) {
             record.ValueType = old_capture.ValueType;
             record.OldValuePresent = old_capture.Present ? 1UL : 0UL;
@@ -646,7 +949,12 @@ NTSTATUS AegisRegistryCallback(PVOID callback_context, PVOID argument1, PVOID ar
         );
         record.NewDataTruncated = new_truncated ? 1UL : 0UL;
 
-        CmCallbackReleaseKeyObjectIDEx(object_name);
+        if (AegisIsProtectedRegistryPath(&key_path)) {
+            record.Blocked = 1UL;
+            AegisJournalPush(&record);
+            return STATUS_ACCESS_DENIED;
+        }
+
         AegisJournalPush(&record);
     } else if (notify_class == RegNtPreDeleteValueKey) {
         PREG_DELETE_VALUE_KEY_INFORMATION info = (PREG_DELETE_VALUE_KEY_INFORMATION)argument2;
@@ -656,22 +964,21 @@ NTSTATUS AegisRegistryCallback(PVOID callback_context, PVOID argument1, PVOID ar
             return STATUS_SUCCESS;
         }
 
-        status = CmCallbackGetKeyObjectIDEx(
-            &gRegistryCallbackCookie,
+        status = AegisCaptureKeyPathFromObject(
             info->Object,
-            NULL,
-            &object_name,
-            0
+            record.KeyPath,
+            RTL_NUMBER_OF(record.KeyPath)
         );
-        if (!NT_SUCCESS(status) || object_name == NULL) {
+        if (!NT_SUCCESS(status)) {
             return STATUS_SUCCESS;
         }
 
-        AegisCopyUnicodeString(record.KeyPath, RTL_NUMBER_OF(record.KeyPath), object_name);
         AegisCopyUnicodeString(record.ValueName, RTL_NUMBER_OF(record.ValueName), info->ValueName);
-        record.Operation = AEGIS_REGISTRY_OPERATION_DELETE;
+        record.Operation = AEGIS_REGISTRY_OPERATION_DELETE_VALUE;
+        record.Blocked = 0UL;
+        RtlInitUnicodeString(&key_path, record.KeyPath);
         RtlZeroMemory(&old_capture, sizeof(old_capture));
-        status = AegisQueryValueByPath(object_name, info->ValueName, &old_capture);
+        status = AegisQueryValueByPath(&key_path, info->ValueName, &old_capture);
         if (NT_SUCCESS(status)) {
             record.ValueType = old_capture.ValueType;
             record.OldValuePresent = old_capture.Present ? 1UL : 0UL;
@@ -686,7 +993,61 @@ NTSTATUS AegisRegistryCallback(PVOID callback_context, PVOID argument1, PVOID ar
         record.NewDataSize = 0UL;
         record.NewDataTruncated = 0UL;
 
-        CmCallbackReleaseKeyObjectIDEx(object_name);
+        if (AegisIsProtectedRegistryPath(&key_path)) {
+            record.Blocked = 1UL;
+            AegisJournalPush(&record);
+            return STATUS_ACCESS_DENIED;
+        }
+
+        AegisJournalPush(&record);
+    } else if (notify_class == RegNtPreCreateKeyEx) {
+        PREG_CREATE_KEY_INFORMATION info = (PREG_CREATE_KEY_INFORMATION)argument2;
+
+        status = AegisResolveRegistryPathFromRootAndName(
+            info->RootObject,
+            info->CompleteName,
+            record.KeyPath,
+            RTL_NUMBER_OF(record.KeyPath)
+        );
+        if (!NT_SUCCESS(status)) {
+            return STATUS_SUCCESS;
+        }
+
+        record.Operation = AEGIS_REGISTRY_OPERATION_CREATE_KEY;
+        record.Blocked = 0UL;
+        RtlInitUnicodeString(&key_path, record.KeyPath);
+        if (AegisIsProtectedRegistryPath(&key_path)) {
+            record.Blocked = 1UL;
+            AegisJournalPush(&record);
+            return STATUS_ACCESS_DENIED;
+        }
+
+        AegisJournalPush(&record);
+    } else if (notify_class == RegNtPreDeleteKey) {
+        PREG_DELETE_KEY_INFORMATION info = (PREG_DELETE_KEY_INFORMATION)argument2;
+
+        if (info->Object == NULL) {
+            return STATUS_SUCCESS;
+        }
+
+        status = AegisCaptureKeyPathFromObject(
+            info->Object,
+            record.KeyPath,
+            RTL_NUMBER_OF(record.KeyPath)
+        );
+        if (!NT_SUCCESS(status)) {
+            return STATUS_SUCCESS;
+        }
+
+        record.Operation = AEGIS_REGISTRY_OPERATION_DELETE_KEY;
+        record.Blocked = 0UL;
+        RtlInitUnicodeString(&key_path, record.KeyPath);
+        if (AegisIsProtectedRegistryPath(&key_path)) {
+            record.Blocked = 1UL;
+            AegisJournalPush(&record);
+            return STATUS_ACCESS_DENIED;
+        }
+
         AegisJournalPush(&record);
     }
 
@@ -788,6 +1149,7 @@ NTSTATUS AegisDriverDeviceControl(PDEVICE_OBJECT device_object, PIRP irp) {
             ExReleaseFastMutex(&gRegistryJournalLock);
             response->ObCallbackRegistered = gObCallbackRegistered ? 1UL : 0UL;
             response->ProtectedProcessCount = AegisProtectedProcessCount();
+            response->ProtectedRegistryPathCount = AegisProtectedRegistryPathCount();
             status = STATUS_SUCCESS;
             information = sizeof(*response);
         }
@@ -875,7 +1237,10 @@ NTSTATUS AegisDriverDeviceControl(PDEVICE_OBJECT device_object, PIRP irp) {
                     AEGIS_REGISTRY_JOURNAL_CAPACITY;
                 UNICODE_STRING record_key_path;
                 RtlInitUnicodeString(&record_key_path, gRegistryJournal[reverse_slot].KeyPath);
-                if (RtlEqualUnicodeString(&selector, &record_key_path, TRUE)) {
+                if (gRegistryJournal[reverse_slot].Blocked == 0 &&
+                    (gRegistryJournal[reverse_slot].Operation == AEGIS_REGISTRY_OPERATION_SET_VALUE ||
+                     gRegistryJournal[reverse_slot].Operation == AEGIS_REGISTRY_OPERATION_DELETE_VALUE) &&
+                    RtlEqualUnicodeString(&selector, &record_key_path, TRUE)) {
                     match_count += 1;
                 }
             }
@@ -901,7 +1266,10 @@ NTSTATUS AegisDriverDeviceControl(PDEVICE_OBJECT device_object, PIRP irp) {
                     BOOLEAN seen_value = FALSE;
                     ULONG existing_index;
                     RtlInitUnicodeString(&record_key_path, gRegistryJournal[reverse_slot].KeyPath);
-                    if (!RtlEqualUnicodeString(&selector, &record_key_path, TRUE)) {
+                    if (gRegistryJournal[reverse_slot].Blocked != 0 ||
+                        (gRegistryJournal[reverse_slot].Operation != AEGIS_REGISTRY_OPERATION_SET_VALUE &&
+                         gRegistryJournal[reverse_slot].Operation != AEGIS_REGISTRY_OPERATION_DELETE_VALUE) ||
+                        !RtlEqualUnicodeString(&selector, &record_key_path, TRUE)) {
                         continue;
                     }
 
@@ -947,6 +1315,39 @@ NTSTATUS AegisDriverDeviceControl(PDEVICE_OBJECT device_object, PIRP irp) {
                     information = sizeof(*response);
                 }
             }
+        }
+    } else if (stack->Parameters.DeviceIoControl.IoControlCode == AEGIS_IOCTL_PROTECT_REGISTRY_PATH ||
+               stack->Parameters.DeviceIoControl.IoControlCode == AEGIS_IOCTL_CLEAR_PROTECTED_REGISTRY_PATHS) {
+        PAEGIS_REGISTRY_PROTECT_REQUEST request =
+            (PAEGIS_REGISTRY_PROTECT_REQUEST)irp->AssociatedIrp.SystemBuffer;
+        PAEGIS_REGISTRY_PROTECT_RESPONSE response =
+            (PAEGIS_REGISTRY_PROTECT_RESPONSE)irp->AssociatedIrp.SystemBuffer;
+
+        if (request == NULL || response == NULL) {
+            status = STATUS_INVALID_USER_BUFFER;
+        } else if (stack->Parameters.DeviceIoControl.InputBufferLength < sizeof(*request) ||
+                   stack->Parameters.DeviceIoControl.OutputBufferLength < sizeof(*response)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+        } else if (request->ProtocolVersion != AEGIS_DRIVER_PROTOCOL_VERSION) {
+            status = STATUS_REVISION_MISMATCH;
+        } else if (stack->Parameters.DeviceIoControl.IoControlCode == AEGIS_IOCTL_PROTECT_REGISTRY_PATH) {
+            UNICODE_STRING key_path;
+
+            RtlInitUnicodeString(&key_path, request->KeyPath);
+            status = AegisProtectRegistryPath(&key_path);
+            if (NT_SUCCESS(status)) {
+                RtlZeroMemory(response, sizeof(*response));
+                response->ProtocolVersion = AEGIS_DRIVER_PROTOCOL_VERSION;
+                response->ProtectedPathCount = AegisProtectedRegistryPathCount();
+                information = sizeof(*response);
+            }
+        } else {
+            AegisClearProtectedRegistryPaths();
+            RtlZeroMemory(response, sizeof(*response));
+            response->ProtocolVersion = AEGIS_DRIVER_PROTOCOL_VERSION;
+            response->ProtectedPathCount = AegisProtectedRegistryPathCount();
+            status = STATUS_SUCCESS;
+            information = sizeof(*response);
         }
     } else if (stack->Parameters.DeviceIoControl.IoControlCode == AEGIS_IOCTL_PROTECT_PROCESS) {
         PAEGIS_PROCESS_PROTECT_REQUEST request =
@@ -1003,6 +1404,7 @@ VOID AegisDriverUnload(PDRIVER_OBJECT driver_object) {
         CmUnRegisterCallback(gRegistryCallbackCookie);
         gRegistryCallbackRegistered = FALSE;
     }
+    AegisClearProtectedRegistryPaths();
 
     RtlInitUnicodeString(&dos_device_name, AEGIS_DRIVER_DOS_DEVICE_NAME_W);
     IoDeleteSymbolicLink(&dos_device_name);
@@ -1028,13 +1430,16 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver_object, PUNICODE_STRING registry_path
 
     ExInitializeDriverRuntime(DrvRtPoolNxOptIn);
     ExInitializeFastMutex(&gRegistryJournalLock);
+    ExInitializeFastMutex(&gProtectedRegistryPathLock);
     KeInitializeSpinLock(&gProtectedProcessLock);
     gRegistryJournalHead = 0;
     gRegistryJournalCount = 0;
     gRegistryNextSequence = 1;
+    gProtectedRegistryPathCount = 0;
     gProtectedProcessCount = 0;
     RtlZeroMemory(gProtectedProcessIds, sizeof(gProtectedProcessIds));
     RtlZeroMemory(gRegistryJournal, sizeof(gRegistryJournal));
+    RtlZeroMemory(gProtectedRegistryPaths, sizeof(gProtectedRegistryPaths));
 
     for (major_index = 0; major_index <= IRP_MJ_MAXIMUM_FUNCTION; major_index++) {
         driver_object->MajorFunction[major_index] = AegisDriverCreateClose;

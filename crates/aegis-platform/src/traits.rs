@@ -50,6 +50,7 @@ pub struct PlatformExecutionSnapshot {
     pub terminated_protected_pids: Vec<u32>,
     pub protected_pids: Vec<u32>,
     pub protected_paths: Vec<PathBuf>,
+    pub protected_registry_paths: Vec<String>,
     pub quarantined_files: Vec<QuarantineReceipt>,
     pub forensic_artifacts: Vec<ArtifactBundle>,
     pub audit_artifacts: Vec<PathBuf>,
@@ -101,6 +102,7 @@ pub trait KernelIntegrity: Send + Sync {
 pub trait PlatformProtection: Send + Sync {
     fn protect_process(&self, pid: u32) -> Result<()>;
     fn protect_files(&self, paths: &[PathBuf]) -> Result<()>;
+    fn protect_registry(&self, selectors: &[String]) -> Result<()>;
     fn verify_integrity(&self) -> Result<IntegrityReport>;
     fn check_etw_integrity(&self) -> Result<EtwStatus>;
     fn check_amsi_integrity(&self) -> Result<AmsiStatus>;

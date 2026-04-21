@@ -8,7 +8,7 @@ use aegis_model::{
     IsolationRulesV2, NetworkTarget, QuarantineReceipt, RollbackTarget, SensorCapabilities,
     SensorConfig, SuspiciousProcess,
 };
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -726,6 +726,10 @@ impl PlatformProtection for LinuxPlatform {
             .map(|entry| entry.display().to_string())
             .collect::<Vec<_>>();
         materialize_protection_manifest(&mut state, "paths.txt", lines)
+    }
+
+    fn protect_registry(&self, _selectors: &[String]) -> Result<()> {
+        bail!("registry protection is unavailable on linux")
     }
 
     fn verify_integrity(&self) -> Result<IntegrityReport> {

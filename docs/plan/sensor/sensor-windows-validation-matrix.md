@@ -5,6 +5,8 @@
 - 仓库脚本：`scripts/windows-runtime-verify.sh`
 - 远端执行脚本：`scripts/windows-runtime-verify.ps1`
 - 本地输出：`target/windows-validation/192.168.2.218.json`
+- W15 本地输出：`target/windows-validation/192.168.2.222.json`
+- W16 本地输出：`target/windows-validation/192.168.2.222.json`
 - 实际验证时间：`2026-04-20 18:05:12 +08:00`
 - 实际验证 ID：`windows-runtime-20260420-180434`
 - W10 补充验证时间：`2026-04-20 16:46:03 +08:00`
@@ -17,21 +19,27 @@
 - W13 补充验证方式：远端执行 `packaging/windows/validate.ps1`，使用离线工具链 `C:\ProgramData\Aegis\toolchains\1.91.0` 完成本地构建、payload 组装、安装、自检、watchdog 一次性校验与回滚验证
 - W14 补充验证时间：`2026-04-20 21:09:35 +08:00`
 - W14 补充验证方式：远端执行 `packaging/windows/validate.ps1 -BundleChannel release`，注入代码签名证书、时间戳地址与 ELAM/PPL 批准文件，完成 release 签名、payload 验签、安装后复验与卸载闭环
+- W15 补充验证时间：`2026-04-21 11:17:56 +08:00`
+- W15 补充验证方式：远端重构建并安装 `AegisSensorKmod`，执行注册表保护路径下发、受保护键写入阻断与 registry journal `blocked=true` 验收
+- W16 补充验证时间：`2026-04-21 12:16:16 +08:00`
+- W16 补充验证方式：远端重构建并安装 `AegisSensorKmod + AegisFileMonitor`，执行 `block_path` / `block_pid` / `block_hash` 三类真实阻断、`block-*` 事件回传与 block 清空验收
 
 ## 2. 主机选择结果
 
-`docs/env/开发环境.md` 中提供了两台 Windows 测试机，实际连通性如下：
+`docs/env/开发环境.md` 中登记的 Windows 测试机，实际连通性如下：
 
 | 主机 | 用户 | SSH 结果 | 结论 |
 |------|------|----------|------|
 | `192.168.1.4` | `admin` | `Connection timed out during banner exchange` | 不可用，本轮未采用 |
 | `192.168.2.218` | `lamba` | `hostname => DESKTOP-TLASHJG` | 可用，作为本轮验收主机 |
+| `192.168.2.222` | `admin` | `hostname => DESKTOP-HF6134L` | 可用，作为 `W15/W16` 补充验收主机 |
 
 ## 3. 主机兼容性矩阵
 
 | 主机 | 计算机名 | 系统版本 | Build | PowerShell | 管理员 | 验收结果 |
 |------|----------|----------|-------|------------|--------|----------|
 | `192.168.2.218` | `DESKTOP-TLASHJG` | `Windows 11 专业版` | `10.0.26200` | `5.1.26100.8115` | `true` | `pass` |
+| `192.168.2.222` | `DESKTOP-HF6134L` | `Windows 11 专业版` | `10.0.26100` | `5.1.26100.2161` | `true` | `pass` |
 
 ## 4. 验收项结果
 
@@ -45,6 +53,8 @@
 | `security_4688` | pass | 可读取 `Security/4688`，最新 `record_id=788750`；临时 `cmd.exe` 探针未稳定命中，作为观察项保留 |
 | `network_inventory` | pass | `TCP=144`，`UDP=62` |
 | `firewall_block` | pass | 成功创建并清理 `AegisValidation-55b576db` rule group |
+| `registry_protection` | pass | 在 `192.168.2.222` 下发 `\\REGISTRY\\MACHINE\\SOFTWARE\\AegisValidation\\RegistryProtection\\windows-runtime-20260421-111721`，写入 `BlockedValue` 返回“尝试执行未经授权的操作”，journal 记录 `blocked=true` |
+| `preemptive_blocking` | pass | 在 `192.168.2.222` 下发 `block_path` / `block_pid` / `block_hash` 后，路径创建/重命名/删除、目标 PID 写入、命中 hash 的文件打开均被拒绝，且 Minifilter 记录 `block-path` / `block-pid` / `block-hash` 事件并在清空后返回 `block_entry_count=0` |
 | `named_pipe_inventory` | pass | 成功枚举命名管道样本，包括 `InitShutdown`、`lsass`、`ntsvcs` |
 | `module_inventory` | pass | 成功读取 `1Password.exe` 进程模块清单 |
 | `vss_inventory` | pass | 成功读取 `3` 条 `Win32_ShadowCopy` 样本 |
@@ -93,6 +103,12 @@
 - W14 release receipt：`C:\ProgramData\Aegis\validation\windows-package-payload\metadata\signed-release.json`
 - W14 release signature：`C:\ProgramData\Aegis\validation\windows-package-payload\metadata\signed-release.cms`
 - W14 关键结果：`{"bundle_channel":"release","payload_release_verification":true,"installed_release_verification":true,"required_failures":[]}`
+- W15 验收摘要：`C:\ProgramData\Aegis\validation\windows-runtime-20260421-111721\summary.json`
+- W15 远端 payload 根目录：`C:\ProgramData\Aegis\validation\windows-runtime-verify-20260421-111712`
+- W15 关键结果：`{"protected_path_count":1,"blocked":true,"required_failures":[]}`
+- W16 验收摘要：`C:\ProgramData\Aegis\validation\windows-runtime-20260421-121355\summary.json`
+- W16 远端 payload 根目录：`C:\ProgramData\Aegis\validation\windows-runtime-verify-20260421-121345`
+- W16 关键结果：`{"path_blocked":true,"pid_blocked":true,"hash_blocked":true,"block_path_event":true,"block_pid_event":true,"block_hash_event":true,"block_entry_count_after_clear":0,"required_failures":[]}`
 
 ## 6. 结论
 
@@ -103,4 +119,6 @@
 - `W12` 已额外验证通过共享脚本解码、AMSI 脚本阻断/告警、PowerShell 4104 脚本块回执与内存快照增量事件；`WindowsPlatform` 不再把 `AmsiScript`/`MemorySensor` 固定为未实现。
 - `W13` 已额外验证通过 Windows 开发包构建、安装、自举自检、watchdog 状态闭环与失败回滚链；当前仓库已具备发布前开发包验收入口。
 - `W14` 已额外验证通过 release 清单、代码签名/验签、安装前后 release gate 与批准文件依赖校验；当前仓库已具备严格失败的 Windows release 验收入口。
+- `W15` 已额外验证通过注册表真实保护链：`protect_registry` 可下发真实内核路径，受保护注册表写入被驱动 pre-callback 拒绝，journal 与审计工件均反映真实保护状态。
+- `W16` 已额外验证通过 `block_hash` / `block_pid` / `block_path` 真实阻断链：Minifilter 权威 block map、TTL、事件回传与清空链路已经闭环，`WindowsPlatform` 不再把这三项能力维持在 audit-only 工件阶段。
 - `security_4688` 的验收口径以“日志可读、record_id 可取”为准；`cmd.exe` 临时探针命中率被保留为观察项，不作为失败条件。

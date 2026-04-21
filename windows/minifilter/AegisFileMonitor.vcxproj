@@ -66,11 +66,17 @@
     <TargetName>AegisFileMonitor</TargetName>
     <OutDir>$(ProjectDir)build\$(Configuration)\$(Platform)\</OutDir>
     <IntDir>$(ProjectDir)build\obj\$(Configuration)\$(Platform)\</IntDir>
+    <KM_IncludePath Condition="'$(KM_IncludePath)' == ''">$(WDKContentRoot)Include\$(WDKBuildFolder)\km;$(WDKContentRoot)Include\$(WDKBuildFolder)\km\crt;$(WDKContentRoot)Include\$(WDKBuildFolder)\shared</KM_IncludePath>
+    <DDK_LIB_PATH Condition="'$(DDK_LIB_PATH)' == ''">$(WDKContentRoot)Lib\$(WDKBuildFolder)\km\$(Platform)\</DDK_LIB_PATH>
+    <DDK_LibraryPath_DDKPlatform Condition="'$(DDK_LibraryPath_DDKPlatform)' == ''">$(WDKContentRoot)Lib\$(WDKBuildFolder)\km\$(Platform)</DDK_LibraryPath_DDKPlatform>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <TargetName>AegisFileMonitor</TargetName>
     <OutDir>$(ProjectDir)build\$(Configuration)\$(Platform)\</OutDir>
     <IntDir>$(ProjectDir)build\obj\$(Configuration)\$(Platform)\</IntDir>
+    <KM_IncludePath Condition="'$(KM_IncludePath)' == ''">$(WDKContentRoot)Include\$(WDKBuildFolder)\km;$(WDKContentRoot)Include\$(WDKBuildFolder)\km\crt;$(WDKContentRoot)Include\$(WDKBuildFolder)\shared</KM_IncludePath>
+    <DDK_LIB_PATH Condition="'$(DDK_LIB_PATH)' == ''">$(WDKContentRoot)Lib\$(WDKBuildFolder)\km\$(Platform)\</DDK_LIB_PATH>
+    <DDK_LibraryPath_DDKPlatform Condition="'$(DDK_LibraryPath_DDKPlatform)' == ''">$(WDKContentRoot)Lib\$(WDKBuildFolder)\km\$(Platform)</DDK_LibraryPath_DDKPlatform>
   </PropertyGroup>
 
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -80,7 +86,7 @@
     </ClCompile>
     <Link>
       <AdditionalLibraryDirectories>$(WDKContentRoot)Lib\$(WDKBuildFolder)\km\$(Platform);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>fltMgr.lib;ntoskrnl.lib;BufferOverflowFastFailK.lib;ntstrsafe.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>fltMgr.lib;ntoskrnl.lib;BufferOverflowFastFailK.lib;ntstrsafe.lib;Cng.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <EntryPointSymbol>DriverEntry</EntryPointSymbol>
     </Link>
     <DriverSign>
@@ -94,7 +100,7 @@
     </ClCompile>
     <Link>
       <AdditionalLibraryDirectories>$(WDKContentRoot)Lib\$(WDKBuildFolder)\km\$(Platform);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>fltMgr.lib;ntoskrnl.lib;BufferOverflowFastFailK.lib;ntstrsafe.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>fltMgr.lib;ntoskrnl.lib;BufferOverflowFastFailK.lib;ntstrsafe.lib;Cng.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <EntryPointSymbol>DriverEntry</EntryPointSymbol>
     </Link>
     <DriverSign>

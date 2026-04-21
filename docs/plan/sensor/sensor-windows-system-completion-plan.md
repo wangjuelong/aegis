@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 用户态、Windows WDM/Minifilter/WFP 驱动工程、PowerShell/SSH 真机验收、MSBuild/Windows Kits/Signtool、MSI/INF/CAT 打包与签名校验。
 
-## 当前进度（2026-04-20）
+## 当前进度（2026-04-21）
 
 | 工作包 | 状态 | 结果 |
 |--------|------|------|
@@ -18,6 +18,8 @@
 | `W12` | `done` | 已完成共享脚本解码、AMSI 脚本阻断/告警链与内存信号采集，`192.168.2.218` 真机验证通过 |
 | `W13` | `done` | 已完成开发包安装/卸载、自举自检、watchdog 状态闭环与远端真机验收，`required_failures=[]` |
 | `W14` | `done` | 已完成 release 清单、签名/验签脚本、安装前后 release gate 与 Windows 11 真机发布验证；外部证书/审批缺失时严格失败 |
+| `W15` | `done` | 已完成 `protect_registry`、驱动保护表、registry pre-callback 阻断与 `192.168.2.222` 真机验收 |
+| `W16` | `done` | 已完成 Minifilter 权威 block map、TTL、状态查询与 `192.168.2.222` 真机验收 |
 
 ---
 
@@ -25,16 +27,16 @@
 
 - 不允许继续把 `KernelTransport::Driver`、`supports_registry`、`supports_amsi` 等能力声明为已支持，但运行时仍然只依赖 PowerShell/SSH。
 - 不允许继续用审计工件替代真实系统级能力。`registry_rollback`、`protect_process`、`protect_files`、`block_hash/pid/path` 必须具备真实执行链，否则状态保持 `todo/doing`。
+- 不允许把“注册表保护面”继续写成静态路径列表冒充真实保护状态；必须记录真实已下发保护路径与驱动状态。
 - 不允许在系统级模式下静默降级到用户态替代实现；缺驱动、缺签名、缺依赖时必须显式失败并暴露诊断。
 - 不允许把开发签名、自签名或未验收兼容矩阵误记为“正式签名/正式发布”。
 - 不允许引入兜底路径掩盖真实失败；所有外部依赖缺失都必须以结构化错误暴露。
 
-## 2. 当前缺口
+## 2. 当前结论
 
-- 开发包安装、自举、自检、watchdog 与失败回滚链已完成，但仍未形成正式发布包。
-- 缺少正式 MSI/驱动打包、驱动签名、ELAM 依赖校验、支持矩阵验收。
-- 测试机 `192.168.2.218` 可用；`192.168.1.4` 当前不可达，不能作为主验收机。
-- 当前仓库没有可用的正式代码签名证书或 `pfx/cer` 资产；正式签名链必须依赖外部凭据注入。
+- 仓库侧 Windows 功能缺口已清零，`W09-W16` 全部完成，系统级交付链路已可重新标记为 `done`。
+- 测试机 `192.168.2.218` 与 `192.168.2.222` 均可用；`192.168.1.4` 当前不可达，不作为当前验收主机。
+- `W14` 需要的签名、验签、批准文件依赖已经形成严格失败链路，但正式 `pfx/cer` 资产仍由外部发布环境注入。
 
 ## 3. 研发工作包
 
@@ -253,6 +255,82 @@
 - 修改：`docs/plan/sensor/sensor-windows-validation-matrix.md`
 - 修改：`docs/release/aegis-sensor-release-notes.md`
 
+### W15: 注册表真实保护链
+
+**状态**
+
+- 已完成，真机主机：`192.168.2.222`
+- 已验证 `protect_registry` 真实下发、保护路径状态回执、registry pre-callback 阻断与 journal `blocked=true`
+- 远端验证时间：`2026-04-21 11:17:56 +08:00`
+- 远端 payload：`C:\ProgramData\Aegis\validation\windows-runtime-verify-20260421-111712`
+- 代码提交：`9061fea`
+
+**目标**
+
+- 为 Windows 平台补齐一等注册表保护接口与真实内核阻断。
+- 让 `CmRegisterCallbackEx` 在键/值创建、修改、删除前执行实时保护判定。
+- 让保护面工件和运行时状态只反映真实已下发保护路径。
+
+**完成判定**
+
+- `protect_registry` 能下发真实保护路径并返回驱动回执。
+- 键/值创建、修改、删除在保护面上被拒绝，并进入 journal。
+- `windows-runtime-verify` 新增 `registry_protection` 必选步骤，`192.168.2.222` 真机通过。
+
+**关键文件**
+
+- 修改：`crates/aegis-platform/src/traits.rs`
+- 修改：`crates/aegis-platform/src/windows.rs`
+- 修改：`windows/driver/include/aegis_windows_driver_protocol.h`
+- 修改：`windows/driver/src/aegis_sensor_kmod.c`
+- 新增：`scripts/windows-configure-registry-protection.ps1`
+- 修改：`scripts/windows-query-registry-events.ps1`
+- 修改：`scripts/windows-runtime-verify.ps1`
+- 修改：`scripts/windows-runtime-verify.sh`
+
+**详细计划**
+
+- `docs/plan/sensor/sensor-windows-registry-protection-plan.md`
+
+### W16: hash/pid/path 真实阻断链
+
+**状态**
+
+- 已完成，真机主机：`192.168.2.222`
+- 已验证 `block_path` / `block_pid` / `block_hash` 三类真实阻断、事件回传与 Minifilter `block_entry_count=0` 清空闭环
+- 远端验证时间：`2026-04-21 12:16:16 +08:00`
+- 远端 payload：`C:\ProgramData\Aegis\validation\windows-runtime-verify-20260421-121345`
+- 代码提交：`e3769ac`
+
+**目标**
+
+- 为 Windows Minifilter 增加 block map、TTL 与状态查询。
+- 让 `block_hash`、`block_pid`、`block_path` 成为真实 pre-op 阻断，而不是 userspace ledger。
+- 让 `clear_all_blocks` 清空 firewall 与 minifilter 权威 block 状态。
+
+**完成判定**
+
+- `block_hash/pid/path` 审计工件全部为 `enforced=true`。
+- Minifilter 状态可查询真实 block 计数与类型分布。
+- `windows-runtime-verify` 新增 `preemptive_blocking` 必选步骤，`192.168.2.222` 真机通过。
+
+**关键文件**
+
+- 修改：`crates/aegis-platform/src/windows.rs`
+- 修改：`windows/minifilter/include/aegis_file_minifilter_protocol.h`
+- 修改：`windows/minifilter/src/aegis_file_minifilter.c`
+- 修改：`windows/minifilter/AegisFileMonitor.vcxproj`
+- 新增：`scripts/windows-build-minifilter.ps1`
+- 新增：`scripts/windows-configure-preemptive-block.ps1`
+- 修改：`scripts/windows-install-minifilter.ps1`
+- 修改：`scripts/windows-query-file-events.ps1`
+- 修改：`scripts/windows-runtime-verify.ps1`
+- 修改：`scripts/windows-runtime-verify.sh`
+
+**详细计划**
+
+- `docs/plan/sensor/sensor-windows-preemptive-block-plan.md`
+
 ## 4. 验证矩阵
 
 - 本地 Rust 单元测试：
@@ -274,6 +352,6 @@
 
 ## 5. 外部前提
 
-- `192.168.2.218` 当前是唯一已验证可用的 Windows 主机。
+- `192.168.2.218` 与 `192.168.2.222` 均已验证可用，分别承接 `W12-W14` 与 `W15/W16` 真机验收。
 - 正式代码签名、驱动签发、ELAM 相关验证需要外部证书与 Microsoft 签发链；仓库内不能伪造这条链路。
 - 当前仓库侧 `W14` 已通过“外部证书/批准文件注入 + 缺失即失败”的 release 验收；Microsoft 正式签发、多版本试点扩容仍属于仓库外流程，不在仓库内伪造。
