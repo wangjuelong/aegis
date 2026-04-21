@@ -31,6 +31,8 @@ const WINDOWS_QUERY_FILE_EVENTS_SCRIPT: &str =
     include_str!("../../../scripts/windows-query-file-events.ps1");
 const WINDOWS_CONFIGURE_FILE_PROTECTION_SCRIPT: &str =
     include_str!("../../../scripts/windows-configure-file-protection.ps1");
+const WINDOWS_CONFIGURE_PREEMPTIVE_BLOCK_SCRIPT: &str =
+    include_str!("../../../scripts/windows-configure-preemptive-block.ps1");
 const WINDOWS_CONFIGURE_REGISTRY_PROTECTION_SCRIPT: &str =
     include_str!("../../../scripts/windows-configure-registry-protection.ps1");
 const WINDOWS_QUERY_REGISTRY_EVENTS_SCRIPT: &str =
@@ -223,6 +225,10 @@ struct WindowsHostCapabilities {
     file_monitor_queue_capacity: Option<u32>,
     file_monitor_current_sequence: Option<u32>,
     file_monitor_status_detail: Option<String>,
+    file_block_entry_count: Option<u32>,
+    hash_block_count: Option<u32>,
+    pid_block_count: Option<u32>,
+    path_block_count: Option<u32>,
     registry_callback_registered: bool,
     registry_journal_capacity: Option<u32>,
     registry_current_sequence: Option<u32>,
@@ -370,7 +376,7 @@ impl WindowsHostCapabilities {
         facts.push(format!("memory_inventory={}", self.has_memory_inventory));
         facts.push(self.driver_transport_summary());
         facts.push(format!(
-            "file_monitor={};file_protocol={};file_queue={};protected_paths={};file_detail={}",
+            "file_monitor={};file_protocol={};file_queue={};protected_paths={};blocks={};hash_blocks={};pid_blocks={};path_blocks={};file_detail={}",
             self.file_monitor_ready(),
             self.file_monitor_protocol_version
                 .map(|value| format!("0x{value:08x}"))
@@ -379,6 +385,18 @@ impl WindowsHostCapabilities {
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".to_string()),
             self.protected_file_path_count
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            self.file_block_entry_count
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            self.hash_block_count
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            self.pid_block_count
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            self.path_block_count
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".to_string()),
             self.file_monitor_status_detail
@@ -461,6 +479,14 @@ struct WindowsCapabilityProbe {
     file_monitor_current_sequence: Option<u32>,
     #[serde(default)]
     file_monitor_status_detail: Option<String>,
+    #[serde(default)]
+    file_block_entry_count: Option<u32>,
+    #[serde(default)]
+    hash_block_count: Option<u32>,
+    #[serde(default)]
+    pid_block_count: Option<u32>,
+    #[serde(default)]
+    path_block_count: Option<u32>,
     #[serde(default)]
     registry_callback_registered: bool,
     #[serde(default)]
@@ -659,6 +685,14 @@ struct WindowsFileMonitorStatus {
     current_sequence: u32,
     #[serde(default)]
     protected_path_count: u32,
+    #[serde(default)]
+    block_entry_count: u32,
+    #[serde(default)]
+    hash_block_count: u32,
+    #[serde(default)]
+    pid_block_count: u32,
+    #[serde(default)]
+    path_block_count: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -680,6 +714,14 @@ struct WindowsFileMonitorQuery {
     overflowed: bool,
     #[serde(default)]
     protected_path_count: u32,
+    #[serde(default)]
+    block_entry_count: u32,
+    #[serde(default)]
+    hash_block_count: u32,
+    #[serde(default)]
+    pid_block_count: u32,
+    #[serde(default)]
+    path_block_count: u32,
     events: Vec<WindowsFileMonitorEvent>,
 }
 
@@ -689,6 +731,36 @@ struct WindowsFileProtectionResponse {
     protected_path_count: u32,
     #[serde(default)]
     resolved_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsPreemptiveBlockEntry {
+    kind: String,
+    process_id: u32,
+    ttl_seconds_remaining: u32,
+    target: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsPreemptiveBlockStatus {
+    protocol_version: u32,
+    block_entry_count: u32,
+    hash_block_count: u32,
+    pid_block_count: u32,
+    path_block_count: u32,
+    #[serde(default)]
+    entries: Vec<WindowsPreemptiveBlockEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsPreemptiveBlockResponse {
+    protocol_version: u32,
+    block_entry_count: u32,
+    hash_block_count: u32,
+    pid_block_count: u32,
+    path_block_count: u32,
+    #[serde(default)]
+    resolved_target: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -922,6 +994,8 @@ struct WindowsFirewallBlockReceipt {
 struct WindowsBlockAuditArtifact {
     kind: String,
     target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolved_target: Option<String>,
     ttl_secs: u64,
     enforced: bool,
     enforcement_plane: String,
@@ -1350,14 +1424,39 @@ impl PlatformResponse for WindowsPlatform {
 impl PreemptiveBlock for WindowsPlatform {
     fn block_hash(&self, hash: &str, ttl: Duration) -> Result<()> {
         let mut state = self.state.lock().expect("windows state poisoned");
-        push_block(&mut state.execution, "hash", hash.to_string(), ttl);
+        ensure_windows_driver_transport(&state.host, "apply windows hash block")?;
+        if !state.host.file_monitor_ready() {
+            bail!(
+                "apply windows hash block requires minifilter control port {}; {}",
+                AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
+                state.host.summary()
+            );
+        }
+        let normalized_hash = hash.trim().to_ascii_lowercase();
+        let response = apply_windows_hash_block(
+            self.runner.as_ref(),
+            AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
+            &normalized_hash,
+            ttl,
+        )
+        .with_context(|| format!("apply windows hash block {}", normalized_hash))?;
+        if response.protocol_version != AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION {
+            bail!(
+                "windows hash block protocol mismatch: expected 0x{expected:08x}, got 0x{actual:08x}",
+                expected = AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION,
+                actual = response.protocol_version
+            );
+        }
+        sync_windows_preemptive_block_state(&mut state, self.runner.as_ref())
+            .with_context(|| "synchronize windows preemptive block state after hash block")?;
         let artifact_path = write_windows_block_artifact(
             &mut state,
             "hash",
-            hash.to_string(),
+            normalized_hash,
+            response.resolved_target,
             ttl,
-            false,
-            "userspace-ledger",
+            true,
+            "windows-minifilter",
             None,
         )?;
         state.execution.audit_artifacts.push(artifact_path);
@@ -1366,14 +1465,38 @@ impl PreemptiveBlock for WindowsPlatform {
 
     fn block_pid(&self, pid: u32, ttl: Duration) -> Result<()> {
         let mut state = self.state.lock().expect("windows state poisoned");
-        push_block(&mut state.execution, "pid", pid.to_string(), ttl);
+        ensure_windows_driver_transport(&state.host, "apply windows pid block")?;
+        if !state.host.file_monitor_ready() {
+            bail!(
+                "apply windows pid block requires minifilter control port {}; {}",
+                AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
+                state.host.summary()
+            );
+        }
+        let response = apply_windows_pid_block(
+            self.runner.as_ref(),
+            AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
+            pid,
+            ttl,
+        )
+        .with_context(|| format!("apply windows pid block {}", pid))?;
+        if response.protocol_version != AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION {
+            bail!(
+                "windows pid block protocol mismatch: expected 0x{expected:08x}, got 0x{actual:08x}",
+                expected = AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION,
+                actual = response.protocol_version
+            );
+        }
+        sync_windows_preemptive_block_state(&mut state, self.runner.as_ref())
+            .with_context(|| "synchronize windows preemptive block state after pid block")?;
         let artifact_path = write_windows_block_artifact(
             &mut state,
             "pid",
             pid.to_string(),
+            response.resolved_target,
             ttl,
-            false,
-            "userspace-ledger",
+            true,
+            "windows-minifilter",
             None,
         )?;
         state.execution.audit_artifacts.push(artifact_path);
@@ -1382,15 +1505,39 @@ impl PreemptiveBlock for WindowsPlatform {
 
     fn block_path(&self, path: &Path, ttl: Duration) -> Result<()> {
         let mut state = self.state.lock().expect("windows state poisoned");
+        ensure_windows_driver_transport(&state.host, "apply windows path block")?;
+        if !state.host.file_monitor_ready() {
+            bail!(
+                "apply windows path block requires minifilter control port {}; {}",
+                AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
+                state.host.summary()
+            );
+        }
         let target = path.display().to_string();
-        push_block(&mut state.execution, "path", target.clone(), ttl);
+        let response = apply_windows_path_block(
+            self.runner.as_ref(),
+            AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
+            path,
+            ttl,
+        )
+        .with_context(|| format!("apply windows path block {}", target))?;
+        if response.protocol_version != AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION {
+            bail!(
+                "windows path block protocol mismatch: expected 0x{expected:08x}, got 0x{actual:08x}",
+                expected = AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION,
+                actual = response.protocol_version
+            );
+        }
+        sync_windows_preemptive_block_state(&mut state, self.runner.as_ref())
+            .with_context(|| "synchronize windows preemptive block state after path block")?;
         let artifact_path = write_windows_block_artifact(
             &mut state,
             "path",
             target,
+            response.resolved_target,
             ttl,
-            false,
-            "userspace-ledger",
+            true,
+            "windows-minifilter",
             None,
         )?;
         state.execution.audit_artifacts.push(artifact_path);
@@ -1415,6 +1562,7 @@ impl PreemptiveBlock for WindowsPlatform {
             &mut state,
             "network",
             target_value,
+            None,
             ttl,
             true,
             "windows-firewall",
@@ -1426,12 +1574,40 @@ impl PreemptiveBlock for WindowsPlatform {
 
     fn clear_all_blocks(&self) -> Result<()> {
         let mut state = self.state.lock().expect("windows state poisoned");
+        let cleared_block_count = state.execution.active_blocks.len();
+        let has_non_network_blocks = state
+            .execution
+            .active_blocks
+            .iter()
+            .any(|lease| lease.kind != "network");
+        if has_non_network_blocks && !state.host.file_monitor_ready() {
+            bail!(
+                "clear windows blocks requires minifilter control port {}; {}",
+                AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
+                state.host.summary()
+            );
+        }
+        if state.host.file_monitor_ready() {
+            let response = clear_windows_preemptive_blocks(
+                self.runner.as_ref(),
+                AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
+            )
+            .with_context(|| "clear windows minifilter block entries")?;
+            if response.protocol_version != AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION {
+                bail!(
+                    "windows block clear protocol mismatch: expected 0x{expected:08x}, got 0x{actual:08x}",
+                    expected = AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION,
+                    actual = response.protocol_version
+                );
+            }
+            sync_windows_preemptive_block_state(&mut state, self.runner.as_ref())
+                .with_context(|| "synchronize windows preemptive block state after clear")?;
+        }
         let cleared_rule_groups = state.block_rule_groups.clone();
         if !cleared_rule_groups.is_empty() {
             clear_windows_firewall_blocks(&mut state, self.runner.as_ref(), &cleared_rule_groups)
                 .with_context(|| "clear windows firewall block rules")?;
         }
-        let cleared_block_count = state.execution.active_blocks.len();
         state.execution.active_blocks.clear();
         state.block_rule_groups.clear();
         let artifact_path = write_windows_block_clear_artifact(
@@ -2050,6 +2226,10 @@ $data | ConvertTo-Json -Compress
         file_monitor_queue_capacity: probe.file_monitor_queue_capacity,
         file_monitor_current_sequence: probe.file_monitor_current_sequence,
         file_monitor_status_detail: probe.file_monitor_status_detail,
+        file_block_entry_count: probe.file_block_entry_count,
+        hash_block_count: probe.hash_block_count,
+        pid_block_count: probe.pid_block_count,
+        path_block_count: probe.path_block_count,
         registry_callback_registered: probe.registry_callback_registered,
         registry_journal_capacity: probe.registry_journal_capacity,
         registry_current_sequence: probe.registry_current_sequence,
@@ -2117,13 +2297,21 @@ fn refresh_windows_driver_surfaces(
             host.file_monitor_queue_capacity = Some(status.queue_capacity);
             host.file_monitor_current_sequence = Some(status.current_sequence);
             host.protected_file_path_count = Some(status.protected_path_count);
+            host.file_block_entry_count = Some(status.block_entry_count);
+            host.hash_block_count = Some(status.hash_block_count);
+            host.pid_block_count = Some(status.pid_block_count);
+            host.path_block_count = Some(status.path_block_count);
             host.file_monitor_status_detail = Some(format!(
-                "port={};protocol=0x{:08x};queue_capacity={};current_sequence={};protected_paths={}",
+                "port={};protocol=0x{:08x};queue_capacity={};current_sequence={};protected_paths={};blocks={};hash_blocks={};pid_blocks={};path_blocks={}",
                 AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
                 status.protocol_version,
                 status.queue_capacity,
                 status.current_sequence,
-                status.protected_path_count
+                status.protected_path_count,
+                status.block_entry_count,
+                status.hash_block_count,
+                status.pid_block_count,
+                status.path_block_count
             ));
         }
         Err(error) => {
@@ -2132,6 +2320,10 @@ fn refresh_windows_driver_surfaces(
             host.file_monitor_queue_capacity = None;
             host.file_monitor_current_sequence = None;
             host.protected_file_path_count = None;
+            host.file_block_entry_count = None;
+            host.hash_block_count = None;
+            host.pid_block_count = None;
+            host.path_block_count = None;
             host.file_monitor_status_detail = Some(error.to_string());
         }
     }
@@ -2395,6 +2587,88 @@ fn protect_windows_file_path(
     )
 }
 
+fn query_windows_preemptive_block_state(
+    runner: &dyn WindowsCommandRunner,
+    port_name: &str,
+) -> Result<WindowsPreemptiveBlockStatus> {
+    run_embedded_powershell_json(
+        runner,
+        WINDOWS_CONFIGURE_PREEMPTIVE_BLOCK_SCRIPT,
+        &[
+            ("Mode", "status".to_string()),
+            ("PortName", port_name.to_string()),
+        ],
+    )
+}
+
+fn apply_windows_hash_block(
+    runner: &dyn WindowsCommandRunner,
+    port_name: &str,
+    hash: &str,
+    ttl: Duration,
+) -> Result<WindowsPreemptiveBlockResponse> {
+    run_embedded_powershell_json(
+        runner,
+        WINDOWS_CONFIGURE_PREEMPTIVE_BLOCK_SCRIPT,
+        &[
+            ("Mode", "block-hash".to_string()),
+            ("PortName", port_name.to_string()),
+            ("Hash", hash.to_string()),
+            ("TtlSeconds", ttl.as_secs().to_string()),
+        ],
+    )
+}
+
+fn apply_windows_pid_block(
+    runner: &dyn WindowsCommandRunner,
+    port_name: &str,
+    pid: u32,
+    ttl: Duration,
+) -> Result<WindowsPreemptiveBlockResponse> {
+    run_embedded_powershell_json(
+        runner,
+        WINDOWS_CONFIGURE_PREEMPTIVE_BLOCK_SCRIPT,
+        &[
+            ("Mode", "block-pid".to_string()),
+            ("PortName", port_name.to_string()),
+            ("ProcessId", pid.to_string()),
+            ("TtlSeconds", ttl.as_secs().to_string()),
+        ],
+    )
+}
+
+fn apply_windows_path_block(
+    runner: &dyn WindowsCommandRunner,
+    port_name: &str,
+    path: &Path,
+    ttl: Duration,
+) -> Result<WindowsPreemptiveBlockResponse> {
+    run_embedded_powershell_json(
+        runner,
+        WINDOWS_CONFIGURE_PREEMPTIVE_BLOCK_SCRIPT,
+        &[
+            ("Mode", "block-path".to_string()),
+            ("PortName", port_name.to_string()),
+            ("Path", path.display().to_string()),
+            ("TtlSeconds", ttl.as_secs().to_string()),
+        ],
+    )
+}
+
+fn clear_windows_preemptive_blocks(
+    runner: &dyn WindowsCommandRunner,
+    port_name: &str,
+) -> Result<WindowsPreemptiveBlockResponse> {
+    run_embedded_powershell_json(
+        runner,
+        WINDOWS_CONFIGURE_PREEMPTIVE_BLOCK_SCRIPT,
+        &[
+            ("Mode", "clear".to_string()),
+            ("PortName", port_name.to_string()),
+        ],
+    )
+}
+
 fn clear_windows_registry_protection(
     runner: &dyn WindowsCommandRunner,
     service_name: &str,
@@ -2506,6 +2780,47 @@ fn registry_monitor_event_subject(event: &WindowsRegistryMonitorEvent) -> String
     ))
 }
 
+fn sync_windows_preemptive_block_state(
+    state: &mut WindowsState,
+    runner: &dyn WindowsCommandRunner,
+) -> Result<()> {
+    let status = query_windows_preemptive_block_state(runner, AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME)?;
+    if status.protocol_version != AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION {
+        bail!(
+            "preemptive block protocol mismatch: expected 0x{expected:08x}, got 0x{actual:08x}",
+            expected = AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION,
+            actual = status.protocol_version
+        );
+    }
+
+    state.host.file_block_entry_count = Some(status.block_entry_count);
+    state.host.hash_block_count = Some(status.hash_block_count);
+    state.host.pid_block_count = Some(status.pid_block_count);
+    state.host.path_block_count = Some(status.path_block_count);
+
+    let mut reconciled = state
+        .execution
+        .active_blocks
+        .iter()
+        .filter(|lease| lease.kind == "network")
+        .cloned()
+        .collect::<Vec<_>>();
+    for entry in status.entries {
+        let target = if entry.kind == "pid" {
+            entry.process_id.to_string()
+        } else {
+            entry.target
+        };
+        reconciled.push(BlockLease {
+            kind: entry.kind,
+            target,
+            ttl_secs: u64::from(entry.ttl_seconds_remaining),
+        });
+    }
+    state.execution.active_blocks = reconciled;
+    Ok(())
+}
+
 fn collect_file_monitor_events(
     state: &mut WindowsState,
     runner: &dyn WindowsCommandRunner,
@@ -2530,13 +2845,21 @@ fn collect_file_monitor_events(
     state.host.file_monitor_queue_capacity = Some(response.queue_capacity);
     state.host.file_monitor_current_sequence = Some(response.current_sequence);
     state.host.protected_file_path_count = Some(response.protected_path_count);
+    state.host.file_block_entry_count = Some(response.block_entry_count);
+    state.host.hash_block_count = Some(response.hash_block_count);
+    state.host.pid_block_count = Some(response.pid_block_count);
+    state.host.path_block_count = Some(response.path_block_count);
     state.host.file_monitor_status_detail = Some(format!(
-        "port={};current_sequence={};returned_count={};overflowed={};protected_paths={}",
+        "port={};current_sequence={};returned_count={};overflowed={};protected_paths={};blocks={};hash_blocks={};pid_blocks={};path_blocks={}",
         AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
         response.current_sequence,
         response.returned_count,
         response.overflowed,
-        response.protected_path_count
+        response.protected_path_count,
+        response.block_entry_count,
+        response.hash_block_count,
+        response.pid_block_count,
+        response.path_block_count
     ));
     state.file_monitor_cursor = Some(response.current_sequence);
 
@@ -3472,6 +3795,7 @@ fn write_windows_block_artifact(
     state: &mut WindowsState,
     kind: &str,
     target: String,
+    resolved_target: Option<String>,
     ttl: Duration,
     enforced: bool,
     enforcement_plane: &str,
@@ -3480,6 +3804,7 @@ fn write_windows_block_artifact(
     let artifact = WindowsBlockAuditArtifact {
         kind: kind.to_string(),
         target,
+        resolved_target,
         ttl_secs: ttl.as_secs(),
         enforced,
         enforcement_plane: enforcement_plane.to_string(),
@@ -4340,6 +4665,10 @@ mod tests {
             file_monitor_queue_capacity: None,
             file_monitor_current_sequence: None,
             file_monitor_status_detail: None,
+            file_block_entry_count: None,
+            hash_block_count: None,
+            pid_block_count: None,
+            path_block_count: None,
             registry_callback_registered: false,
             registry_journal_capacity: None,
             registry_current_sequence: None,
@@ -4379,8 +4708,12 @@ mod tests {
         host.file_monitor_queue_capacity = Some(256);
         host.file_monitor_current_sequence = Some(1200);
         host.protected_file_path_count = Some(1);
+        host.file_block_entry_count = Some(0);
+        host.hash_block_count = Some(0);
+        host.pid_block_count = Some(0);
+        host.path_block_count = Some(0);
         host.file_monitor_status_detail = Some(
-            "port=\\AegisFileMonitorPort;protocol=0x00010000;queue_capacity=256;current_sequence=1200;protected_paths=1"
+            "port=\\AegisFileMonitorPort;protocol=0x00010000;queue_capacity=256;current_sequence=1200;protected_paths=1;blocks=0;hash_blocks=0;pid_blocks=0;path_blocks=0"
                 .to_string(),
         );
         host.registry_callback_registered = true;
@@ -4743,7 +5076,7 @@ mod tests {
         protected_path_count: u32,
     ) -> String {
         format!(
-            r#"{{"port_name":"\\AegisFileMonitorPort","protocol_version":65536,"queue_capacity":{queue_capacity},"current_sequence":{current_sequence},"protected_path_count":{protected_path_count}}}"#
+            r#"{{"port_name":"\\AegisFileMonitorPort","protocol_version":65536,"queue_capacity":{queue_capacity},"current_sequence":{current_sequence},"protected_path_count":{protected_path_count},"block_entry_count":0,"hash_block_count":0,"pid_block_count":0,"path_block_count":0}}"#
         )
     }
 
@@ -4763,7 +5096,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         format!(
-            r#"{{"port_name":"\\AegisFileMonitorPort","protocol_version":65536,"queue_capacity":{queue_capacity},"oldest_sequence":0,"current_sequence":{current_sequence},"returned_count":{},"overflowed":false,"protected_path_count":1,"events":[{}]}}"#,
+            r#"{{"port_name":"\\AegisFileMonitorPort","protocol_version":65536,"queue_capacity":{queue_capacity},"oldest_sequence":0,"current_sequence":{current_sequence},"returned_count":{},"overflowed":false,"protected_path_count":1,"block_entry_count":0,"hash_block_count":0,"pid_block_count":0,"path_block_count":0,"events":[{}]}}"#,
             events.len(),
             rows.join(",")
         )
@@ -4775,6 +5108,44 @@ mod tests {
             .unwrap_or_else(|| "null".to_string());
         format!(
             r#"{{"protocol_version":65536,"protected_path_count":{protected_path_count},"resolved_path":{resolved_path}}}"#
+        )
+    }
+
+    fn preemptive_block_response_output(
+        block_entry_count: u32,
+        hash_block_count: u32,
+        pid_block_count: u32,
+        path_block_count: u32,
+        resolved_target: Option<&str>,
+    ) -> String {
+        let resolved_target = resolved_target
+            .map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+            .unwrap_or_else(|| "null".to_string());
+        format!(
+            r#"{{"protocol_version":65536,"block_entry_count":{block_entry_count},"hash_block_count":{hash_block_count},"pid_block_count":{pid_block_count},"path_block_count":{path_block_count},"resolved_target":{resolved_target}}}"#
+        )
+    }
+
+    fn preemptive_block_status_output(
+        entries: &[(&str, u32, u32, &str)],
+        hash_block_count: u32,
+        pid_block_count: u32,
+        path_block_count: u32,
+    ) -> String {
+        let rows = entries
+            .iter()
+            .map(|(kind, process_id, ttl_seconds_remaining, target)| {
+                format!(
+                    "{{\"kind\":\"{}\",\"process_id\":{process_id},\"ttl_seconds_remaining\":{ttl_seconds_remaining},\"target\":\"{}\"}}",
+                    kind.replace('\\', "\\\\").replace('"', "\\\""),
+                    target.replace('\\', "\\\\").replace('"', "\\\"")
+                )
+            })
+            .collect::<Vec<_>>();
+        format!(
+            r#"{{"protocol_version":65536,"block_entry_count":{},"hash_block_count":{hash_block_count},"pid_block_count":{pid_block_count},"path_block_count":{path_block_count},"entries":[{}]}}"#,
+            entries.len(),
+            rows.join(",")
         )
     }
 
@@ -4963,6 +5334,8 @@ mod tests {
                     "AegisIsolation-test",
                 ),
                 String::new(),
+                preemptive_block_response_output(1, 1, 0, 0, None),
+                preemptive_block_status_output(&[("hash", 0, 90, "deadbeef")], 1, 0, 0),
             ])),
             healthy_host_with_driver_surfaces(),
         )
@@ -4975,6 +5348,18 @@ mod tests {
                 String::new(),
             ])),
             healthy_host(),
+        )
+    }
+
+    fn platform_with_probe_for_preemptive_clear() -> WindowsPlatform {
+        WindowsPlatform::with_runner_for_test(
+            Box::new(QueuedWindowsRunner::new([
+                preemptive_block_response_output(1, 0, 1, 0, None),
+                preemptive_block_status_output(&[("pid", 5150, 45, "")], 0, 1, 0),
+                preemptive_block_response_output(0, 0, 0, 0, None),
+                preemptive_block_status_output(&[], 0, 0, 0),
+            ])),
+            healthy_host_with_driver_surfaces(),
         )
     }
 
@@ -5218,6 +5603,8 @@ mod tests {
         let block_json = fs::read_to_string(block_artifact).expect("read block artifact");
         assert!(block_json.contains("\"kind\": \"hash\""));
         assert!(block_json.contains("deadbeef"));
+        assert!(block_json.contains("\"enforced\": true"));
+        assert!(block_json.contains("\"enforcement_plane\": \"windows-minifilter\""));
         assert!(!snapshot.network_isolation_active);
         assert_eq!(
             snapshot
@@ -5287,6 +5674,46 @@ mod tests {
         let clear_json = fs::read_to_string(clear_artifact).expect("read clear artifact");
         assert!(clear_json.contains("\"cleared_block_count\": 1"));
         assert!(clear_json.contains("AegisBlock-test"));
+    }
+
+    #[test]
+    fn windows_clear_all_blocks_clears_minifilter_state() {
+        let platform = platform_with_probe_for_preemptive_clear();
+
+        platform
+            .block_pid(5150, Duration::from_secs(45))
+            .expect("block pid should be enforced by minifilter");
+        platform.clear_all_blocks().expect("clear all blocks");
+
+        let snapshot = platform.execution_snapshot();
+        assert!(snapshot.active_blocks.is_empty());
+        let block_artifact = snapshot
+            .audit_artifacts
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .map(|value| value.starts_with("block-"))
+                    .unwrap_or(false)
+            })
+            .expect("pid block artifact should exist");
+        let block_json = fs::read_to_string(block_artifact).expect("read pid block artifact");
+        assert!(block_json.contains("\"kind\": \"pid\""));
+        assert!(block_json.contains("\"enforced\": true"));
+        assert!(block_json.contains("\"enforcement_plane\": \"windows-minifilter\""));
+        let clear_artifact = snapshot
+            .audit_artifacts
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .map(|value| value.starts_with("clear-"))
+                    .unwrap_or(false)
+            })
+            .expect("block clear artifact should exist");
+        let clear_json = fs::read_to_string(clear_artifact).expect("read clear artifact");
+        assert!(clear_json.contains("\"cleared_block_count\": 1"));
+        assert!(clear_json.contains("\"cleared_rule_groups\": []"));
     }
 
     #[test]
