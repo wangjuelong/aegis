@@ -21,7 +21,7 @@
 | `W15` | `done` | 已完成 `protect_registry`、驱动保护表、registry pre-callback 阻断与 `192.168.2.222` 真机验收 |
 | `W16` | `done` | 已完成 Minifilter 权威 block map、TTL、状态查询与 `192.168.2.222` 真机验收 |
 | `W17` | `done` | 已完成目标路径阻断：外部文件 rename/move/link 进入受保护目录在 `192.168.2.222` 被拒绝 |
-| `W18` | `todo` | 收口 `block_hash` 严格 pre-create 阻断，不再依赖 `post-create + FltCancelFileOpen` |
+| `W18` | `done` | 已完成 `block_hash` 严格 pre-create 阻断，`.222` 真机重新验证通过 |
 | `W19` | `todo` | 收口 `clear_all_blocks` 平面解耦：防火墙与 Minifilter 独立释放、部分成功显式可见 |
 | `W20` | `todo` | 收口 AMSI 严格阻断：恶意样本阻断不能再走 skip 分支，能力声明与真机结果一致 |
 
@@ -38,8 +38,8 @@
 
 ## 2. 当前结论
 
-- 新一轮代码审查发现的 4 个剩余缺口中，`W17` 已完成；当前还剩 3 个缺口：`block_hash` 非严格 pre-create、`clear_all_blocks` 平面耦合、AMSI 严格阻断仍是条件成立。
-- 因此仓库侧 Windows 功能当前仍应保持 `doing`，待 `W18-W20` 收口后再恢复“系统级交付 done”。
+- 新一轮代码审查发现的 4 个剩余缺口中，`W17/W18` 已完成；当前还剩 2 个缺口：`clear_all_blocks` 平面耦合、AMSI 严格阻断仍是条件成立。
+- 因此仓库侧 Windows 功能当前仍应保持 `doing`，待 `W19-W20` 收口后再恢复“系统级交付 done”。
 - 测试机 `192.168.2.218` 与 `192.168.2.222` 均可用；`192.168.1.4` 当前不可达，不作为当前验收主机。
 - `W14` 需要的签名、验签、批准文件依赖已经形成严格失败链路，但正式 `pfx/cer` 资产仍由外部发布环境注入。
 
@@ -370,8 +370,11 @@
 
 **状态**
 
-- `todo`
-- 目标主机：`192.168.2.222`
+- 已完成，真机主机：`192.168.2.222`
+- 已验证 `block_hash` 在 create 返回前拒绝，整机 `preemptive_blocking` 再次通过
+- 远端验证时间：`2026-04-21 14:23:50 +08:00`
+- 远端 payload：`C:\ProgramData\Aegis\validation\windows-runtime-verify-20260421-142031`
+- 代码提交：`7061b59`
 
 **目标**
 
@@ -382,6 +385,11 @@
 
 - `block_hash` 不再依赖 post-create cancel。
 - 命中 hash 的文件在 create 返回前被拒绝。
+
+**关键文件**
+
+- 修改：`windows/minifilter/src/aegis_file_minifilter.c`
+- 修改：`scripts/windows-runtime-verify.ps1`
 
 **详细计划**
 

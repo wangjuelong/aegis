@@ -1,5 +1,13 @@
 # Windows hash 严格 pre-create 阻断计划
 
+## 0. 状态
+
+- 已完成
+- 代码提交：`7061b59`
+- 真机主机：`192.168.2.222`
+- 远端验收时间：`2026-04-21 14:23:50 +08:00`
+- 验收 ID：`windows-runtime-20260421-142041`
+
 ## 1. 目标
 
 把当前 `block_hash` 的“post-create + `FltCancelFileOpen`”实现收口为严格的 create 入口阻断，保证：
@@ -9,6 +17,8 @@
 - 审计与文档中的“preemptive block”口径与内核真实时序一致
 
 ## 2. 当前缺口
+
+以下缺口已在本轮收口，保留为计划与实际交付的对照基线：
 
 - 当前 `block_hash` 在 `AegisFilePostCreate` 中做 SHA-256，再调用 `FltCancelFileOpen`。
 - 这意味着 create 已完成，只是在句柄返回前取消，不是严格的 pre-create gate。
@@ -57,7 +67,14 @@
 - `crates/aegis-platform/src/windows.rs`
 - `scripts/windows-runtime-verify.ps1`
 
-## 6. 完成判定
+## 6. 实际交付结果
+
+- `block_hash` 已从 `AegisFilePostCreate + FltCancelFileOpen` 迁移到 `IRP_MJ_CREATE` pre-op 路径。
+- Minifilter 新增 hash lookup guard，并通过内核自开句柄读取目标文件内容计算 SHA-256，再在 create 返回前完成 block map 判定。
+- `AegisFilePostCreate` 的阻断职责已移除，create 事件恢复为纯 pre-op 记录。
+- `windows-runtime-verify.ps1` 在 `.222` 上重新验证 `preemptive_blocking`，命中 hash 的文件打开被拒绝，且整机结果 `required_failures=[]`。
+
+## 7. 完成判定
 
 - `block_hash` 不再依赖 `AegisFilePostCreate + FltCancelFileOpen`
 - 命中 hash 的文件在 create 返回前被拒绝
