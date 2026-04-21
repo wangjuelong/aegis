@@ -19,7 +19,7 @@
 | `W13` | `done` | 已完成开发包安装/卸载、自举自检、watchdog 状态闭环与远端真机验收，`required_failures=[]` |
 | `W14` | `done` | 已完成 release 清单、签名/验签脚本、安装前后 release gate 与 Windows 11 真机发布验证；外部证书/审批缺失时严格失败 |
 | `W15` | `done` | 已完成 `protect_registry`、驱动保护表、registry pre-callback 阻断与 `192.168.2.222` 真机验收 |
-| `W16` | `todo` | 收口 `block_hash/pid/path` 真实阻断链：minifilter block map、TTL、状态查询、真机验收 |
+| `W16` | `done` | 已完成 Minifilter 权威 block map、TTL、状态查询与 `192.168.2.222` 真机验收 |
 
 ---
 
@@ -32,9 +32,9 @@
 - 不允许把开发签名、自签名或未验收兼容矩阵误记为“正式签名/正式发布”。
 - 不允许引入兜底路径掩盖真实失败；所有外部依赖缺失都必须以结构化错误暴露。
 
-## 2. 当前缺口
+## 2. 当前结论
 
-- 当前唯一剩余的功能缺口是 `W16`：`block_hash/block_pid/block_path` 仍未成为真实 pre-op 阻断。
+- 仓库侧 Windows 功能缺口已清零，`W09-W16` 全部完成，系统级交付链路已可重新标记为 `done`。
 - 测试机 `192.168.2.218` 与 `192.168.2.222` 均可用；`192.168.1.4` 当前不可达，不作为当前验收主机。
 - `W14` 需要的签名、验签、批准文件依赖已经形成严格失败链路，但正式 `pfx/cer` 资产仍由外部发布环境注入。
 
@@ -296,8 +296,11 @@
 
 **状态**
 
-- `todo`
-- 目标主机：`192.168.2.222`
+- 已完成，真机主机：`192.168.2.222`
+- 已验证 `block_path` / `block_pid` / `block_hash` 三类真实阻断、事件回传与 Minifilter `block_entry_count=0` 清空闭环
+- 远端验证时间：`2026-04-21 12:16:16 +08:00`
+- 远端 payload：`C:\ProgramData\Aegis\validation\windows-runtime-verify-20260421-121345`
+- 代码提交：`e3769ac`
 
 **目标**
 
@@ -310,6 +313,19 @@
 - `block_hash/pid/path` 审计工件全部为 `enforced=true`。
 - Minifilter 状态可查询真实 block 计数与类型分布。
 - `windows-runtime-verify` 新增 `preemptive_blocking` 必选步骤，`192.168.2.222` 真机通过。
+
+**关键文件**
+
+- 修改：`crates/aegis-platform/src/windows.rs`
+- 修改：`windows/minifilter/include/aegis_file_minifilter_protocol.h`
+- 修改：`windows/minifilter/src/aegis_file_minifilter.c`
+- 修改：`windows/minifilter/AegisFileMonitor.vcxproj`
+- 新增：`scripts/windows-build-minifilter.ps1`
+- 新增：`scripts/windows-configure-preemptive-block.ps1`
+- 修改：`scripts/windows-install-minifilter.ps1`
+- 修改：`scripts/windows-query-file-events.ps1`
+- 修改：`scripts/windows-runtime-verify.ps1`
+- 修改：`scripts/windows-runtime-verify.sh`
 
 **详细计划**
 
