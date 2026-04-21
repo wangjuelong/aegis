@@ -34,8 +34,7 @@ Linux 平台目标覆盖：
 ## 4. 当前总体结论
 
 - 当前开发机与 Linux 测试机可闭合的 Linux 研发项已完成。
-- 剩余未完成项为：
-  - Linux 容器 / sidecar / runtime connector 交付链
+- 当前仓库范围内，Linux 已无剩余未完成项。
 
 ## 5. Linux 研发计划与状态
 
@@ -53,7 +52,7 @@ Linux 平台目标覆盖：
 | L10 | Linux 容器验证与诊断集成 | done | 已完成 Linux 容器内 `cargo test` 基线验证与 `aegis-agentd -- --diagnose` 诊断接线 |
 | L11 | 更高阶 remote attestation / verifier 分离信任链 | done | 已完成 attestation bundle、verifier receipt、设备证书/receipt 诊断状态与本地正反向烟测 |
 | L12 | Linux 生产部署、签名与发行工程 | done | 已完成 install manifest、systemd、`DEB/RPM` 组装、原生 RPM 安装/自检/watchdog/卸载与 `scripts/linux-package-verify.sh` 真机闭环 |
-| L13 | Linux 容器 / Sidecar / Runtime Connector 交付链 | todo | 当前仅完成 contract / example / test baseline，未形成交付目录、manifest 与 validate 入口 |
+| L13 | Linux 容器 / Sidecar / Runtime Connector 交付链 | done | 已完成 Host Agent DaemonSet、Sidecar Lite Pod 样例、Runtime SDK / Cloud Connector 样例目录与 `scripts/linux-container-validate.sh` 校验链 |
 
 ## 6. 已完成验证
 
@@ -77,6 +76,10 @@ Linux 测试机已完成：
 - `scripts/linux-tpm-policy-verify.sh`
 - `scripts/linux-package-verify.sh`
 
+本地容器 / Sidecar 交付验证已完成：
+
+- `scripts/linux-container-validate.sh`
+
 ## 7. Linux 完成定义
 
 当且仅当以下判断同时成立，Linux 计划中的对应工作包才可标记为 `done`：
@@ -91,4 +94,4 @@ Linux 测试机已完成：
 - `L01-L10 = done`
 - `L11 = done`
 - `L12 = done`
-- `L13 = todo`
+- `L13 = done`

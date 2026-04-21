@@ -57,3 +57,39 @@
 - Host Agent / Sidecar Lite / Runtime SDK / Cloud API Connector 都有交付目录
 - manifest 与 contract 校验通过
 - 最小 smoke test 可复跑
+
+## 7. 实际交付
+
+- 代码提交：`1310049 feat(linux): 完成容器交付清单与验证链`
+- 已新增：
+  - `packaging/linux/kubernetes/daemonset-host-agent.yaml`
+  - `packaging/linux/kubernetes/sidecar-lite-pod.yaml`
+  - `packaging/linux/kubernetes/README.md`
+  - `packaging/linux/runtime-sdk/runtime-event.sample.json`
+  - `packaging/linux/runtime-sdk/runtime-heartbeat.sample.json`
+  - `packaging/linux/runtime-sdk/runtime-policy.contract.json`
+  - `packaging/linux/runtime-sdk/cloud-connector.contract.json`
+  - `packaging/linux/runtime-sdk/run-example.sh`
+  - `packaging/linux/runtime-sdk/README.md`
+  - `scripts/linux-container-validate.sh`
+- 已收口：
+  - `DaemonSetHostAgentConfig` 已改成与技术方案一致的最小权限模型，不再维持 `host_network=true / privileged=true` 的错误 contract
+  - Host Agent、Sidecar Lite、Runtime SDK、Cloud Connector 都已进入仓库交付目录
+  - `linux-container-validate.sh` 已可同时校验 contract、manifest 与 Runtime SDK 运行样例
+
+## 8. 验证结果
+
+本地已完成：
+
+- `cargo test -p aegis-core container_ -- --nocapture`
+- `bash scripts/linux-container-validate.sh`
+
+关键结果：
+
+- `runtime_example_output="runtime_event=... first_flush=false second_flush=true buffered_events=1 emitted_batches=1"`
+- `required_failures=[]`
+
+## 9. 结论
+
+- `L13` 已完成代码、验证与文档闭环。
+- Linux 平台在当前仓库范围内已无剩余未完成项。
