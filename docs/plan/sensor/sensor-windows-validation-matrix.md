@@ -7,6 +7,10 @@
 - 本地输出：`target/windows-validation/192.168.2.218.json`
 - W15 本地输出：`target/windows-validation/192.168.2.222.json`
 - W16 本地输出：`target/windows-validation/192.168.2.222.json`
+- W17 本地输出：`target/windows-validation/192.168.2.222.json`
+- W18 本地输出：`target/windows-validation/192.168.2.222.json`
+- W19 本地输出：`target/windows-validation/192.168.2.222.json`
+- W20 本地输出：`target/windows-validation/192.168.2.222.json`
 - 实际验证时间：`2026-04-20 18:05:12 +08:00`
 - 实际验证 ID：`windows-runtime-20260420-180434`
 - W10 补充验证时间：`2026-04-20 16:46:03 +08:00`
@@ -23,6 +27,14 @@
 - W15 补充验证方式：远端重构建并安装 `AegisSensorKmod`，执行注册表保护路径下发、受保护键写入阻断与 registry journal `blocked=true` 验收
 - W16 补充验证时间：`2026-04-21 12:16:16 +08:00`
 - W16 补充验证方式：远端重构建并安装 `AegisSensorKmod + AegisFileMonitor`，执行 `block_path` / `block_pid` / `block_hash` 三类真实阻断、`block-*` 事件回传与 block 清空验收
+- W17 补充验证时间：`2026-04-21 14:04:08 +08:00`
+- W17 补充验证方式：远端重构建并安装 `AegisSensorKmod + AegisFileMonitor`，执行 `file_target_path_protection`，验证外部文件 `move` / `hardlink` 进入受保护目录失败
+- W18 补充验证时间：`2026-04-21 14:23:50 +08:00`
+- W18 补充验证方式：远端重构建并安装 `AegisSensorKmod + AegisFileMonitor`，重新执行 `preemptive_blocking`，验证 `block_hash` 在 create 返回前拒绝且整机 `required_failures=[]`
+- W19 补充验证时间：`2026-04-21 14:37:59 +08:00`
+- W19 补充验证方式：本地执行 `cargo test -p aegis-platform windows_clear_all_blocks_releases_firewall_when_minifilter_unavailable`，并在 `192.168.2.222` 重跑整机 `windows-runtime-verify.sh`，验证正常双平面清理链无回归
+- W20 补充验证时间：`2026-04-21 14:58:20 +08:00`
+- W20 补充验证方式：本地执行 `cargo test -p aegis-platform windows_descriptor_requires_strict_amsi_blocking_for_support`，并在 `192.168.2.222` 重跑整机 `windows-runtime-verify.sh`，验证 `.222` 上 `strict_block_ready=false` 时平台不再 overclaim `supports_amsi=true`
 
 ## 2. 主机选择结果
 
@@ -54,13 +66,14 @@
 | `network_inventory` | pass | `TCP=144`，`UDP=62` |
 | `firewall_block` | pass | 成功创建并清理 `AegisValidation-55b576db` rule group |
 | `registry_protection` | pass | 在 `192.168.2.222` 下发 `\\REGISTRY\\MACHINE\\SOFTWARE\\AegisValidation\\RegistryProtection\\windows-runtime-20260421-111721`，写入 `BlockedValue` 返回“尝试执行未经授权的操作”，journal 记录 `blocked=true` |
+| `file_target_path_protection` | pass | 在 `192.168.2.222` 下发受保护目录后，外部文件 `MoveFileEx` / `CreateHardLink` 进入目录均失败 |
 | `preemptive_blocking` | pass | 在 `192.168.2.222` 下发 `block_path` / `block_pid` / `block_hash` 后，路径创建/重命名/删除、目标 PID 写入、命中 hash 的文件打开均被拒绝，且 Minifilter 记录 `block-path` / `block-pid` / `block-hash` 事件并在清空后返回 `block_entry_count=0` |
 | `named_pipe_inventory` | pass | 成功枚举命名管道样本，包括 `InitShutdown`、`lsass`、`ntsvcs` |
 | `module_inventory` | pass | 成功读取 `1Password.exe` 进程模块清单 |
 | `vss_inventory` | pass | 成功读取 `3` 条 `Win32_ShadowCopy` 样本 |
 | `device_inventory` | pass | 成功读取 `Display / AudioEndpoint / Firmware / System` 设备样本 |
-| `amsi_surface` | pass | `has_amsi_runtime=true`，`scan_interface_ready=true`，`session_opened=true`，`has_script_block_logging=false` |
-| `script_surface_roundtrip` | pass | benign script `Write-Output 'Aegis script surface allow'` 已产出 4104 事件；官方 AMSI test sample 被 `AmsiScanBuffer` 以 `amsi_result=32768` 阻断 |
+| `amsi_surface` | pass | `192.168.2.218` 上 `scan_interface_ready=true`；`192.168.2.222` 上 `scan_interface_ready=false`、`strict_block_ready=false`，平台不再 overclaim 支持状态 |
+| `script_surface_roundtrip` | pass | benign script 仍产出 4104 事件；`192.168.2.218` 上官方 AMSI sample 被阻断，`192.168.2.222` 上显式返回 `host_amsi_strict_enforcement_unavailable` |
 | `memory_signal_roundtrip` | pass | 真实拉起 `powershell(pid=2512)` 并分配约 `160411648` bytes 私有内存，快照可见进程与增量 |
 | `suspend_kill_response` | pass | 真实执行 `NtSuspendProcess + Stop-Process`，目标 `pid=6984` |
 | `quarantine_response` | pass | 真实移动文件到 `C:\ProgramData\Aegis\quarantine\windows-runtime-20260420-180434-quarantine-input.txt` |
@@ -109,6 +122,18 @@
 - W16 验收摘要：`C:\ProgramData\Aegis\validation\windows-runtime-20260421-121355\summary.json`
 - W16 远端 payload 根目录：`C:\ProgramData\Aegis\validation\windows-runtime-verify-20260421-121345`
 - W16 关键结果：`{"path_blocked":true,"pid_blocked":true,"hash_blocked":true,"block_path_event":true,"block_pid_event":true,"block_hash_event":true,"block_entry_count_after_clear":0,"required_failures":[]}`
+- W17 验收摘要：`C:\ProgramData\Aegis\validation\windows-runtime-20260421-140132\summary.json`
+- W17 远端 payload 根目录：`C:\ProgramData\Aegis\validation\windows-runtime-verify-20260421-140122`
+- W17 关键结果：`{"move_into_protected_dir_blocked":true,"hardlink_into_protected_dir_blocked":true,"required_failures":[]}`
+- W18 验收摘要：`C:\ProgramData\Aegis\validation\windows-runtime-20260421-142041\summary.json`
+- W18 远端 payload 根目录：`C:\ProgramData\Aegis\validation\windows-runtime-verify-20260421-142031`
+- W18 关键结果：`{"hash_blocked_before_create_return":true,"preemptive_blocking_passed":true,"required_failures":[]}`
+- W19 验收摘要：`C:\ProgramData\Aegis\validation\windows-runtime-20260421-143528\summary.json`
+- W19 远端 payload 根目录：`C:\ProgramData\Aegis\validation\windows-runtime-verify-20260421-143518`
+- W19 关键结果：`{"runtime_verify_required_failures":[],"partial_release_unit_test_passed":true}`
+- W20 验收摘要：`C:\ProgramData\Aegis\validation\windows-runtime-20260421-145549\summary.json`
+- W20 远端 payload 根目录：`C:\ProgramData\Aegis\validation\windows-runtime-verify-20260421-145539`
+- W20 关键结果：`{"strict_block_ready":false,"script_surface_roundtrip_skip_reason":"host_amsi_strict_enforcement_unavailable","required_failures":[]}`
 
 ## 6. 结论
 
@@ -121,4 +146,8 @@
 - `W14` 已额外验证通过 release 清单、代码签名/验签、安装前后 release gate 与批准文件依赖校验；当前仓库已具备严格失败的 Windows release 验收入口。
 - `W15` 已额外验证通过注册表真实保护链：`protect_registry` 可下发真实内核路径，受保护注册表写入被驱动 pre-callback 拒绝，journal 与审计工件均反映真实保护状态。
 - `W16` 已额外验证通过 `block_hash` / `block_pid` / `block_path` 真实阻断链：Minifilter 权威 block map、TTL、事件回传与清空链路已经闭环，`WindowsPlatform` 不再把这三项能力维持在 audit-only 工件阶段。
+- `W17` 已额外验证通过目标路径保护链：`protect_files` 已能阻断外部文件 move / hardlink 进入受保护目录，目标路径绕过缺口已关闭。
+- `W18` 已额外验证通过 hash 严格预阻断链：`block_hash` 不再依赖 `AegisFilePostCreate + FltCancelFileOpen`，真机可验证命中 hash 的文件在 create 返回前被拒绝。
+- `W19` 已额外验证通过 block 清理平面解耦：Minifilter 不可用时 firewall 仍可释放，且正常真机整机验收未回归。
+- `W20` 已额外验证通过 AMSI 能力 truthfulness：`.222` 上 strict blocking 仍不可用，但平台与验收脚本已显式声明 unsupported，不再把 skip 分支写成“严格阻断已完成”。
 - `security_4688` 的验收口径以“日志可读、record_id 可取”为准；`cmd.exe` 临时探针命中率被保留为观察项，不作为失败条件。

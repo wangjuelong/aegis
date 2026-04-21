@@ -20,6 +20,10 @@
 | `W14` | `done` | 已完成 release 清单、签名/验签脚本、安装前后 release gate 与 Windows 11 真机发布验证；外部证书/审批缺失时严格失败 |
 | `W15` | `done` | 已完成 `protect_registry`、驱动保护表、registry pre-callback 阻断与 `192.168.2.222` 真机验收 |
 | `W16` | `done` | 已完成 Minifilter 权威 block map、TTL、状态查询与 `192.168.2.222` 真机验收 |
+| `W17` | `done` | 已完成目标路径阻断：外部文件 rename/move/link 进入受保护目录在 `192.168.2.222` 被拒绝 |
+| `W18` | `done` | 已完成 `block_hash` 严格 pre-create 阻断，`.222` 真机重新验证通过 |
+| `W19` | `done` | 已完成 `clear_all_blocks` 平面解耦，部分成功状态与残留块已可审计 |
+| `W20` | `done` | 已完成 AMSI strict-block 能力 truthfulness 收口，平台不再 overclaim `.222` 上的支持状态 |
 
 ---
 
@@ -34,7 +38,8 @@
 
 ## 2. 当前结论
 
-- 仓库侧 Windows 功能缺口已清零，`W09-W16` 全部完成，系统级交付链路已可重新标记为 `done`。
+- 新一轮代码审查发现的 4 个剩余代码/设计缺口已经全部收口。
+- 当前 `.222` 宿主仍缺少真实 AMSI strict-block 前置条件，但平台已显式声明 `unsupported`，不再 overclaim；系统级交付状态仍保持 `doing`，直到补齐带 Defender strict-block 的正式验证主机。
 - 测试机 `192.168.2.218` 与 `192.168.2.222` 均可用；`192.168.1.4` 当前不可达，不作为当前验收主机。
 - `W14` 需要的签名、验签、批准文件依赖已经形成严格失败链路，但正式 `pfx/cer` 资产仍由外部发布环境注入。
 
@@ -330,6 +335,125 @@
 **详细计划**
 
 - `docs/plan/sensor/sensor-windows-preemptive-block-plan.md`
+
+### W17: 受保护目录目标路径阻断收口
+
+**状态**
+
+- 已完成，真机主机：`192.168.2.222`
+- 已验证外部文件 `move` / `hardlink` 进入受保护目录被拒绝
+- 远端验证时间：`2026-04-21 14:04:08 +08:00`
+- 远端 payload：`C:\ProgramData\Aegis\validation\windows-runtime-verify-20260421-140122`
+- 代码提交：`60955d1`
+
+**目标**
+
+- 收口 rename / move / link 进入受保护目录的目标路径绕过。
+- 让 `protect_files` 与 `block_path` 同时覆盖源路径与目标路径判定。
+
+**完成判定**
+
+- 外部文件无法通过 rename / move / link 进入受保护目录。
+- 真机 `192.168.2.222` 可验证目标路径阻断。
+
+**关键文件**
+
+- 修改：`windows/minifilter/src/aegis_file_minifilter.c`
+- 修改：`scripts/windows-runtime-verify.ps1`
+- 修改：`scripts/windows-runtime-verify.sh`
+
+**详细计划**
+
+- `docs/plan/sensor/sensor-windows-protected-destination-rename-plan.md`
+
+### W18: hash 严格 pre-create 阻断链
+
+**状态**
+
+- 已完成，真机主机：`192.168.2.222`
+- 已验证 `block_hash` 在 create 返回前拒绝，整机 `preemptive_blocking` 再次通过
+- 远端验证时间：`2026-04-21 14:23:50 +08:00`
+- 远端 payload：`C:\ProgramData\Aegis\validation\windows-runtime-verify-20260421-142031`
+- 代码提交：`7061b59`
+
+**目标**
+
+- 把 `block_hash` 从 `post-create + FltCancelFileOpen` 收口为严格 create 入口阻断。
+- 保证文档中的“preemptive block”与内核真实时序一致。
+
+**完成判定**
+
+- `block_hash` 不再依赖 post-create cancel。
+- 命中 hash 的文件在 create 返回前被拒绝。
+
+**关键文件**
+
+- 修改：`windows/minifilter/src/aegis_file_minifilter.c`
+- 修改：`scripts/windows-runtime-verify.ps1`
+
+**详细计划**
+
+- `docs/plan/sensor/sensor-windows-hash-precreate-block-plan.md`
+
+### W19: block 清理平面解耦
+
+**状态**
+
+- 已完成，主验证主机：`192.168.2.222`
+- 已验证正常双平面清理链无回归，且本地单测覆盖 Minifilter 不可用时 firewall 仍被释放
+- 远端验证时间：`2026-04-21 14:37:59 +08:00`
+- 远端 payload：`C:\ProgramData\Aegis\validation\windows-runtime-verify-20260421-143518`
+- 代码提交：`65b198f`
+
+**目标**
+
+- 让 `clear_all_blocks()` 分平面清理 Windows 防火墙与 Minifilter block。
+- 某一平面失效时，另一平面仍能完成 release，并把部分成功显式写入工件。
+
+**完成判定**
+
+- Minifilter 失效时 network release 仍能完成。
+- 清理工件显式包含分平面结果与残留状态。
+
+**关键文件**
+
+- 修改：`crates/aegis-platform/src/windows.rs`
+- 修改：`crates/aegis-platform/src/traits.rs`
+- 修改：`scripts/windows-runtime-verify.ps1`
+
+**详细计划**
+
+- `docs/plan/sensor/sensor-windows-block-release-decoupling-plan.md`
+
+### W20: AMSI 严格阻断收口
+
+**状态**
+
+- 已完成，真机主机：`192.168.2.222`
+- 已验证 `.222` 上 `strict_block_ready=false` 时平台不再 overclaim `supports_amsi=true`
+- 远端验证时间：`2026-04-21 14:58:20 +08:00`
+- 远端 payload：`C:\ProgramData\Aegis\validation\windows-runtime-verify-20260421-145539`
+- 代码提交：`0a01f16`
+
+**目标**
+
+- 收口 AMSI 严格阻断只能条件成立的问题。
+- 让 `supports_amsi` / `AmsiStatus` / 验收脚本与真实主机 strict-block 能力一致。
+
+**完成判定**
+
+- `supports_amsi` / `AmsiStatus` 与真实宿主 strict-block 能力一致。
+- `.222` 上 `strict_block_ready=false` 时，平台显式输出 unsupported，不再 overclaim。
+
+**关键文件**
+
+- 修改：`crates/aegis-platform/src/windows.rs`
+- 修改：`scripts/windows-scan-script-with-amsi.ps1`
+- 修改：`scripts/windows-runtime-verify.ps1`
+
+**详细计划**
+
+- `docs/plan/sensor/sensor-windows-amsi-strict-enforcement-plan.md`
 
 ## 4. 验证矩阵
 

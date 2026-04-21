@@ -4,6 +4,7 @@ use aegis_model::{
     SensorConfig, SuspiciousProcess,
 };
 use anyhow::Result;
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -35,7 +36,7 @@ pub struct PlatformDescriptor {
     pub supports_container_sensor: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct BlockLease {
     pub kind: String,
     pub target: String,

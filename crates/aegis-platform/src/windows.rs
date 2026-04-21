@@ -209,6 +209,7 @@ struct WindowsHostCapabilities {
     has_amsi_runtime: bool,
     has_script_block_logging: bool,
     has_amsi_scan_interface: bool,
+    has_amsi_strict_blocking: bool,
     has_memory_inventory: bool,
     has_named_pipe_inventory: bool,
     has_module_inventory: bool,
@@ -309,7 +310,7 @@ impl WindowsHostCapabilities {
             && self.has_powershell_log
             && self.has_amsi_runtime
             && self.has_script_block_logging
-            && self.has_amsi_scan_interface
+            && self.has_amsi_strict_blocking
     }
 
     fn memory_sensor_ready(&self) -> bool {
@@ -372,6 +373,10 @@ impl WindowsHostCapabilities {
         facts.push(format!(
             "amsi_scan_interface={}",
             self.has_amsi_scan_interface
+        ));
+        facts.push(format!(
+            "amsi_strict_blocking={}",
+            self.has_amsi_strict_blocking
         ));
         facts.push(format!("memory_inventory={}", self.has_memory_inventory));
         facts.push(self.driver_transport_summary());
@@ -451,6 +456,8 @@ struct WindowsCapabilityProbe {
     has_script_block_logging: bool,
     #[serde(default)]
     has_amsi_scan_interface: bool,
+    #[serde(default)]
+    has_amsi_strict_blocking: bool,
     #[serde(default)]
     has_memory_inventory: bool,
     has_named_pipe_inventory: bool,
@@ -584,6 +591,8 @@ struct WindowsAmsiScanResponse {
     should_block: bool,
     session_opened: bool,
     scan_interface_ready: bool,
+    #[serde(default)]
+    strict_block_ready: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1006,6 +1015,10 @@ struct WindowsBlockAuditArtifact {
 struct WindowsBlockClearArtifact {
     cleared_block_count: usize,
     cleared_rule_groups: Vec<String>,
+    minifilter_blocks_cleared: usize,
+    firewall_clear_error: Option<String>,
+    minifilter_clear_error: Option<String>,
+    remaining_blocks: Vec<BlockLease>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -1574,49 +1587,100 @@ impl PreemptiveBlock for WindowsPlatform {
 
     fn clear_all_blocks(&self) -> Result<()> {
         let mut state = self.state.lock().expect("windows state poisoned");
-        let cleared_block_count = state.execution.active_blocks.len();
-        let has_non_network_blocks = state
-            .execution
-            .active_blocks
-            .iter()
-            .any(|lease| lease.kind != "network");
-        if has_non_network_blocks && !state.host.file_monitor_ready() {
-            bail!(
-                "clear windows blocks requires minifilter control port {}; {}",
-                AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
-                state.host.summary()
-            );
-        }
+        let active_blocks = state.execution.active_blocks.clone();
+        let cleared_block_count = active_blocks.len();
+        let has_non_network_blocks = active_blocks.iter().any(|lease| lease.kind != "network");
+        let mut firewall_clear_error = None;
+        let mut minifilter_clear_error = None;
+        let mut minifilter_blocks_cleared = 0usize;
+        let mut cleared_rule_groups = Vec::new();
+
         if state.host.file_monitor_ready() {
-            let response = clear_windows_preemptive_blocks(
+            match clear_windows_preemptive_blocks(
                 self.runner.as_ref(),
                 AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME,
-            )
-            .with_context(|| "clear windows minifilter block entries")?;
-            if response.protocol_version != AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION {
-                bail!(
-                    "windows block clear protocol mismatch: expected 0x{expected:08x}, got 0x{actual:08x}",
-                    expected = AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION,
-                    actual = response.protocol_version
-                );
+            ) {
+                Ok(response) => {
+                    if response.protocol_version != AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION {
+                        minifilter_clear_error = Some(format!(
+                            "windows block clear protocol mismatch: expected 0x{expected:08x}, got 0x{actual:08x}",
+                            expected = AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION,
+                            actual = response.protocol_version
+                        ));
+                    } else {
+                        minifilter_blocks_cleared =
+                            active_blocks.iter().filter(|lease| lease.kind != "network").count();
+                        if let Err(error) =
+                            sync_windows_preemptive_block_state(&mut state, self.runner.as_ref())
+                                .with_context(
+                                    || "synchronize windows preemptive block state after clear",
+                                )
+                        {
+                            minifilter_clear_error = Some(error.to_string());
+                        }
+                    }
+                }
+                Err(error) => {
+                    minifilter_clear_error =
+                        Some(format!("clear windows minifilter block entries: {error}"));
+                }
             }
-            sync_windows_preemptive_block_state(&mut state, self.runner.as_ref())
-                .with_context(|| "synchronize windows preemptive block state after clear")?;
+        } else if has_non_network_blocks {
+            minifilter_clear_error = Some(format!(
+                "minifilter control port unavailable: {}",
+                state.host.summary()
+            ));
         }
-        let cleared_rule_groups = state.block_rule_groups.clone();
-        if !cleared_rule_groups.is_empty() {
-            clear_windows_firewall_blocks(&mut state, self.runner.as_ref(), &cleared_rule_groups)
-                .with_context(|| "clear windows firewall block rules")?;
+
+        let configured_rule_groups = state.block_rule_groups.clone();
+        if !configured_rule_groups.is_empty() {
+            match clear_windows_firewall_blocks(
+                &mut state,
+                self.runner.as_ref(),
+                &configured_rule_groups,
+            ) {
+                Ok(()) => {
+                    cleared_rule_groups = configured_rule_groups.clone();
+                }
+                Err(error) => {
+                    firewall_clear_error = Some(format!("clear windows firewall block rules: {error}"));
+                }
+            }
         }
-        state.execution.active_blocks.clear();
-        state.block_rule_groups.clear();
+
+        let remaining_blocks = active_blocks
+            .into_iter()
+            .filter(|lease| match lease.kind.as_str() {
+                "network" => firewall_clear_error.is_some(),
+                _ => minifilter_clear_error.is_some(),
+            })
+            .collect::<Vec<_>>();
+        state.execution.active_blocks = remaining_blocks.clone();
+        if firewall_clear_error.is_none() {
+            state.block_rule_groups.clear();
+        }
         let artifact_path = write_windows_block_clear_artifact(
             &mut state,
             cleared_block_count,
             cleared_rule_groups,
+            minifilter_blocks_cleared,
+            firewall_clear_error.clone(),
+            minifilter_clear_error.clone(),
+            remaining_blocks.clone(),
         )?;
         state.execution.audit_artifacts.push(artifact_path);
-        Ok(())
+        match (firewall_clear_error, minifilter_clear_error) {
+            (None, None) => Ok(()),
+            (Some(firewall), Some(minifilter)) => bail!(
+                "clear windows blocks completed partially: firewall={firewall}; minifilter={minifilter}"
+            ),
+            (Some(firewall), None) => {
+                bail!("clear windows blocks completed partially: firewall={firewall}")
+            }
+            (None, Some(minifilter)) => {
+                bail!("clear windows blocks completed partially: minifilter={minifilter}")
+            }
+        }
     }
 }
 
@@ -1985,6 +2049,19 @@ if ($hasAmsiRuntime) {
     }
 }
 
+$hasAmsiStrictBlocking = $false
+if ($hasAmsiRuntime) {
+    try {
+        $strictSample = "`$null = 'AMSI Test Sample: 7e72c3ce-861b-4339-8740-0ac1484c1386'; Write-Output '__AEGIS_EXECUTED__'"
+        $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($strictSample))
+        $strictOutput = @(& powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded 2>&1 | ForEach-Object { [string]$_ })
+        $strictJoined = $strictOutput -join "`n"
+        $hasAmsiStrictBlocking = $strictJoined -notlike "*__AEGIS_EXECUTED__*"
+    } catch {
+        $hasAmsiStrictBlocking = $false
+    }
+}
+
 $hasMemoryInventory = $false
 if ((Get-Command Get-Process -ErrorAction SilentlyContinue) -ne $null) {
     try {
@@ -2173,6 +2250,7 @@ $data = [ordered]@{
     has_amsi_runtime = $hasAmsiRuntime
     has_script_block_logging = $hasScriptBlockLogging
     has_amsi_scan_interface = $hasAmsiScanInterface
+    has_amsi_strict_blocking = $hasAmsiStrictBlocking
     has_memory_inventory = $hasMemoryInventory
     has_named_pipe_inventory = $hasNamedPipeInventory
     has_module_inventory = $hasModuleInventory
@@ -2210,6 +2288,7 @@ $data | ConvertTo-Json -Compress
         has_amsi_runtime: probe.has_amsi_runtime,
         has_script_block_logging: probe.has_script_block_logging,
         has_amsi_scan_interface: probe.has_amsi_scan_interface,
+        has_amsi_strict_blocking: probe.has_amsi_strict_blocking,
         has_memory_inventory: probe.has_memory_inventory,
         has_named_pipe_inventory: probe.has_named_pipe_inventory,
         has_module_inventory: probe.has_module_inventory,
@@ -3826,10 +3905,18 @@ fn write_windows_block_clear_artifact(
     state: &mut WindowsState,
     cleared_block_count: usize,
     cleared_rule_groups: Vec<String>,
+    minifilter_blocks_cleared: usize,
+    firewall_clear_error: Option<String>,
+    minifilter_clear_error: Option<String>,
+    remaining_blocks: Vec<BlockLease>,
 ) -> Result<PathBuf> {
     let artifact = WindowsBlockClearArtifact {
         cleared_block_count,
         cleared_rule_groups,
+        minifilter_blocks_cleared,
+        firewall_clear_error,
+        minifilter_clear_error,
+        remaining_blocks,
     };
     let path = state
         .base_dir
@@ -4521,11 +4608,12 @@ fn amsi_report(host: &WindowsHostCapabilities) -> IntegrityReport {
         host.summary()
     } else {
         format!(
-            "amsi_runtime={};script_block_logging={};powershell_operational_log={};amsi_scan_interface={}",
+            "amsi_runtime={};script_block_logging={};powershell_operational_log={};amsi_scan_interface={};amsi_strict_blocking={}",
             host.has_amsi_runtime,
             host.has_script_block_logging,
             host.has_powershell_log,
-            host.has_amsi_scan_interface
+            host.has_amsi_scan_interface,
+            host.has_amsi_strict_blocking
         )
     };
     IntegrityReport { passed, details }
@@ -4579,8 +4667,8 @@ mod tests {
         AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION, AEGIS_WINDOWS_DRIVER_SERVICE_NAME,
     };
     use crate::{
-        KernelIntegrity, KernelTransport, PlatformProtection, PlatformResponse, PlatformRuntime,
-        PlatformSensor, PreemptiveBlock,
+        BlockLease, KernelIntegrity, KernelTransport, PlatformProtection, PlatformResponse,
+        PlatformRuntime, PlatformSensor, PreemptiveBlock,
     };
     use aegis_model::{EventBuffer, ForensicSpec, IsolationRulesV2, RollbackTarget, SensorConfig};
     use anyhow::{anyhow, bail, Result};
@@ -4649,6 +4737,7 @@ mod tests {
             has_amsi_runtime: false,
             has_script_block_logging: false,
             has_amsi_scan_interface: false,
+            has_amsi_strict_blocking: false,
             has_memory_inventory: false,
             has_named_pipe_inventory: false,
             has_module_inventory: false,
@@ -4775,7 +4864,7 @@ mod tests {
                 r#""has_wmi_log":true,"has_task_scheduler_log":true,"has_sysmon_log":false,"#,
                 r#""has_process_creation_events":true,"has_net_connection":true,"has_firewall":true,"#,
                 r#""has_registry_cli":true,"has_amsi_runtime":{},"has_script_block_logging":{},"#,
-                r#""has_amsi_scan_interface":false,"has_memory_inventory":false,"#,
+                r#""has_amsi_scan_interface":false,"has_amsi_strict_blocking":false,"has_memory_inventory":false,"#,
                 r#""has_named_pipe_inventory":{},"has_module_inventory":{},"has_vss_inventory":{},"#,
                 r#""has_device_inventory":{}}}"#
             ),
@@ -4792,6 +4881,7 @@ mod tests {
         has_amsi_runtime: bool,
         has_script_block_logging: bool,
         has_amsi_scan_interface: bool,
+        has_amsi_strict_blocking: bool,
         has_memory_inventory: bool,
     ) -> String {
         format!(
@@ -4801,13 +4891,14 @@ mod tests {
                 r#""has_wmi_log":true,"has_task_scheduler_log":true,"has_sysmon_log":false,"#,
                 r#""has_process_creation_events":true,"has_net_connection":true,"has_firewall":true,"#,
                 r#""has_registry_cli":true,"has_amsi_runtime":{},"has_script_block_logging":{},"#,
-                r#""has_amsi_scan_interface":{},"has_memory_inventory":{},"#,
+                r#""has_amsi_scan_interface":{},"has_amsi_strict_blocking":{},"has_memory_inventory":{},"#,
                 r#""has_named_pipe_inventory":false,"has_module_inventory":false,"has_vss_inventory":false,"#,
                 r#""has_device_inventory":false}}"#
             ),
             has_amsi_runtime,
             has_script_block_logging,
             has_amsi_scan_interface,
+            has_amsi_strict_blocking,
             has_memory_inventory
         )
     }
@@ -5717,6 +5808,59 @@ mod tests {
     }
 
     #[test]
+    fn windows_clear_all_blocks_releases_firewall_when_minifilter_unavailable() {
+        let platform = WindowsPlatform::with_runner_for_test(
+            Box::new(QueuedWindowsRunner::new([
+                firewall_block_output("AegisBlock-test"),
+                String::new(),
+            ])),
+            healthy_host(),
+        );
+
+        platform
+            .block_network(
+                &aegis_model::NetworkTarget {
+                    value: "10.0.0.9".to_string(),
+                },
+                Duration::from_secs(120),
+            )
+            .expect("block network should create firewall rule");
+        {
+            let mut state = platform.state.lock().expect("windows state poisoned");
+            state.execution.active_blocks.push(BlockLease {
+                kind: "pid".to_string(),
+                target: "5150".to_string(),
+                ttl_secs: 45,
+            });
+        }
+
+        let error = platform
+            .clear_all_blocks()
+            .expect_err("clear should surface minifilter failure while releasing firewall");
+        assert!(error.to_string().contains("minifilter"));
+
+        let snapshot = platform.execution_snapshot();
+        assert_eq!(snapshot.active_blocks.len(), 1);
+        assert_eq!(snapshot.active_blocks[0].kind, "pid");
+        let clear_artifact = snapshot
+            .audit_artifacts
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .map(|value| value.starts_with("clear-"))
+                    .unwrap_or(false)
+            })
+            .expect("block clear artifact should exist");
+        let clear_json = fs::read_to_string(clear_artifact).expect("read clear artifact");
+        assert!(clear_json.contains("\"cleared_rule_groups\": ["));
+        assert!(clear_json.contains("AegisBlock-test"));
+        assert!(clear_json.contains("\"minifilter_clear_error\""));
+        assert!(clear_json.contains("\"remaining_blocks\""));
+        assert!(clear_json.contains("\"kind\": \"pid\""));
+    }
+
+    #[test]
     fn windows_health_snapshot_reports_real_host_probe_state() {
         let mut platform =
             platform_with_probe_and_processes([process_output(&[("System", 4, 0, None)])]);
@@ -5927,7 +6071,7 @@ mod tests {
     fn windows_amsi_health_reflects_runtime_and_script_block_state() {
         let mut platform = WindowsPlatform::new_with_runner(
             Box::new(QueuedWindowsRunner::new([
-                probe_output_with_script_memory_surface(true, true, true, false),
+                probe_output_with_script_memory_surface(true, true, true, true, false),
                 process_output(&[("System", 4, 0, None)]),
                 audit_cursor_output(150),
                 audit_cursor_output(250),
@@ -5983,6 +6127,7 @@ mod tests {
         host.has_amsi_runtime = true;
         host.has_script_block_logging = true;
         host.has_amsi_scan_interface = true;
+        host.has_amsi_strict_blocking = true;
         host.has_memory_inventory = true;
 
         let platform = WindowsPlatform::with_runner_for_test(
@@ -6004,6 +6149,7 @@ mod tests {
         host.has_amsi_runtime = true;
         host.has_script_block_logging = true;
         host.has_amsi_scan_interface = true;
+        host.has_amsi_strict_blocking = true;
         host.has_memory_inventory = true;
 
         let mut platform = WindowsPlatform::with_runner_for_test(
@@ -6085,6 +6231,28 @@ mod tests {
                 && event.contains("memory-growth")
                 && event.contains("private_delta_bytes=")
         }));
+    }
+
+    #[test]
+    fn windows_descriptor_requires_strict_amsi_blocking_for_support() {
+        let mut host = healthy_host();
+        host.has_amsi_runtime = true;
+        host.has_script_block_logging = true;
+        host.has_amsi_scan_interface = true;
+        host.has_amsi_strict_blocking = false;
+
+        let platform = WindowsPlatform::with_runner_for_test(
+            Box::new(QueuedWindowsRunner::new(Vec::<String>::new())),
+            host,
+        );
+
+        let descriptor = platform.descriptor();
+        let amsi = platform
+            .check_amsi_integrity()
+            .expect("amsi integrity should be available");
+
+        assert!(!descriptor.supports_amsi);
+        assert!(!amsi.healthy);
     }
 
     #[test]
