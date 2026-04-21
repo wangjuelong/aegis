@@ -36,11 +36,11 @@ Windows 平台目标覆盖：
 - `W04.1` 已完成：启动阶段会采集 TCP/UDP 真实网络基线，`poll_events()` 已接入连接增量事件；`network_isolate/network_release` 已通过 Windows 防火墙真实执行隔离与释放，不再只修改内存态。
 - `W04.2` 已完成：`protect_files` 与 `registry_rollback` 会生成真实 JSON 审计工件，回滚目标、受保护路径和注册表保护面已可落盘并通过执行快照回看工件路径。
 - `W06.1` 已完成：`suspend_process/kill_process/kill_ppl_process/quarantine_file/collect_forensics` 已切换为真实 Windows 响应执行链；挂起链使用 `NtSuspendProcess`，终止链会等待进程退出，文件隔离与取证打包会返回真实主机产物路径，不再依赖本地伪造快照。
-- `W06.2` 已完成：`block_hash/block_pid/block_path` 已不再只保留 lease，而是生成可复盘的阻断审计工件；`block_network/clear_all_blocks` 已接入真实 Windows 防火墙 rule group 创建/清理；`protect_process/protect_files/verify_integrity` 也会产出保护面与完整性审计工件。
+- `W06.2` 已完成一半：`block_network/clear_all_blocks` 已接入真实 Windows 防火墙 rule group 创建/清理；但 `block_hash/block_pid/block_path` 仍是 audit-only 工件，不是实时内核阻断，需由 `W16` 收口。
 - `W07.1` 已完成：仓库已新增 `scripts/windows-runtime-verify.sh` / `scripts/windows-runtime-verify.ps1` 真机验收脚本，并在 `192.168.2.218` 跑通完整矩阵；详细结果见 `docs/plan/sensor/sensor-windows-validation-matrix.md`。
 - `W08.1` 已完成：`aegis-core` 已接入 Windows 专用 DPAPI 主密钥与回滚锚点实现，诊断状态会输出 `provider_detail`、Windows TPM 可用性与回滚锚点状态；并已在 `192.168.2.218` 实测拿到 `tpm_present=true`、`tpm_ready=true` 和 DPAPI machine/user scope 往返成功结果。
-- 当前仓库在本轮计划范围内已经完成“真实能力、真实失败、真实工件”的 Windows 运行时闭环，并已补齐 Windows 驱动工程、安装/卸载链、版本化控制通道与 `driver_transport` 真机验收。
-- `W11` 已完成：`ObRegisterCallbacks` 进程保护、Minifilter 路径保护与真实驱动完整性回执已接入，`192.168.2.218` 已验证 `Stop-Process`/文件修改阻断与 `block-create` 事件记录。
+- 当前仓库已经完成大部分 Windows 运行时闭环，但仍有两个未收口的真实能力缺口：注册表保护仍停留在静态保护面工件、`block_hash/pid/path` 仍停留在 audit-only 工件。
+- `W11` 已完成大部分：`ObRegisterCallbacks` 进程保护、Minifilter 路径保护与真实驱动完整性回执已接入；但注册表“保护”尚未成为真实 pre-callback 阻断，需由 `W15` 收口。
 - `W12` 已完成：共享脚本解码、AMSI 脚本阻断/告警链、PowerShell 4104 脚本块事件与内存快照增量已接入，`192.168.2.218` 已验证 benign script 事件捕获和官方 AMSI 测试样本阻断。
 - `W13` 已完成：开发包安装/卸载、自举自检、watchdog 状态快照、失败回滚与远端打包验证已经闭环，真机 `validate.ps1` 返回 `required_failures=[]`。
 - 但这不等于 Windows 最终系统级交付已经完成。当前仍缺少正式签名、兼容性验证与发布工程化。
@@ -106,6 +106,8 @@ Windows 平台目标覆盖：
 | W09 | Windows 驱动工程、安装链与用户态桥接 | done | 不允许继续声明 `KernelTransport::Driver` 但实际只依赖 PowerShell/SSH；缺驱动必须显式失败 | 已入仓可构建驱动工程、安装/卸载脚本、版本协商与严格失败逻辑，`192.168.2.218` 已完成构建、安装、协议握手、卸载与 `windows-runtime-verify` 闭环 |
 | W10 | 文件与注册表系统采集链 | done | 不允许继续把 `file/registry=false` 或把 rollback 只做成 JSON 工件 | 已完成 Minifilter 文件事件、注册表 journal/回滚、真实事件上报与真机回滚闭环 |
 | W11 | 进程/文件/注册表保护与内核完整性 | done | 不允许继续把保护面仅落成工件；`check_ssdt_integrity`/`check_callback_tables`/`check_kernel_code` 不得再返回 `not implemented` | 已完成真实保护执行链和完整性检查，真机可验证阻断与检测结果 |
+| W15 | 注册表真实保护链 | todo | 不允许把静态保护面路径继续当成保护能力；必须具备真实路径下发、驱动权威状态与 pre-callback 阻断 | 完成后 `protect_registry`、保护面工件、journal 和真机阻断结果全部反映真实状态 |
+| W16 | hash/pid/path 真实阻断链 | todo | 不允许继续用 userspace ledger 冒充 preemptive block；TTL 与 block map 必须在 minifilter 权威状态里生效 | 完成后 `block_hash/pid/path` 均为真实 pre-op 阻断，`clear_all_blocks` 能清空全部 block |
 | W12 | 脚本/AMSI/内存信号闭环 | done | 不允许继续把 `AmsiScript`/`MemorySensor` 固定为未实现；脚本能力不能只停留在日志健康面 | 已完成共享脚本解码、AMSI 扫描/阻断、PowerShell 4104 事件桥接、内存快照增量事件与真机验收 |
 | W13 | 打包、看门狗、自举与发布前自检 | done | 不允许继续把系统级交付等同于单个 `powershell.exe` 运行时；安装链必须显式校验驱动/服务/依赖 | 已完成开发包 manifest/install/uninstall/validate、`aegis-agentd` 首启配置与 bootstrap 检查、`aegis-watchdog --once` 状态快照，以及 `192.168.2.218` 真机安装/回滚闭环 |
 | W14 | 正式签名、兼容性矩阵与发布验证 | done | 不允许把自签名或未验签产物标记为正式发布；无签名凭据必须严格失败 | 已完成 release manifest、签名/验签脚本、安装前后 release gate、支持矩阵文档与 `192.168.2.218` 真机发布验收 |
@@ -123,7 +125,8 @@ Windows 平台目标覆盖：
 - Windows Named Pipe / DLL / VSS / Device 资产可见性：`done`
 - Windows AMSI / ScriptBlock / ETW 健康面：`done`
 - Windows 真实挂起/终止/隔离/取证执行链：`done`
-- Windows 预防性阻断与保护面审计：`done`
+- Windows 预防性阻断与保护面审计：`doing`
+- Windows 注册表真实保护链：`todo`
 - Windows 真机验收、兼容性矩阵与验收脚本：`done`
 - Windows 凭据存储、DPAPI/TPM 根信任与回滚锚点：`done`
 - Windows 驱动工程、安装链与用户态桥接：`done`
@@ -131,7 +134,7 @@ Windows 平台目标覆盖：
 - Windows 进程/文件保护与内核完整性：`done`
 - Windows 脚本/AMSI/内存信号闭环：`done`
 - Windows 打包、看门狗、自举与发布前自检：`done`
-- Windows 真实系统级交付：`done`
+- Windows 真实系统级交付：`doing`
 - Windows 正式签名、发布验证：`done`
 
 因此，本文件中的平台状态应保持：
@@ -151,6 +154,8 @@ Windows 平台目标覆盖：
 - `W09 = done`
 - `W10 = done`
 - `W11 = done`
+- `W15 = todo`
+- `W16 = todo`
 - `W12 = done`
 - `W13 = done`
 - `W14 = done`
@@ -161,5 +166,6 @@ Windows 专项的最终目标不变：
 
 1. 先把运行时改成“真实能力、真实失败、真实工件”
 2. 再补齐真正的 Windows 驱动工程、文件/注册表/脚本/内存系统采集与保护链
-3. 再补齐真实 Windows 主机上的安装、自举、签名、兼容性与发布前验收
-4. 当前仓库侧 Windows 系统级交付、正式签名与发布验证已收口；Microsoft 正式签发与多版本试点继续作为仓库外运维流程推进
+3. 再收口注册表真实保护链与 `block_hash/pid/path` 真实 preemptive block
+4. 再补齐真实 Windows 主机上的安装、自举、签名、兼容性与发布前验收
+5. 当前仓库侧正式签名与发布验证已收口；`W15/W16` 完成后 Windows 系统级交付才可重新标为 `done`
