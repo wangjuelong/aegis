@@ -54,6 +54,27 @@ function Convert-Base64ToUtf8String {
     [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Value))
 }
 
+function Invoke-PowerShellEngineExecution {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Content
+    )
+
+    $marker = "__AEGIS_EXECUTED__"
+    $wrapped = "$Content`nWrite-Output '$marker'"
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($wrapped))
+    $output = @(& powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded 2>&1 | ForEach-Object { [string]$_ })
+    $joined = $output -join "`n"
+
+    [ordered]@{
+        executed = $joined -like "*$marker*"
+        blocked = $joined -notlike "*$marker*"
+        output = $output
+        output_count = @($output).Count
+        exit_code = [int]$LASTEXITCODE
+    }
+}
+
 function Invoke-AmsiScan {
     param(
         [Parameter(Mandatory = $true)]
@@ -119,9 +140,12 @@ try {
 switch ($Mode) {
     "status" {
         $scan = Invoke-AmsiScan -Name "AegisProbe.ps1" -Content "Write-Output 'Aegis AMSI probe'"
+        $strictSample = "`$null = 'AMSI Test Sample: 7e72c3ce-861b-4339-8740-0ac1484c1386'"
+        $engine = Invoke-PowerShellEngineExecution -Content $strictSample
         [ordered]@{
             has_amsi_runtime = $hasAmsiRuntime
             scan_interface_ready = [bool]$scan.scan_interface_ready
+            strict_block_ready = [bool]$engine.blocked
             session_opened = [bool]$scan.session_opened
             amsi_result = [uint32]$scan.amsi_result
         } | ConvertTo-Json -Depth 5 -Compress
@@ -143,6 +167,7 @@ switch ($Mode) {
             should_block = [bool]$scan.should_block
             session_opened = [bool]$scan.session_opened
             scan_interface_ready = [bool]$scan.scan_interface_ready
+            strict_block_ready = $false
         } | ConvertTo-Json -Depth 5 -Compress
     }
     "execute" {
@@ -163,6 +188,25 @@ switch ($Mode) {
                 malware = [bool]$scan.malware
                 session_opened = [bool]$scan.session_opened
                 scan_interface_ready = [bool]$scan.scan_interface_ready
+                strict_block_ready = [bool]$scan.scan_interface_ready
+            } | ConvertTo-Json -Depth 5 -Compress
+            return
+        }
+
+        if (-not [bool]$scan.scan_interface_ready) {
+            $engine = Invoke-PowerShellEngineExecution -Content $content
+            [ordered]@{
+                decision = if ($engine.blocked) { "block" } else { "allow" }
+                blocked = [bool]$engine.blocked
+                executed = [bool]$engine.executed
+                amsi_result = [uint32]$scan.amsi_result
+                blocked_by_admin = [bool]$scan.blocked_by_admin
+                malware = [bool]$scan.malware
+                session_opened = [bool]$scan.session_opened
+                scan_interface_ready = [bool]$scan.scan_interface_ready
+                strict_block_ready = [bool]$engine.blocked
+                output = $engine.output
+                output_count = [int]$engine.output_count
             } | ConvertTo-Json -Depth 5 -Compress
             return
         }
@@ -177,6 +221,7 @@ switch ($Mode) {
             malware = [bool]$scan.malware
             session_opened = [bool]$scan.session_opened
             scan_interface_ready = [bool]$scan.scan_interface_ready
+            strict_block_ready = $false
             output = $output
             output_count = @($output).Count
         } | ConvertTo-Json -Depth 5 -Compress

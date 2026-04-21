@@ -209,6 +209,7 @@ struct WindowsHostCapabilities {
     has_amsi_runtime: bool,
     has_script_block_logging: bool,
     has_amsi_scan_interface: bool,
+    has_amsi_strict_blocking: bool,
     has_memory_inventory: bool,
     has_named_pipe_inventory: bool,
     has_module_inventory: bool,
@@ -309,7 +310,7 @@ impl WindowsHostCapabilities {
             && self.has_powershell_log
             && self.has_amsi_runtime
             && self.has_script_block_logging
-            && self.has_amsi_scan_interface
+            && self.has_amsi_strict_blocking
     }
 
     fn memory_sensor_ready(&self) -> bool {
@@ -372,6 +373,10 @@ impl WindowsHostCapabilities {
         facts.push(format!(
             "amsi_scan_interface={}",
             self.has_amsi_scan_interface
+        ));
+        facts.push(format!(
+            "amsi_strict_blocking={}",
+            self.has_amsi_strict_blocking
         ));
         facts.push(format!("memory_inventory={}", self.has_memory_inventory));
         facts.push(self.driver_transport_summary());
@@ -451,6 +456,8 @@ struct WindowsCapabilityProbe {
     has_script_block_logging: bool,
     #[serde(default)]
     has_amsi_scan_interface: bool,
+    #[serde(default)]
+    has_amsi_strict_blocking: bool,
     #[serde(default)]
     has_memory_inventory: bool,
     has_named_pipe_inventory: bool,
@@ -584,6 +591,8 @@ struct WindowsAmsiScanResponse {
     should_block: bool,
     session_opened: bool,
     scan_interface_ready: bool,
+    #[serde(default)]
+    strict_block_ready: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2040,6 +2049,19 @@ if ($hasAmsiRuntime) {
     }
 }
 
+$hasAmsiStrictBlocking = $false
+if ($hasAmsiRuntime) {
+    try {
+        $strictSample = "`$null = 'AMSI Test Sample: 7e72c3ce-861b-4339-8740-0ac1484c1386'; Write-Output '__AEGIS_EXECUTED__'"
+        $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($strictSample))
+        $strictOutput = @(& powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded 2>&1 | ForEach-Object { [string]$_ })
+        $strictJoined = $strictOutput -join "`n"
+        $hasAmsiStrictBlocking = $strictJoined -notlike "*__AEGIS_EXECUTED__*"
+    } catch {
+        $hasAmsiStrictBlocking = $false
+    }
+}
+
 $hasMemoryInventory = $false
 if ((Get-Command Get-Process -ErrorAction SilentlyContinue) -ne $null) {
     try {
@@ -2228,6 +2250,7 @@ $data = [ordered]@{
     has_amsi_runtime = $hasAmsiRuntime
     has_script_block_logging = $hasScriptBlockLogging
     has_amsi_scan_interface = $hasAmsiScanInterface
+    has_amsi_strict_blocking = $hasAmsiStrictBlocking
     has_memory_inventory = $hasMemoryInventory
     has_named_pipe_inventory = $hasNamedPipeInventory
     has_module_inventory = $hasModuleInventory
@@ -2265,6 +2288,7 @@ $data | ConvertTo-Json -Compress
         has_amsi_runtime: probe.has_amsi_runtime,
         has_script_block_logging: probe.has_script_block_logging,
         has_amsi_scan_interface: probe.has_amsi_scan_interface,
+        has_amsi_strict_blocking: probe.has_amsi_strict_blocking,
         has_memory_inventory: probe.has_memory_inventory,
         has_named_pipe_inventory: probe.has_named_pipe_inventory,
         has_module_inventory: probe.has_module_inventory,
@@ -4584,11 +4608,12 @@ fn amsi_report(host: &WindowsHostCapabilities) -> IntegrityReport {
         host.summary()
     } else {
         format!(
-            "amsi_runtime={};script_block_logging={};powershell_operational_log={};amsi_scan_interface={}",
+            "amsi_runtime={};script_block_logging={};powershell_operational_log={};amsi_scan_interface={};amsi_strict_blocking={}",
             host.has_amsi_runtime,
             host.has_script_block_logging,
             host.has_powershell_log,
-            host.has_amsi_scan_interface
+            host.has_amsi_scan_interface,
+            host.has_amsi_strict_blocking
         )
     };
     IntegrityReport { passed, details }
@@ -4712,6 +4737,7 @@ mod tests {
             has_amsi_runtime: false,
             has_script_block_logging: false,
             has_amsi_scan_interface: false,
+            has_amsi_strict_blocking: false,
             has_memory_inventory: false,
             has_named_pipe_inventory: false,
             has_module_inventory: false,
@@ -4838,7 +4864,7 @@ mod tests {
                 r#""has_wmi_log":true,"has_task_scheduler_log":true,"has_sysmon_log":false,"#,
                 r#""has_process_creation_events":true,"has_net_connection":true,"has_firewall":true,"#,
                 r#""has_registry_cli":true,"has_amsi_runtime":{},"has_script_block_logging":{},"#,
-                r#""has_amsi_scan_interface":false,"has_memory_inventory":false,"#,
+                r#""has_amsi_scan_interface":false,"has_amsi_strict_blocking":false,"has_memory_inventory":false,"#,
                 r#""has_named_pipe_inventory":{},"has_module_inventory":{},"has_vss_inventory":{},"#,
                 r#""has_device_inventory":{}}}"#
             ),
@@ -4855,6 +4881,7 @@ mod tests {
         has_amsi_runtime: bool,
         has_script_block_logging: bool,
         has_amsi_scan_interface: bool,
+        has_amsi_strict_blocking: bool,
         has_memory_inventory: bool,
     ) -> String {
         format!(
@@ -4864,13 +4891,14 @@ mod tests {
                 r#""has_wmi_log":true,"has_task_scheduler_log":true,"has_sysmon_log":false,"#,
                 r#""has_process_creation_events":true,"has_net_connection":true,"has_firewall":true,"#,
                 r#""has_registry_cli":true,"has_amsi_runtime":{},"has_script_block_logging":{},"#,
-                r#""has_amsi_scan_interface":{},"has_memory_inventory":{},"#,
+                r#""has_amsi_scan_interface":{},"has_amsi_strict_blocking":{},"has_memory_inventory":{},"#,
                 r#""has_named_pipe_inventory":false,"has_module_inventory":false,"has_vss_inventory":false,"#,
                 r#""has_device_inventory":false}}"#
             ),
             has_amsi_runtime,
             has_script_block_logging,
             has_amsi_scan_interface,
+            has_amsi_strict_blocking,
             has_memory_inventory
         )
     }
@@ -6043,7 +6071,7 @@ mod tests {
     fn windows_amsi_health_reflects_runtime_and_script_block_state() {
         let mut platform = WindowsPlatform::new_with_runner(
             Box::new(QueuedWindowsRunner::new([
-                probe_output_with_script_memory_surface(true, true, true, false),
+                probe_output_with_script_memory_surface(true, true, true, true, false),
                 process_output(&[("System", 4, 0, None)]),
                 audit_cursor_output(150),
                 audit_cursor_output(250),
@@ -6099,6 +6127,7 @@ mod tests {
         host.has_amsi_runtime = true;
         host.has_script_block_logging = true;
         host.has_amsi_scan_interface = true;
+        host.has_amsi_strict_blocking = true;
         host.has_memory_inventory = true;
 
         let platform = WindowsPlatform::with_runner_for_test(
@@ -6120,6 +6149,7 @@ mod tests {
         host.has_amsi_runtime = true;
         host.has_script_block_logging = true;
         host.has_amsi_scan_interface = true;
+        host.has_amsi_strict_blocking = true;
         host.has_memory_inventory = true;
 
         let mut platform = WindowsPlatform::with_runner_for_test(
@@ -6201,6 +6231,28 @@ mod tests {
                 && event.contains("memory-growth")
                 && event.contains("private_delta_bytes=")
         }));
+    }
+
+    #[test]
+    fn windows_descriptor_requires_strict_amsi_blocking_for_support() {
+        let mut host = healthy_host();
+        host.has_amsi_runtime = true;
+        host.has_script_block_logging = true;
+        host.has_amsi_scan_interface = true;
+        host.has_amsi_strict_blocking = false;
+
+        let platform = WindowsPlatform::with_runner_for_test(
+            Box::new(QueuedWindowsRunner::new(Vec::<String>::new())),
+            host,
+        );
+
+        let descriptor = platform.descriptor();
+        let amsi = platform
+            .check_amsi_integrity()
+            .expect("amsi integrity should be available");
+
+        assert!(!descriptor.supports_amsi);
+        assert!(!amsi.healthy);
     }
 
     #[test]

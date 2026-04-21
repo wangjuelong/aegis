@@ -1096,6 +1096,7 @@ Invoke-ValidationStep -Name "amsi_surface" -Body {
     [ordered]@{
         has_amsi_runtime = [bool]$status.has_amsi_runtime
         scan_interface_ready = [bool]$status.scan_interface_ready
+        strict_block_ready = [bool]$status.strict_block_ready
         session_opened = [bool]$status.session_opened
         amsi_result = [uint32]$status.amsi_result
         has_powershell_operational_log = (Get-WinEvent -ListLog "Microsoft-Windows-PowerShell/Operational" -ErrorAction Stop) -ne $null
@@ -1148,9 +1149,9 @@ Invoke-ValidationStep -Name "script_surface_roundtrip" -Body {
             reason = $null
             result = $null
         }
-        if (-not [bool]$allowResult.scan_interface_ready) {
+        if (-not [bool]$allowResult.strict_block_ready) {
             $blockValidation.skipped = $true
-            $blockValidation.reason = "host_amsi_scan_interface_unavailable"
+            $blockValidation.reason = "host_amsi_strict_enforcement_unavailable"
             return [ordered]@{
                 allow = $allowResult
                 benign_event = $matched | Select-Object -First 1
