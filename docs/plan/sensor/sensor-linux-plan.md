@@ -35,7 +35,6 @@ Linux 平台目标覆盖：
 
 - 当前开发机与 Linux 测试机可闭合的 Linux 研发项已完成。
 - 剩余未完成项为：
-  - Linux 安装 / 发布工程
   - Linux 容器 / sidecar / runtime connector 交付链
 
 ## 5. Linux 研发计划与状态
@@ -53,7 +52,7 @@ Linux 平台目标覆盖：
 | L09 | TPM PCR policy session 绑定 | done | 已完成 `linux_tpm_master_key_pcrs`、policy digest、`session:<ctx>` 解封与真机正反向验收 |
 | L10 | Linux 容器验证与诊断集成 | done | 已完成 Linux 容器内 `cargo test` 基线验证与 `aegis-agentd -- --diagnose` 诊断接线 |
 | L11 | 更高阶 remote attestation / verifier 分离信任链 | done | 已完成 attestation bundle、verifier receipt、设备证书/receipt 诊断状态与本地正反向烟测 |
-| L12 | Linux 生产部署、签名与发行工程 | todo | 当前已具备测试机闭环，但更高阶生产打包、发行与长期运维工程未单独收口 |
+| L12 | Linux 生产部署、签名与发行工程 | done | 已完成 install manifest、systemd、`DEB/RPM` 组装、原生 RPM 安装/自检/watchdog/卸载与 `scripts/linux-package-verify.sh` 真机闭环 |
 | L13 | Linux 容器 / Sidecar / Runtime Connector 交付链 | todo | 当前仅完成 contract / example / test baseline，未形成交付目录、manifest 与 validate 入口 |
 
 ## 6. 已完成验证
@@ -76,6 +75,7 @@ Linux 测试机已完成：
 - `scripts/linux-tpm-sealed-verify.sh`
 - `scripts/linux-tpm-quote-verify.sh`
 - `scripts/linux-tpm-policy-verify.sh`
+- `scripts/linux-package-verify.sh`
 
 ## 7. Linux 完成定义
 
@@ -90,4 +90,5 @@ Linux 测试机已完成：
 
 - `L01-L10 = done`
 - `L11 = done`
-- `L12-L13 = todo`
+- `L12 = done`
+- `L13 = todo`
