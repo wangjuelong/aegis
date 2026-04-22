@@ -17,16 +17,30 @@ cd "$REPO_ROOT"
 
 run_cargo test -p aegis-core sidecar_and_daemonset_contracts_validate_expected_constraints -- --nocapture >/dev/null
 run_cargo test -p aegis-core container_detection_engine_flags_escape_and_lateral_signals -- --nocapture >/dev/null
-run_cargo run -p aegis-core --example runtime_sdk_connector >/tmp/aegis-runtime-sdk-example.out 2>/dev/null
+run_cargo run -p aegis-core --example runtime_sdk_connector >/tmp/aegis-runtime-sdk-rust.out 2>/dev/null
+python3 packaging/linux/runtime-sdk/python/example.py >/tmp/aegis-runtime-sdk-python.out
+node packaging/linux/runtime-sdk/node/example.mjs >/tmp/aegis-runtime-sdk-node.out
+(cd packaging/linux/runtime-sdk/go/example && go run .) >/tmp/aegis-runtime-sdk-go.out
+java_build_dir=$(mktemp -d)
+javac -d "$java_build_dir" $(find packaging/linux/runtime-sdk/java/src/main/java -name '*.java' | tr '\n' ' ') >/dev/null
+java -cp "$java_build_dir" io.aegis.runtime.RuntimeExample >/tmp/aegis-runtime-sdk-java.out
+rm -rf "$java_build_dir"
+docker run --rm -v "$REPO_ROOT:/workspace" -w /workspace mcr.microsoft.com/dotnet/sdk:8.0 \
+  dotnet run --project packaging/linux/runtime-sdk/dotnet/Aegis.Runtime.Example.csproj >/tmp/aegis-runtime-sdk-dotnet.out 2>/dev/null
 
-python3 - <<'PY' "$REPO_ROOT" "/tmp/aegis-runtime-sdk-example.out"
+python3 - <<'PY' "$REPO_ROOT" "/tmp/aegis-runtime-sdk-rust.out" "/tmp/aegis-runtime-sdk-python.out" "/tmp/aegis-runtime-sdk-node.out" "/tmp/aegis-runtime-sdk-go.out" "/tmp/aegis-runtime-sdk-java.out" "/tmp/aegis-runtime-sdk-dotnet.out"
 import json
 import pathlib
 import re
 import sys
 
 repo_root = pathlib.Path(sys.argv[1])
-example_output = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8").strip()
+rust_output = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8").strip()
+python_output = json.loads(pathlib.Path(sys.argv[3]).read_text(encoding="utf-8").strip())
+node_output = json.loads(pathlib.Path(sys.argv[4]).read_text(encoding="utf-8").strip())
+go_output = json.loads(pathlib.Path(sys.argv[5]).read_text(encoding="utf-8").strip())
+java_output = json.loads(pathlib.Path(sys.argv[6]).read_text(encoding="utf-8").strip())
+dotnet_output = json.loads(pathlib.Path(sys.argv[7]).read_text(encoding="utf-8").strip())
 required_failures = []
 
 daemonset_path = repo_root / "packaging/linux/kubernetes/daemonset-host-agent.yaml"
@@ -39,6 +53,9 @@ runtime_event = json.loads((runtime_dir / "runtime-event.sample.json").read_text
 runtime_heartbeat = json.loads((runtime_dir / "runtime-heartbeat.sample.json").read_text(encoding="utf-8"))
 runtime_policy = json.loads((runtime_dir / "runtime-policy.contract.json").read_text(encoding="utf-8"))
 cloud_connector = json.loads((runtime_dir / "cloud-connector.contract.json").read_text(encoding="utf-8"))
+aws_connector = json.loads((runtime_dir / "cloud-connector.aws-cloudtrail.contract.json").read_text(encoding="utf-8"))
+azure_connector = json.loads((runtime_dir / "cloud-connector.azure-monitor.contract.json").read_text(encoding="utf-8"))
+gcp_connector = json.loads((runtime_dir / "cloud-connector.gcp-audit-log.contract.json").read_text(encoding="utf-8"))
 
 daemonset_spec = daemonset["spec"]["template"]["spec"]
 daemonset_container = daemonset_spec["containers"][0]
@@ -99,19 +116,48 @@ if cloud_connector.get("contract_version") != "serverless.v1":
     required_failures.append("cloud_connector_contract")
 if cloud_connector.get("source") != "AwsCloudTrail":
     required_failures.append("cloud_connector_source")
+if aws_connector.get("source") != "AwsCloudTrail":
+    required_failures.append("aws_connector_source")
+if azure_connector.get("source") != "AzureMonitor":
+    required_failures.append("azure_connector_source")
+if gcp_connector.get("source") != "GcpAuditLog":
+    required_failures.append("gcp_connector_source")
 
 match = re.search(
     r"runtime_event=(?P<event>\S+) first_flush=(?P<first>\S+) second_flush=(?P<second>\S+) buffered_events=(?P<buffered>\d+) emitted_batches=(?P<batches>\d+)",
-    example_output,
+    rust_output,
 )
 if not match:
     required_failures.append("runtime_sdk_example_output")
+
+expected_languages = {
+    "python": python_output,
+    "node": node_output,
+    "go": go_output,
+    "java": java_output,
+    "dotnet": dotnet_output,
+}
+expected_connectors = {
+    "python": "aws-cloudtrail",
+    "node": "azure-activity",
+    "go": "gcp-audit-log",
+    "java": "aws-cloudtrail",
+    "dotnet": "azure-activity",
+}
+for language, payload in expected_languages.items():
+    if payload.get("language") != language:
+        required_failures.append(f"{language}_language")
+    if payload.get("signal_kind") != "HttpRequest":
+        required_failures.append(f"{language}_signal_kind")
+    if payload.get("connector_id") != expected_connectors[language]:
+        required_failures.append(f"{language}_connector")
 
 payload = {
     "daemonset_manifest": str(daemonset_path),
     "sidecar_manifest": str(sidecar_path),
     "runtime_samples_root": str(runtime_dir),
-    "runtime_example_output": example_output,
+    "runtime_rust_output": rust_output,
+    "runtime_multilang_outputs": expected_languages,
     "required_failures": required_failures,
 }
 print(json.dumps(payload, indent=2, ensure_ascii=False))

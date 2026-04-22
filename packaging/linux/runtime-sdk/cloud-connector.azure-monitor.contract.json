@@ -1,0 +1,8 @@
+{
+  "contract_version": "serverless.v1",
+  "connector_id": "azure-activity",
+  "source": "AzureMonitor",
+  "poll_interval_secs": 60,
+  "max_batch_records": 500,
+  "cursor": null
+}
