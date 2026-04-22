@@ -49,6 +49,24 @@
           "link_pin": "aegis_bprm_check_security"
         },
         {
+          "name": "aegis_sys_enter_execve",
+          "kind": "tracepoint",
+          "target": "syscalls/sys_enter_execve",
+          "link_pin": "aegis_sys_enter_execve"
+        },
+        {
+          "name": "aegis_sys_enter_openat",
+          "kind": "tracepoint",
+          "target": "syscalls/sys_enter_openat",
+          "link_pin": "aegis_sys_enter_openat"
+        },
+        {
+          "name": "aegis_sys_enter_openat2",
+          "kind": "tracepoint",
+          "target": "syscalls/sys_enter_openat2",
+          "link_pin": "aegis_sys_enter_openat2"
+        },
+        {
           "name": "aegis_file_open",
           "kind": "lsm",
           "target": "file_open",

@@ -122,6 +122,7 @@ done
 require_command python3
 require_command systemctl
 require_command mountpoint
+require_command bpftool
 
 PAYLOAD_ROOT=$(resolve_existing_path "$PAYLOAD_ROOT" "payload root")
 MANIFEST_PATH=$(resolve_existing_path "$MANIFEST_PATH" "install manifest")
@@ -185,12 +186,24 @@ fi
 if ! mountpoint -q /sys/fs/bpf; then
   mount -t bpf bpf /sys/fs/bpf
 fi
+if [[ -e /sys/fs/bpf/edr ]]; then
+  rm -rf /sys/fs/bpf/edr
+fi
+ensure_directory /sys/fs/bpf/edr/process
+ensure_directory /sys/fs/bpf/edr/file
+ensure_directory /sys/fs/bpf/edr/network
+ensure_directory /sys/fs/bpf/edr/maps/file
+ensure_directory /sys/fs/bpf/edr/maps/network
 
 agent_path="$INSTALL_ROOT/bin/aegis-agentd"
 watchdog_path="$INSTALL_ROOT/bin/aegis-watchdog"
 config_path="$CONFIG_ROOT/agent.toml"
 
 "$agent_path" --write-default-config --state-root "$STATE_ROOT" --config "$config_path" >"$tmp_root/config.json"
+
+bpftool prog loadall "$INSTALL_ROOT/ebpf/process.bpf.o" /sys/fs/bpf/edr/process autoattach >/dev/null
+bpftool prog loadall "$INSTALL_ROOT/ebpf/file.bpf.o" /sys/fs/bpf/edr/file pinmaps /sys/fs/bpf/edr/maps/file autoattach >/dev/null
+bpftool prog loadall "$INSTALL_ROOT/ebpf/network.bpf.o" /sys/fs/bpf/edr/network pinmaps /sys/fs/bpf/edr/maps/network autoattach >/dev/null
 
 device_control_root="$INSTALL_ROOT/device-control"
 if [[ -d "$device_control_root" ]]; then

@@ -11,6 +11,7 @@ User=root
 Group=root
 Environment=AEGIS_STATE_ROOT=/var/lib/aegis
 Environment=AEGIS_CONFIG=/etc/aegis/agent.toml
+Environment=AEGIS_LINUX_LOAD_BPF=1
 ExecStart=/opt/aegis/bin/aegis-agentd --state-root /var/lib/aegis --config /etc/aegis/agent.toml
 Restart=always
 RestartSec=5

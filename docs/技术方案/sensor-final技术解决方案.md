@@ -3,6 +3,10 @@
 > 本文档定义 EDR Endpoint Sensor / Agent 的最终实施方案，覆盖内核态采集、用户态核心引擎、本地检测、响应执行、通信、自保护、升级发布、容器与云原生适配等核心子系统。
 >
 > 文档按终态架构组织，直接描述可落地的设计、边界、指标与运维要求，不再区分版本演进路径。
+>
+> 当前代码实现口径的分平台采集清单见：
+> - [Windows 数据采集清单](../architecture/aegis-sensor-windows-data-collection.md)
+> - [Linux 数据采集清单](../architecture/aegis-sensor-linux-data-collection.md)
 ---
 ## 一、Agent 总体架构
 ### 1.1 设计原则

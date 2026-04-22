@@ -104,9 +104,10 @@ systemctl daemon-reload
 
 for path in \
   "/etc/udev/rules.d/99-aegis-removable.rules" \
-  "/etc/usbguard/rules.conf"; do
+  "/etc/usbguard/rules.conf" \
+  "/sys/fs/bpf/edr"; do
   if [[ -e "$path" ]]; then
-    rm -f "$path"
+    rm -rf "$path"
     removed_paths+=("$path")
   fi
 done

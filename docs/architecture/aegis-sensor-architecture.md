@@ -5,6 +5,10 @@
 > 状态：草稿  
 > 分类：内部 / 机密  
 > 依赖文档：aegis-architecture-design.md、sensor-final技术解决方案.md
+>
+> 当前代码实现口径的分平台采集清单见：
+> - [Windows 数据采集清单](./aegis-sensor-windows-data-collection.md)
+> - [Linux 数据采集清单](./aegis-sensor-linux-data-collection.md)
 
 ---
 

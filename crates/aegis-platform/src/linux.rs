@@ -10,11 +10,14 @@ use aegis_model::{
 };
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
+use std::net::Ipv4Addr;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -105,6 +108,52 @@ impl LinuxDeviceRecord {
         parts.join(" ")
     }
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct LinuxFileEventIdentity {
+    pid: u32,
+    op: u32,
+    identity: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LinuxFileEventRecord {
+    seen_ns: u64,
+    pid: u32,
+    op: u32,
+    identity: u64,
+    inode: u64,
+    blocked: bool,
+    comm: Option<String>,
+    path: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct LinuxNetworkEventIdentity {
+    pid: u32,
+    op: u32,
+    daddr: u32,
+    dport: u16,
+    family: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LinuxNetworkEventRecord {
+    seen_ns: u64,
+    pid: u32,
+    op: u32,
+    daddr: u32,
+    dport: u16,
+    family: u16,
+    blocked: bool,
+    comm: Option<String>,
+}
+
+const AEGIS_FILE_EVENT_MAP_NAME: &str = "observed_file_events";
+const AEGIS_NETWORK_EVENT_MAP_NAME: &str = "observed_ipv4_connect_events";
+const AEGIS_FILE_OP_OPEN: u32 = 1;
+const AEGIS_FILE_OP_EXEC: u32 = 2;
+const AEGIS_NET_OP_CONNECT: u32 = 1;
 
 #[derive(Clone, Debug, Deserialize)]
 struct LinuxLsblkOutput {
@@ -337,6 +386,8 @@ struct LinuxState {
     host: LinuxHostCapabilities,
     host_capabilities_pinned: bool,
     known_processes: BTreeMap<u32, Option<String>>,
+    known_file_events: BTreeMap<LinuxFileEventIdentity, u64>,
+    known_network_events: BTreeMap<LinuxNetworkEventIdentity, u64>,
     known_devices: BTreeMap<String, LinuxDeviceRecord>,
     auth_offsets: BTreeMap<PathBuf, u64>,
     firewall_backend: Option<LinuxFirewallBackend>,
@@ -392,6 +443,8 @@ impl LinuxPlatform {
                 host: capabilities,
                 host_capabilities_pinned,
                 known_processes: BTreeMap::new(),
+                known_file_events: BTreeMap::new(),
+                known_network_events: BTreeMap::new(),
                 known_devices: BTreeMap::new(),
                 auth_offsets: BTreeMap::new(),
                 firewall_backend,
@@ -549,6 +602,8 @@ impl PlatformSensor for LinuxPlatform {
         }
         refresh_kernel_runtime(&mut state);
         state.known_processes = snapshot_processes();
+        state.known_file_events = snapshot_linux_file_event_cursors(&state)?;
+        state.known_network_events = snapshot_linux_network_event_cursors(&state)?;
         state.known_devices = snapshot_device_control_state();
         state.execution.running = true;
         Ok(())
@@ -569,7 +624,7 @@ impl PlatformSensor for LinuxPlatform {
             return Ok(0);
         }
 
-        collect_live_linux_events(&mut state);
+        collect_live_linux_events(&mut state)?;
 
         let mut drained = 0usize;
         while let Some(event) = state.pending_events.pop_front() {
@@ -1149,8 +1204,25 @@ fn attempt_bpf_bundle_load(kernel: &mut LinuxKernelRuntimeState) -> Result<()> {
         .with_context(|| format!("create ebpf pin root {}", kernel.pin_root.display()))?;
 
     for bundle in &kernel.planned_bundles {
-        if pin_dir_has_entries(&bundle.pin_path) {
+        let requires_reload = bundle.auto_attach
+            && kernel
+                .planned_attachments
+                .iter()
+                .filter(|attachment| attachment.bundle_name == bundle.name)
+                .any(|attachment| !attachment.link_pin_path.exists());
+        if pin_dir_has_entries(&bundle.pin_path) && !requires_reload {
             continue;
+        }
+        if requires_reload {
+            fs::remove_dir_all(&bundle.pin_path).with_context(|| {
+                format!(
+                    "remove stale ebpf pin dir before reload {}",
+                    bundle.pin_path.display()
+                )
+            })?;
+            if let Some(map_pin_path) = &bundle.map_pin_path {
+                let _ = fs::remove_dir_all(map_pin_path);
+            }
         }
         fs::create_dir_all(&bundle.pin_path)
             .with_context(|| format!("create ebpf pin dir {}", bundle.pin_path.display()))?;
@@ -1318,13 +1390,16 @@ fn append_kernel_error(current: &mut Option<String>, next: String) {
     }
 }
 
-fn collect_live_linux_events(state: &mut LinuxState) {
+fn collect_live_linux_events(state: &mut LinuxState) -> Result<()> {
     if !state.host.running_on_linux {
-        return;
+        return Ok(());
     }
-        collect_process_delta_events(state);
-        collect_auth_log_events(state);
-        collect_device_control_events(state);
+    collect_process_delta_events(state);
+    collect_file_ebpf_events(state)?;
+    collect_network_ebpf_events(state)?;
+    collect_auth_log_events(state);
+    collect_device_control_events(state);
+    Ok(())
 }
 
 fn collect_process_delta_events(state: &mut LinuxState) {
@@ -1358,6 +1433,88 @@ fn collect_process_delta_events(state: &mut LinuxState) {
     }
 
     state.known_processes = current;
+}
+
+fn collect_file_ebpf_events(state: &mut LinuxState) -> Result<()> {
+    let current = snapshot_linux_file_event_records(state)?;
+    for (identity, record) in &current {
+        if state.known_file_events.get(identity) == Some(&record.seen_ns) {
+            continue;
+        }
+
+        let resolved_path =
+            record
+                .path
+                .clone()
+                .filter(|path| !path.is_empty())
+                .or_else(|| resolve_linux_file_event_path(record.pid, record.inode))
+                .unwrap_or_else(|| "-".to_string());
+        let operation = linux_file_operation_name(record.op, record.blocked).to_string();
+        let subject = truncate_subject(&format!(
+            "pid={};op={};blocked={};identity={};inode={};path={};comm={}",
+            record.pid,
+            linux_file_operation_label(record.op),
+            record.blocked,
+            record.identity,
+            record.inode,
+            resolved_path,
+            record.comm.as_deref().unwrap_or("-")
+        ));
+        state.pending_events.push_back(
+            LinuxEventStub {
+                provider: LinuxProviderKind::FileEbpf,
+                operation,
+                subject,
+                container_id: read_container_id(record.pid),
+            }
+            .encode(),
+        );
+    }
+
+    state.known_file_events = current
+        .into_iter()
+        .map(|(identity, record)| (identity, record.seen_ns))
+        .collect();
+    Ok(())
+}
+
+fn collect_network_ebpf_events(state: &mut LinuxState) -> Result<()> {
+    let current = snapshot_linux_network_event_records(state)?;
+    for (identity, record) in &current {
+        if state.known_network_events.get(identity) == Some(&record.seen_ns) {
+            continue;
+        }
+
+        let destination = format!(
+            "{}:{}",
+            Ipv4Addr::from(record.daddr.to_ne_bytes()),
+            u16::from_be(record.dport)
+        );
+        let subject = truncate_subject(&format!(
+            "pid={};op={};blocked={};dst={};family={};comm={}",
+            record.pid,
+            linux_network_operation_label(record.op),
+            record.blocked,
+            destination,
+            record.family,
+            record.comm.as_deref().unwrap_or("-")
+        ));
+        state.pending_events.push_back(
+            LinuxEventStub {
+                provider: LinuxProviderKind::NetworkEbpf,
+                operation: linux_network_operation_name(record.op, record.blocked).to_string(),
+                subject,
+                container_id: read_container_id(record.pid),
+            }
+            .encode(),
+        );
+    }
+
+    state.known_network_events = current
+        .into_iter()
+        .map(|(identity, record)| (identity, record.seen_ns))
+        .collect();
+    Ok(())
 }
 
 fn collect_auth_log_events(state: &mut LinuxState) {
@@ -1413,6 +1570,280 @@ fn collect_device_control_events(state: &mut LinuxState) {
         state.pending_events.push_back(event.encode());
     }
     state.known_devices = current;
+}
+
+fn snapshot_linux_file_event_cursors(
+    state: &LinuxState,
+) -> Result<BTreeMap<LinuxFileEventIdentity, u64>> {
+    Ok(snapshot_linux_file_event_records(state)?
+        .into_iter()
+        .map(|(identity, record)| (identity, record.seen_ns))
+        .collect())
+}
+
+fn snapshot_linux_network_event_cursors(
+    state: &LinuxState,
+) -> Result<BTreeMap<LinuxNetworkEventIdentity, u64>> {
+    Ok(snapshot_linux_network_event_records(state)?
+        .into_iter()
+        .map(|(identity, record)| (identity, record.seen_ns))
+        .collect())
+}
+
+fn snapshot_linux_file_event_records(
+    state: &LinuxState,
+) -> Result<BTreeMap<LinuxFileEventIdentity, LinuxFileEventRecord>> {
+    let Some(map_path) = runtime_map_pin_path(state, "file", AEGIS_FILE_EVENT_MAP_NAME) else {
+        return Ok(BTreeMap::new());
+    };
+    let raw = dump_bpftool_map_json(&map_path)?;
+    parse_linux_file_event_map_dump(&raw)
+}
+
+fn snapshot_linux_network_event_records(
+    state: &LinuxState,
+) -> Result<BTreeMap<LinuxNetworkEventIdentity, LinuxNetworkEventRecord>> {
+    let Some(map_path) = runtime_map_pin_path(state, "network", AEGIS_NETWORK_EVENT_MAP_NAME)
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let raw = dump_bpftool_map_json(&map_path)?;
+    parse_linux_network_event_map_dump(&raw)
+}
+
+fn runtime_map_pin_path(state: &LinuxState, bundle_name: &str, map_name: &str) -> Option<PathBuf> {
+    state.kernel
+        .planned_bundles
+        .iter()
+        .find(|bundle| bundle.name == bundle_name)
+        .and_then(|bundle| bundle.map_pin_path.as_ref())
+        .map(|path| path.join(map_name))
+        .filter(|path| path.exists())
+}
+
+fn dump_bpftool_map_json(path: &Path) -> Result<String> {
+    let output = Command::new("bpftool")
+        .arg("-j")
+        .arg("map")
+        .arg("dump")
+        .arg("pinned")
+        .arg(path)
+        .output()
+        .with_context(|| format!("dump bpftool map {}", path.display()))?;
+    if !output.status.success() {
+        bail!(
+            "bpftool map dump failed for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn parse_linux_file_event_map_dump(
+    raw: &str,
+) -> Result<BTreeMap<LinuxFileEventIdentity, LinuxFileEventRecord>> {
+    let entries: Vec<Value> = serde_json::from_str(raw).context("parse linux file ebpf map dump")?;
+    let mut records = BTreeMap::new();
+    for entry in entries {
+        let Some(key) = entry
+            .get("formatted")
+            .and_then(|formatted| formatted.get("key"))
+            .or_else(|| entry.get("key"))
+        else {
+            continue;
+        };
+        let Some(value) = entry
+            .get("formatted")
+            .and_then(|formatted| formatted.get("value"))
+            .or_else(|| entry.get("value"))
+        else {
+            continue;
+        };
+        let identity = LinuxFileEventIdentity {
+            pid: json_u32_field(key, "pid").context("file event key pid")?,
+            op: json_u32_field(key, "op").context("file event key op")?,
+            identity: json_u64_field(key, "identity").context("file event key identity")?,
+        };
+        let record = LinuxFileEventRecord {
+            seen_ns: json_u64_field(value, "seen_ns").context("file event seen_ns")?,
+            pid: json_u32_field(value, "pid").unwrap_or(identity.pid),
+            op: json_u32_field(value, "op").unwrap_or(identity.op),
+            identity: json_u64_field(value, "identity").unwrap_or(identity.identity),
+            inode: json_u64_field(value, "inode").unwrap_or_default(),
+            blocked: json_boolish_field(value, "blocked").unwrap_or(false),
+            comm: json_string_field(value, "comm"),
+            path: json_string_field(value, "path"),
+        };
+        records.insert(identity, record);
+    }
+    Ok(records)
+}
+
+fn parse_linux_network_event_map_dump(
+    raw: &str,
+) -> Result<BTreeMap<LinuxNetworkEventIdentity, LinuxNetworkEventRecord>> {
+    let entries: Vec<Value> =
+        serde_json::from_str(raw).context("parse linux network ebpf map dump")?;
+    let mut records = BTreeMap::new();
+    for entry in entries {
+        let Some(key) = entry
+            .get("formatted")
+            .and_then(|formatted| formatted.get("key"))
+            .or_else(|| entry.get("key"))
+        else {
+            continue;
+        };
+        let Some(value) = entry
+            .get("formatted")
+            .and_then(|formatted| formatted.get("value"))
+            .or_else(|| entry.get("value"))
+        else {
+            continue;
+        };
+        let identity = LinuxNetworkEventIdentity {
+            pid: json_u32_field(key, "pid").context("network event key pid")?,
+            op: json_u32_field(key, "op").context("network event key op")?,
+            daddr: json_u32_field(key, "daddr").context("network event key daddr")?,
+            dport: json_u16_field(key, "dport").context("network event key dport")?,
+            family: json_u16_field(key, "family").context("network event key family")?,
+        };
+        let record = LinuxNetworkEventRecord {
+            seen_ns: json_u64_field(value, "seen_ns").context("network event seen_ns")?,
+            pid: json_u32_field(value, "pid").unwrap_or(identity.pid),
+            op: json_u32_field(value, "op").unwrap_or(identity.op),
+            daddr: json_u32_field(value, "daddr").unwrap_or(identity.daddr),
+            dport: json_u16_field(value, "dport").unwrap_or(identity.dport),
+            family: json_u16_field(value, "family").unwrap_or(identity.family),
+            blocked: json_boolish_field(value, "blocked").unwrap_or(false),
+            comm: json_string_field(value, "comm"),
+        };
+        records.insert(identity, record);
+    }
+    Ok(records)
+}
+
+fn json_u64_field(value: &Value, field: &str) -> Option<u64> {
+    let field_value = value.get(field)?;
+    field_value
+        .as_u64()
+        .or_else(|| field_value.as_i64().map(|number| number.max(0) as u64))
+        .or_else(|| field_value.as_str().and_then(|text| text.parse::<u64>().ok()))
+}
+
+fn json_u32_field(value: &Value, field: &str) -> Option<u32> {
+    json_u64_field(value, field).and_then(|number| u32::try_from(number).ok())
+}
+
+fn json_u16_field(value: &Value, field: &str) -> Option<u16> {
+    json_u64_field(value, field).and_then(|number| u16::try_from(number).ok())
+}
+
+fn json_boolish_field(value: &Value, field: &str) -> Option<bool> {
+    let field_value = value.get(field)?;
+    field_value
+        .as_bool()
+        .or_else(|| field_value.as_u64().map(|number| number != 0))
+        .or_else(|| {
+            field_value
+                .as_str()
+                .and_then(|text| match text {
+                    "0" | "false" | "FALSE" => Some(false),
+                    "1" | "true" | "TRUE" => Some(true),
+                    _ => None,
+                })
+        })
+}
+
+fn json_string_field(value: &Value, field: &str) -> Option<String> {
+    let field_value = value.get(field)?;
+    match field_value {
+        Value::String(text) => {
+            let trimmed = text.trim_matches('\0').trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        Value::Array(bytes) => {
+            let raw = bytes
+                .iter()
+                .filter_map(|byte| byte.as_u64())
+                .take_while(|byte| *byte != 0)
+                .map(|byte| byte as u8)
+                .collect::<Vec<_>>();
+            let text = String::from_utf8(raw).ok()?;
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        _ => None,
+    }
+}
+
+fn linux_file_operation_label(op: u32) -> &'static str {
+    match op {
+        AEGIS_FILE_OP_OPEN => "open",
+        AEGIS_FILE_OP_EXEC => "exec",
+        _ => "unknown",
+    }
+}
+
+fn linux_file_operation_name(op: u32, blocked: bool) -> &'static str {
+    match (op, blocked) {
+        (AEGIS_FILE_OP_OPEN, false) => "file-open",
+        (AEGIS_FILE_OP_OPEN, true) => "file-open-block",
+        (AEGIS_FILE_OP_EXEC, false) => "file-exec",
+        (AEGIS_FILE_OP_EXEC, true) => "file-exec-block",
+        _ if blocked => "file-block",
+        _ => "file-observe",
+    }
+}
+
+fn linux_network_operation_label(op: u32) -> &'static str {
+    match op {
+        AEGIS_NET_OP_CONNECT => "connect",
+        _ => "unknown",
+    }
+}
+
+fn linux_network_operation_name(op: u32, blocked: bool) -> &'static str {
+    match (op, blocked) {
+        (AEGIS_NET_OP_CONNECT, false) => "network-connect",
+        (AEGIS_NET_OP_CONNECT, true) => "network-block",
+        _ if blocked => "network-block",
+        _ => "network-observe",
+    }
+}
+
+fn resolve_linux_file_event_path(pid: u32, inode: u64) -> Option<String> {
+    let exe_path = PathBuf::from(format!("/proc/{pid}/exe"));
+    if let Ok(metadata) = fs::metadata(&exe_path) {
+        if metadata.ino() == inode {
+            return fs::read_link(&exe_path)
+                .ok()
+                .map(|path| path.display().to_string());
+        }
+    }
+
+    let fd_root = PathBuf::from(format!("/proc/{pid}/fd"));
+    let entries = fs::read_dir(fd_root).ok()?;
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        let Ok(metadata) = fs::metadata(&entry_path) else {
+            continue;
+        };
+        if metadata.ino() == inode {
+            let target = fs::read_link(&entry_path).unwrap_or(entry_path);
+            return Some(target.display().to_string());
+        }
+    }
+
+    None
 }
 
 fn snapshot_device_control_state() -> BTreeMap<String, LinuxDeviceRecord> {
@@ -2102,7 +2533,8 @@ fn now_unix_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        diff_device_control_events, parse_device_control_snapshot, LinuxDegradeLevel,
+        diff_device_control_events, parse_device_control_snapshot,
+        parse_linux_file_event_map_dump, parse_linux_network_event_map_dump, LinuxDegradeLevel,
         LinuxEventStub, LinuxHostCapabilities, LinuxPlatform, LinuxProviderKind,
     };
     use crate::{
@@ -2334,6 +2766,80 @@ mod tests {
         assert!(rendered.iter().any(|event| event.contains("device-attach")));
         assert!(rendered.iter().any(|event| event.contains("mount-add")));
         assert!(!rendered.iter().any(|event| event.contains("device-detach")));
+    }
+
+    #[test]
+    fn linux_file_ebpf_map_dump_parses_structured_entries() {
+        let snapshot = parse_linux_file_event_map_dump(
+            r#"[
+  {
+    "key": { "pid": 321, "op": 2, "identity": 555666777 },
+    "value": {
+      "seen_ns": 123456789,
+      "pid": 321,
+      "op": 2,
+      "identity": 555666777,
+      "inode": 987654,
+      "blocked": 1,
+      "comm": "python3",
+      "path": "/tmp/payload.sh"
+    }
+  }
+]"#,
+        )
+        .expect("parse file ebpf snapshot");
+
+        let record = snapshot
+            .values()
+            .next()
+            .expect("single file ebpf record");
+        assert_eq!(record.pid, 321);
+        assert_eq!(record.op, 2);
+        assert_eq!(record.identity, 555666777);
+        assert_eq!(record.inode, 987654);
+        assert!(record.blocked);
+        assert_eq!(record.comm.as_deref(), Some("python3"));
+        assert_eq!(record.path.as_deref(), Some("/tmp/payload.sh"));
+    }
+
+    #[test]
+    fn linux_network_ebpf_map_dump_parses_structured_entries() {
+        let snapshot = parse_linux_network_event_map_dump(
+            r#"[
+  {
+    "key": {
+      "pid": 4321,
+      "op": 1,
+      "daddr": 16777343,
+      "dport": 20480,
+      "family": 2
+    },
+    "value": {
+      "seen_ns": 987654321,
+      "pid": 4321,
+      "op": 1,
+      "daddr": 16777343,
+      "dport": 20480,
+      "family": 2,
+      "blocked": 0,
+      "comm": "curl"
+    }
+  }
+]"#,
+        )
+        .expect("parse network ebpf snapshot");
+
+        let record = snapshot
+            .values()
+            .next()
+            .expect("single network ebpf record");
+        assert_eq!(record.pid, 4321);
+        assert_eq!(record.op, 1);
+        assert_eq!(record.daddr, 16_777_343);
+        assert_eq!(record.dport, 20_480);
+        assert_eq!(record.family, 2);
+        assert!(!record.blocked);
+        assert_eq!(record.comm.as_deref(), Some("curl"));
     }
 
     #[test]

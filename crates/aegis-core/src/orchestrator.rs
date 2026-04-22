@@ -39,11 +39,13 @@ use crate::wal::{
 use crate::yara::{EnqueueDisposition, YaraMatch, YaraResult, YaraScanTarget, YaraScheduler};
 use aegis_model::{
     Alert, ArtifactChunk, ClientAck, ClientAckStatus, CloudApiConnectorContract,
-    CloudLogSourceKind, CommandEnvelope, CommunicationChannelKind, DownlinkMessage, EventPayload,
-    IsolationRulesV2, LineageCheckpoint, LineageCounters, NormalizedEvent, ResponseAction,
-    RuntimeBridgeStatus, RuntimeHealthSignals, RuntimeHeartbeat, RuntimeMetadata,
-    RuntimePolicyContract, RuntimeProviderKind, Severity, Storyline, StorylineContext,
-    TelemetryEvent, ThreatIntelHit, UpdateRequest, UplinkMessage,
+    CloudLogSourceKind, CommandEnvelope, CommunicationChannelKind, ContainerContext,
+    DownlinkMessage, EventPayload, EventType, FileContext, HostContext, IsolationRulesV2,
+    LineageCheckpoint, LineageCounters, NetworkContext, NormalizedEvent, OperatingSystemKind,
+    Priority, ProcessContext, ResponseAction, RuntimeBridgeStatus,
+    RuntimeHealthSignals, RuntimeHeartbeat, RuntimeMetadata, RuntimePolicyContract,
+    RuntimeProviderKind, Severity, Storyline, StorylineContext, TelemetryEvent,
+    ThreatIntelHit, UpdateRequest, UplinkMessage,
 };
 use aegis_platform::PlatformRuntime;
 use anyhow::{anyhow, Result};
@@ -61,6 +63,8 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 const EVENT_QUEUE_CAPACITY: usize = 65_536;
+#[cfg(target_os = "linux")]
+const PLATFORM_SENSOR_POLL_INTERVAL_MS: u64 = 250;
 const DETECTION_QUEUE_CAPACITY: usize = 8_192;
 const DECISION_QUEUE_CAPACITY: usize = 8_192;
 const ALERT_HI_QUEUE_CAPACITY: usize = 1_024;
@@ -195,6 +199,27 @@ impl Orchestrator {
         };
 
         let runtime_bridge_socket = runtime_bridge_socket_path(&self.config);
+        let task_topology = vec![
+            "sensor-dispatch".to_string(),
+            "detection-pool".to_string(),
+            "decision-router".to_string(),
+            "comms-rx".to_string(),
+            "comms-tx-high".to_string(),
+            "comms-tx-normal".to_string(),
+            "uplink-replay".to_string(),
+            "comms-link-manager".to_string(),
+            "response-executor".to_string(),
+            "telemetry-drain".to_string(),
+            "runtime-bridge".to_string(),
+            "health-reporter".to_string(),
+            "update-manager".to_string(),
+            "config-watcher".to_string(),
+        ];
+        #[cfg(target_os = "linux")]
+        let mut task_topology = task_topology;
+        #[cfg(target_os = "linux")]
+        task_topology.insert(0, "platform-sensor".to_string());
+
         let summary = BootstrapSummary {
             agent_id: self.config.agent_id.clone(),
             tenant_id: self.config.tenant_id.clone(),
@@ -217,22 +242,7 @@ impl Orchestrator {
                 ("response".to_string(), RESPONSE_QUEUE_CAPACITY),
                 ("telemetry".to_string(), TELEMETRY_QUEUE_CAPACITY),
             ]),
-            task_topology: vec![
-                "sensor-dispatch".to_string(),
-                "detection-pool".to_string(),
-                "decision-router".to_string(),
-                "comms-rx".to_string(),
-                "comms-tx-high".to_string(),
-                "comms-tx-normal".to_string(),
-                "uplink-replay".to_string(),
-                "comms-link-manager".to_string(),
-                "response-executor".to_string(),
-                "telemetry-drain".to_string(),
-                "runtime-bridge".to_string(),
-                "health-reporter".to_string(),
-                "update-manager".to_string(),
-                "config-watcher".to_string(),
-            ],
+            task_topology,
         };
 
         Ok(BootstrapArtifacts {
@@ -290,6 +300,15 @@ impl Orchestrator {
         } = receivers;
 
         let mut tasks = Vec::new();
+        #[cfg(target_os = "linux")]
+        tasks.push(RuntimeTask {
+            name: "platform-sensor",
+            handle: tokio::spawn(linux_platform_sensor_task(
+                build_linux_sensor_platform()?,
+                channels.event_tx.clone(),
+                shutdown_rx.clone(),
+            )),
+        });
         tasks.push(RuntimeTask {
             name: "sensor-dispatch",
             handle: tokio::spawn(sensor_dispatch_task(
@@ -2751,6 +2770,234 @@ fn build_runtime_platform() -> Arc<dyn PlatformRuntime> {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn build_linux_sensor_platform() -> Result<aegis_platform::LinuxPlatform> {
+    use aegis_platform::PlatformSensor;
+
+    let mut platform = aegis_platform::LinuxPlatform::default();
+    platform.start(&aegis_model::SensorConfig {
+        profile: "linux".to_string(),
+        queue_capacity: EVENT_QUEUE_CAPACITY,
+        require_kernel_driver: false,
+    })?;
+    Ok(platform)
+}
+
+#[cfg(target_os = "linux")]
+async fn linux_platform_sensor_task(
+    mut platform: aegis_platform::LinuxPlatform,
+    event_tx: mpsc::Sender<NormalizedEvent>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    use aegis_platform::PlatformSensor;
+
+    let mut ticker = interval(Duration::from_millis(PLATFORM_SENSOR_POLL_INTERVAL_MS));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    ticker.tick().await;
+
+    loop {
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_ok() && *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+            _ = ticker.tick() => {
+                let mut buffer = aegis_model::EventBuffer::default();
+                match platform.poll_events(&mut buffer) {
+                    Ok(_) => {
+                        for record in &buffer.records {
+                            let Some(event) = parse_linux_platform_record(record) else {
+                                continue;
+                            };
+                            if event_tx.send(event).await.is_err() {
+                                let _ = platform.stop();
+                                return;
+                            }
+                        }
+                    }
+                    Err(error) => debug!(%error, "linux platform sensor poll failed"),
+                }
+            }
+        }
+    }
+
+    let _ = platform.stop();
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_platform_record(record: &[u8]) -> Option<NormalizedEvent> {
+    let decoded = String::from_utf8(record.to_vec()).ok()?;
+    let mut parts = decoded.splitn(5, '|');
+    if parts.next()? != "linux" {
+        return None;
+    }
+
+    let provider = parts.next()?.to_string();
+    let operation = parts.next()?.to_string();
+    let subject = parts.next()?.to_string();
+    let container_id = parts
+        .next()
+        .filter(|value| *value != "-")
+        .map(|value| value.to_string());
+
+    let timestamp_ns = now_unix_ns();
+    let mut process = ProcessContext::default();
+    let payload = match provider.as_str() {
+        "ProcessEbpf" => {
+            process = parse_linux_process_context(&subject, container_id.clone());
+            match operation.as_str() {
+                "process-start" => EventPayload::None,
+                "process-exit" => EventPayload::None,
+                _ => EventPayload::Generic(generic_linux_payload(&provider, &operation, &subject)),
+            }
+        }
+        "FileEbpf" => {
+            let details = parse_linux_semicolon_subject(&subject);
+            process.pid = details
+                .get("pid")
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or_default();
+            process.name = details.get("comm").cloned().unwrap_or_default();
+            process.container_id = container_id.clone();
+            EventPayload::File(FileContext {
+                path: details
+                    .get("path")
+                    .filter(|value| value.as_str() != "-")
+                    .map(PathBuf::from)
+                    .unwrap_or_default(),
+                action: Some(operation.clone()),
+                ..FileContext::default()
+            })
+        }
+        "NetworkEbpf" => {
+            let details = parse_linux_semicolon_subject(&subject);
+            process.pid = details
+                .get("pid")
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or_default();
+            process.name = details.get("comm").cloned().unwrap_or_default();
+            process.container_id = container_id.clone();
+
+            let (dst_ip, dst_port) = details
+                .get("dst")
+                .and_then(|value| value.rsplit_once(':'))
+                .map(|(ip, port)| (Some(ip.to_string()), port.parse::<u16>().ok()))
+                .unwrap_or((None, None));
+
+            EventPayload::Network(NetworkContext {
+                dst_ip,
+                dst_port,
+                protocol: Some("tcp".to_string()),
+                ..NetworkContext::default()
+            })
+        }
+        "AuthAudit" | "AuditFallback" | "DeviceControl" | "ContainerMetadata" | "FanotifyFallback" => {
+            process.container_id = container_id.clone();
+            EventPayload::Generic(generic_linux_payload(&provider, &operation, &subject))
+        }
+        _ => return None,
+    };
+
+    if process.container_id.is_none() {
+        process.container_id = container_id.clone();
+    }
+
+    let event_type = match (provider.as_str(), operation.as_str()) {
+        ("ProcessEbpf", "process-start") => EventType::ProcessCreate,
+        ("ProcessEbpf", "process-exit") => EventType::ProcessExit,
+        ("FileEbpf", _) => EventType::FileWrite,
+        ("NetworkEbpf", _) => EventType::NetConnect,
+        ("AuthAudit", _) | ("AuditFallback", _) => EventType::Auth,
+        ("DeviceControl", _) => EventType::DeviceControl,
+        ("ContainerMetadata", _) => EventType::Container,
+        _ => EventType::Unknown,
+    };
+
+    let mut event = NormalizedEvent::new(
+        timestamp_ns,
+        event_type,
+        Priority::Normal,
+        Severity::Info,
+        process,
+        payload,
+    );
+    event.host = linux_platform_host_context();
+    if let Some(container_id) = container_id {
+        event.container = Some(ContainerContext {
+            container_id,
+            ..ContainerContext::default()
+        });
+    }
+    Some(event)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_process_context(subject: &str, container_id: Option<String>) -> ProcessContext {
+    let mut process = ProcessContext {
+        container_id,
+        ..ProcessContext::default()
+    };
+
+    if let Some(pid_text) = subject.strip_prefix("pid=") {
+        if let Some((pid, comm)) = pid_text.split_once(" comm=") {
+            process.pid = pid.parse::<u32>().unwrap_or_default();
+            process.name = comm.to_string();
+            return process;
+        }
+        if let Some((pid, cmd)) = pid_text.split_once(" cmd=") {
+            process.pid = pid.parse::<u32>().unwrap_or_default();
+            process.cmdline = cmd.to_string();
+            process.name = cmd
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            return process;
+        }
+        process.pid = pid_text.parse::<u32>().unwrap_or_default();
+    }
+
+    process
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_semicolon_subject(subject: &str) -> BTreeMap<String, String> {
+    subject
+        .split(';')
+        .filter_map(|part| part.split_once('='))
+        .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+        .collect()
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn generic_linux_payload(
+    provider: &str,
+    operation: &str,
+    subject: &str,
+) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("provider".to_string(), provider.to_string()),
+        ("operation".to_string(), operation.to_string()),
+        ("subject".to_string(), subject.to_string()),
+    ])
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_platform_host_context() -> HostContext {
+    let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "localhost".to_string());
+
+    HostContext {
+        hostname,
+        os: OperatingSystemKind::Linux,
+        ..HostContext::default()
+    }
+}
+
 fn response_audit_path(config: &AppConfig) -> PathBuf {
     config.storage.state_root.join("response-audit.jsonl")
 }
@@ -3155,6 +3402,45 @@ mod tests {
         assert!(stopped.contains(&"decision-router".to_string()));
 
         fs::remove_dir_all(state_root).ok();
+    }
+
+    #[test]
+    fn linux_platform_record_parser_builds_file_event() {
+        let record = b"linux|FileEbpf|file-exec-block|pid=42;op=exec;blocked=true;inode=123;path=/tmp/payload.sh;comm=bash|container-1";
+        let event = parse_linux_platform_record(record).expect("parse linux file record");
+
+        assert_eq!(event.event_type, EventType::FileWrite);
+        assert_eq!(event.process.pid, 42);
+        assert_eq!(event.process.name, "bash");
+        assert_eq!(
+            event.container.as_ref().map(|ctx| ctx.container_id.as_str()),
+            Some("container-1")
+        );
+        match event.payload {
+            EventPayload::File(file) => {
+                assert_eq!(file.path, PathBuf::from("/tmp/payload.sh"));
+                assert_eq!(file.action.as_deref(), Some("file-exec-block"));
+            }
+            other => panic!("expected file payload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn linux_platform_record_parser_builds_network_event() {
+        let record = b"linux|NetworkEbpf|network-connect|pid=77;op=connect;blocked=false;dst=127.0.0.1:8080;family=2;comm=curl|-";
+        let event = parse_linux_platform_record(record).expect("parse linux network record");
+
+        assert_eq!(event.event_type, EventType::NetConnect);
+        assert_eq!(event.process.pid, 77);
+        assert_eq!(event.process.name, "curl");
+        match event.payload {
+            EventPayload::Network(network) => {
+                assert_eq!(network.dst_ip.as_deref(), Some("127.0.0.1"));
+                assert_eq!(network.dst_port, Some(8080));
+                assert_eq!(network.protocol.as_deref(), Some("tcp"));
+            }
+            other => panic!("expected network payload, got {other:?}"),
+        }
     }
 
     #[tokio::test]
