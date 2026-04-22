@@ -66,3 +66,42 @@
 - Cloud Connector 参考样例全部入仓
 - 验证脚本真实执行各语言样例并返回 `required_failures=[]`
 - 文档状态同步更新
+
+## 7. 实际交付
+
+- 代码提交：`b3432f0 feat(linux): 完成多语言 runtime sdk 交付链`
+- 补充代码清理：`ebde41b chore(linux): 清理 runtime sdk 生成工件`
+- 已新增：
+  - `packaging/linux/runtime-sdk/python/`
+  - `packaging/linux/runtime-sdk/node/`
+  - `packaging/linux/runtime-sdk/go/`
+  - `packaging/linux/runtime-sdk/java/`
+  - `packaging/linux/runtime-sdk/dotnet/`
+  - `packaging/linux/runtime-sdk/cloud-connector.aws-cloudtrail.contract.json`
+  - `packaging/linux/runtime-sdk/cloud-connector.azure-monitor.contract.json`
+  - `packaging/linux/runtime-sdk/cloud-connector.gcp-audit-log.contract.json`
+- 已完成：
+  - `Python / Node.js / Go / Java / .NET` 五种运行时参考 SDK 样例入仓
+  - Rust Runtime SDK example 与多语言样例统一进入 `scripts/linux-container-validate.sh`
+  - Cloud Connector 参考合同覆盖 `AWS CloudTrail / Azure Monitor / GCP Audit Log`
+
+## 8. 验证结果
+
+本地已完成：
+
+- `bash scripts/linux-container-validate.sh`
+
+关键结果：
+
+- `runtime_rust_output="runtime_event=... first_flush=false second_flush=true buffered_events=1 emitted_batches=1"`
+- `runtime_multilang_outputs.python.language=python`
+- `runtime_multilang_outputs.node.language=node`
+- `runtime_multilang_outputs.go.language=go`
+- `runtime_multilang_outputs.java.language=java`
+- `runtime_multilang_outputs.dotnet.language=dotnet`
+- `required_failures=[]`
+
+## 9. 结论
+
+- `L15` 已完成代码、验证与文档闭环。
+- 当前仓库范围内，Linux 剩余未完成项已清零。
