@@ -206,6 +206,9 @@ struct WindowsHostCapabilities {
     has_process_creation_events: bool,
     has_auth_audit_events: bool,
     has_net_connection: bool,
+    has_dns_client_operational_log: bool,
+    dns_client_operational_log_enabled: bool,
+    has_schannel_system_log: bool,
     has_firewall: bool,
     has_registry_cli: bool,
     has_amsi_runtime: bool,
@@ -322,6 +325,17 @@ impl WindowsHostCapabilities {
             && self.has_auth_audit_events
     }
 
+    fn dns_sensor_ready(&self) -> bool {
+        self.reachable
+            && self.running_on_windows
+            && self.has_dns_client_operational_log
+            && self.dns_client_operational_log_enabled
+    }
+
+    fn tls_sensor_ready(&self) -> bool {
+        self.reachable && self.running_on_windows && self.has_schannel_system_log
+    }
+
     fn memory_sensor_ready(&self) -> bool {
         self.reachable
             && self.running_on_windows
@@ -342,7 +356,9 @@ impl WindowsHostCapabilities {
             WindowsProviderKind::AuthAudit => self.auth_sensor_ready(),
             WindowsProviderKind::ObProcess => self.process_protection_ready(),
             WindowsProviderKind::MinifilterFile => self.file_monitor_ready(),
-            WindowsProviderKind::WfpNetwork => self.has_net_connection,
+            WindowsProviderKind::WfpNetwork => {
+                self.has_net_connection || self.dns_sensor_ready() || self.tls_sensor_ready()
+            }
             WindowsProviderKind::RegistryCallback => self.registry_provider_ready(),
             WindowsProviderKind::AmsiScript => self.script_sensor_ready(),
             WindowsProviderKind::MemorySensor => self.memory_sensor_ready(),
@@ -376,6 +392,11 @@ impl WindowsHostCapabilities {
             self.has_process_creation_events
         ));
         facts.push(format!("auth_audit={}", self.has_auth_audit_events));
+        facts.push(format!(
+            "dns_operational_log={}/{}",
+            self.has_dns_client_operational_log, self.dns_client_operational_log_enabled
+        ));
+        facts.push(format!("schannel_system_log={}", self.has_schannel_system_log));
         facts.push(format!("amsi_runtime={}", self.has_amsi_runtime));
         facts.push(format!(
             "script_block_logging={}",
@@ -463,6 +484,12 @@ struct WindowsCapabilityProbe {
     #[serde(default)]
     has_auth_audit_events: bool,
     has_net_connection: bool,
+    #[serde(default)]
+    has_dns_client_operational_log: bool,
+    #[serde(default)]
+    dns_client_operational_log_enabled: bool,
+    #[serde(default)]
+    has_schannel_system_log: bool,
     has_firewall: bool,
     has_registry_cli: bool,
     has_amsi_runtime: bool,
@@ -635,6 +662,107 @@ impl WindowsAuthEvent {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 struct WindowsProcessAuditCursor {
     record_id: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsDnsTelemetryCursor {
+    record_id: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsDnsTelemetryEvent {
+    record_id: u64,
+    event_id: u32,
+    #[serde(default)]
+    query_name: Option<String>,
+    #[serde(default)]
+    query_type: Option<String>,
+    #[serde(default)]
+    query_status: Option<String>,
+    #[serde(default)]
+    response_status: Option<String>,
+    #[serde(default)]
+    query_results: Option<String>,
+    #[serde(default)]
+    dns_server_ip: Option<String>,
+    #[serde(default)]
+    client_pid: Option<u32>,
+}
+
+impl WindowsDnsTelemetryEvent {
+    fn operation(&self) -> &'static str {
+        match self.event_id {
+            3011 => "dns-response",
+            3008 | 3020 => "dns-query",
+            _ => "dns-event",
+        }
+    }
+
+    fn subject(&self) -> String {
+        truncate_subject(&format!(
+            "record_id={};event_id={};query_name={};query_type={};query_status={};response_status={};query_results={};dns_server_ip={};client_pid={}",
+            self.record_id,
+            self.event_id,
+            self.query_name.as_deref().unwrap_or("-"),
+            self.query_type.as_deref().unwrap_or("-"),
+            self.query_status.as_deref().unwrap_or("-"),
+            self.response_status.as_deref().unwrap_or("-"),
+            self.query_results.as_deref().unwrap_or("-"),
+            self.dns_server_ip.as_deref().unwrap_or("-"),
+            self.client_pid
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        ))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsTlsTelemetryCursor {
+    record_id: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsTlsTelemetryEvent {
+    record_id: u64,
+    event_id: u32,
+    #[serde(default)]
+    caller_process_id: Option<u32>,
+    #[serde(default)]
+    caller_process_image_name: Option<String>,
+    #[serde(default)]
+    error_code: Option<String>,
+    #[serde(default)]
+    cert_subject: Option<String>,
+    #[serde(default)]
+    cert_issuer: Option<String>,
+    #[serde(default)]
+    cert_thumbprint: Option<String>,
+}
+
+impl WindowsTlsTelemetryEvent {
+    fn operation(&self) -> &'static str {
+        match self.event_id {
+            36874 | 36876 | 36882 => "tls-cert-validation-failure",
+            36887 | 36888 => "tls-alert",
+            _ => "tls-event",
+        }
+    }
+
+    fn subject(&self) -> String {
+        truncate_subject(&format!(
+            "record_id={};event_id={};pid={};process={};error_code={};cert_subject={};cert_issuer={};cert_thumbprint={}",
+            self.record_id,
+            self.event_id,
+            self.caller_process_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            self.caller_process_image_name.as_deref().unwrap_or("-"),
+            self.error_code.as_deref().unwrap_or("-"),
+            self.cert_subject.as_deref().unwrap_or("-"),
+            self.cert_issuer.as_deref().unwrap_or("-"),
+            self.cert_thumbprint.as_deref().unwrap_or("-"),
+        ))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -1136,6 +1264,8 @@ struct WindowsState {
     known_processes: BTreeMap<u32, WindowsProcessSnapshot>,
     security_process_cursor: Option<u64>,
     auth_event_cursor: Option<u64>,
+    dns_event_cursor: Option<u64>,
+    tls_event_cursor: Option<u64>,
     script_block_cursor: Option<u64>,
     pending_script_blocks: BTreeMap<String, WindowsScriptBlockAssembly>,
     known_memory_processes: BTreeMap<u32, WindowsMemorySnapshot>,
@@ -1198,6 +1328,8 @@ impl WindowsPlatform {
                 known_processes: BTreeMap::new(),
                 security_process_cursor: None,
                 auth_event_cursor: None,
+                dns_event_cursor: None,
+                tls_event_cursor: None,
                 script_block_cursor: None,
                 pending_script_blocks: BTreeMap::new(),
                 known_memory_processes: BTreeMap::new(),
@@ -1313,6 +1445,18 @@ impl PlatformSensor for WindowsPlatform {
         } else {
             state.auth_event_cursor = None;
         }
+        if state.host.dns_sensor_ready() {
+            state.dns_event_cursor = latest_dns_record_id(self.runner.as_ref())
+                .with_context(|| "snapshot initial windows dns cursor")?;
+        } else {
+            state.dns_event_cursor = None;
+        }
+        if state.host.tls_sensor_ready() {
+            state.tls_event_cursor = latest_tls_record_id(self.runner.as_ref())
+                .with_context(|| "snapshot initial windows tls cursor")?;
+        } else {
+            state.tls_event_cursor = None;
+        }
         if state.host.script_sensor_ready() {
             state.script_block_cursor = latest_script_block_record_id(self.runner.as_ref())
                 .with_context(|| "snapshot initial windows script-block cursor")?;
@@ -1398,7 +1542,7 @@ impl PlatformSensor for WindowsPlatform {
         SensorCapabilities {
             process: host.has_process_inventory,
             file: host.file_monitor_ready(),
-            network: host.has_net_connection,
+            network: host.has_net_connection || host.dns_sensor_ready() || host.tls_sensor_ready(),
             registry: host.registry_provider_ready(),
             auth: host.auth_sensor_ready(),
             script: host.script_sensor_ready(),
@@ -2081,6 +2225,28 @@ try {
     $hasAuthAuditEvents = $false
 }
 
+$hasDnsClientOperationalLog = & $hasLog 'Microsoft-Windows-DNS-Client/Operational'
+$dnsClientOperationalLogEnabled = $false
+if ($hasDnsClientOperationalLog) {
+    try {
+        $dnsLog = Get-WinEvent -ListLog 'Microsoft-Windows-DNS-Client/Operational' -ErrorAction Stop
+        if (-not $dnsLog.IsEnabled) {
+            wevtutil sl 'Microsoft-Windows-DNS-Client/Operational' /e:true | Out-Null
+            $dnsLog = Get-WinEvent -ListLog 'Microsoft-Windows-DNS-Client/Operational' -ErrorAction Stop
+        }
+        $dnsClientOperationalLogEnabled = [bool]$dnsLog.IsEnabled
+    } catch {
+        $dnsClientOperationalLogEnabled = $false
+    }
+}
+
+$hasSchannelSystemLog = $false
+try {
+    $hasSchannelSystemLog = (Get-WinEvent -FilterHashtable @{ LogName='System'; ProviderName='Schannel' } -MaxEvents 1 -ErrorAction SilentlyContinue | Select-Object -First 1) -ne $null
+} catch {
+    $hasSchannelSystemLog = $false
+}
+
 $hasAmsiRuntime = $false
 try {
     $amsiDll = Join-Path $env:WINDIR 'System32\amsi.dll'
@@ -2357,6 +2523,9 @@ $data = [ordered]@{
     has_process_creation_events = $hasProcessCreationEvents
     has_auth_audit_events = $hasAuthAuditEvents
     has_net_connection = (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) -ne $null
+    has_dns_client_operational_log = $hasDnsClientOperationalLog
+    dns_client_operational_log_enabled = $dnsClientOperationalLogEnabled
+    has_schannel_system_log = $hasSchannelSystemLog
     has_firewall = ((Get-Command Get-NetFirewallRule -ErrorAction SilentlyContinue) -ne $null) -and ((Get-Command netsh.exe -ErrorAction SilentlyContinue) -ne $null)
     has_registry_cli = (Get-Command reg.exe -ErrorAction SilentlyContinue) -ne $null
     has_amsi_runtime = $hasAmsiRuntime
@@ -2396,6 +2565,9 @@ $data | ConvertTo-Json -Compress
         has_process_creation_events: probe.has_process_creation_events,
         has_auth_audit_events: probe.has_auth_audit_events,
         has_net_connection: probe.has_net_connection,
+        has_dns_client_operational_log: probe.has_dns_client_operational_log,
+        dns_client_operational_log_enabled: probe.dns_client_operational_log_enabled,
+        has_schannel_system_log: probe.has_schannel_system_log,
         has_firewall: probe.has_firewall,
         has_registry_cli: probe.has_registry_cli,
         has_amsi_runtime: probe.has_amsi_runtime,
@@ -3144,6 +3316,12 @@ fn collect_live_windows_events(
     if state.host.has_net_connection {
         collect_network_delta_events(state, runner)?;
     }
+    if state.host.dns_sensor_ready() {
+        collect_dns_events(state, runner)?;
+    }
+    if state.host.tls_sensor_ready() {
+        collect_tls_events(state, runner)?;
+    }
     if state.host.has_named_pipe_inventory {
         collect_named_pipe_events(state, runner)?;
     }
@@ -3189,6 +3367,36 @@ if ($null -eq $event) {
     Ok(cursor.map(|value| value.record_id))
 }
 
+fn latest_dns_record_id(runner: &dyn WindowsCommandRunner) -> Result<Option<u64>> {
+    let script = r#"
+$event = Get-WinEvent -FilterHashtable @{ LogName='Microsoft-Windows-DNS-Client/Operational' } -MaxEvents 1 -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($null -eq $event) {
+    'null'
+} else {
+    [ordered]@{
+        record_id = [uint64]$event.RecordId
+    } | ConvertTo-Json -Compress
+}
+"#;
+    let cursor: Option<WindowsDnsTelemetryCursor> = run_powershell_json(runner, script)?;
+    Ok(cursor.map(|value| value.record_id))
+}
+
+fn latest_tls_record_id(runner: &dyn WindowsCommandRunner) -> Result<Option<u64>> {
+    let script = r#"
+$event = Get-WinEvent -FilterHashtable @{ LogName='System'; ProviderName='Schannel' } -MaxEvents 1 -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($null -eq $event) {
+    'null'
+} else {
+    [ordered]@{
+        record_id = [uint64]$event.RecordId
+    } | ConvertTo-Json -Compress
+}
+"#;
+    let cursor: Option<WindowsTlsTelemetryCursor> = run_powershell_json(runner, script)?;
+    Ok(cursor.map(|value| value.record_id))
+}
+
 fn latest_script_block_record_id(runner: &dyn WindowsCommandRunner) -> Result<Option<u64>> {
     let script = r#"
 $event = Get-WinEvent -FilterHashtable @{ LogName='Microsoft-Windows-PowerShell/Operational'; Id=4104 } -MaxEvents 1 -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -3221,6 +3429,52 @@ fn collect_auth_audit_events(
         state.pending_events.push_back(
             WindowsEventStub {
                 provider: WindowsProviderKind::AuthAudit,
+                operation: event.operation().to_string(),
+                subject: event.subject(),
+            }
+            .encode(),
+        );
+    }
+    Ok(())
+}
+
+fn collect_dns_events(state: &mut WindowsState, runner: &dyn WindowsCommandRunner) -> Result<()> {
+    let Some(after_record_id) = state.dns_event_cursor else {
+        state.dns_event_cursor = latest_dns_record_id(runner)?;
+        return Ok(());
+    };
+
+    let events = snapshot_dns_events_after(runner, after_record_id)?;
+    if let Some(last) = events.last() {
+        state.dns_event_cursor = Some(last.record_id);
+    }
+    for event in events {
+        state.pending_events.push_back(
+            WindowsEventStub {
+                provider: WindowsProviderKind::WfpNetwork,
+                operation: event.operation().to_string(),
+                subject: event.subject(),
+            }
+            .encode(),
+        );
+    }
+    Ok(())
+}
+
+fn collect_tls_events(state: &mut WindowsState, runner: &dyn WindowsCommandRunner) -> Result<()> {
+    let Some(after_record_id) = state.tls_event_cursor else {
+        state.tls_event_cursor = latest_tls_record_id(runner)?;
+        return Ok(());
+    };
+
+    let events = snapshot_tls_events_after(runner, after_record_id)?;
+    if let Some(last) = events.last() {
+        state.tls_event_cursor = Some(last.record_id);
+    }
+    for event in events {
+        state.pending_events.push_back(
+            WindowsEventStub {
+                provider: WindowsProviderKind::WfpNetwork,
                 operation: event.operation().to_string(),
                 subject: event.subject(),
             }
@@ -3757,9 +4011,115 @@ $rows | ConvertTo-Json -Compress
     run_powershell_json(runner, &script)
 }
 
+fn snapshot_dns_events_after(
+    runner: &dyn WindowsCommandRunner,
+    after_record_id: u64,
+) -> Result<Vec<WindowsDnsTelemetryEvent>> {
+    let script = format!(
+        r#"
+$afterRecordId = [uint64]{after_record_id}
+$rows = @(
+    Get-WinEvent -FilterHashtable @{{ LogName='Microsoft-Windows-DNS-Client/Operational' }} -ErrorAction SilentlyContinue |
+        Where-Object {{ [uint64]$_.RecordId -gt $afterRecordId }} |
+        Sort-Object RecordId |
+        Select-Object -First 64 |
+        ForEach-Object {{
+            $xml = [xml]$_.ToXml()
+            $eventData = @{{}}
+            foreach ($item in $xml.Event.EventData.Data) {{
+                if ($item.Name) {{
+                    $eventData[$item.Name] = [string]$item.'#text'
+                }}
+            }}
+            $clientPid = $null
+            if ($eventData.ContainsKey('ClientPID') -and $eventData['ClientPID']) {{
+                $clientPid = [uint32]$eventData['ClientPID']
+            }}
+            [ordered]@{{
+                record_id = [uint64]$_.RecordId
+                event_id = [uint32]$_.Id
+                query_name = $eventData['QueryName']
+                query_type = $eventData['QueryType']
+                query_status = $eventData['QueryStatus']
+                response_status = $eventData['ResponseStatus']
+                query_results = $eventData['QueryResults']
+                dns_server_ip = $eventData['DnsServerIpAddress']
+                client_pid = $clientPid
+            }}
+        }}
+)
+
+$rows | ConvertTo-Json -Compress
+"#
+    );
+    run_powershell_json(runner, &script)
+}
+
+fn snapshot_tls_events_after(
+    runner: &dyn WindowsCommandRunner,
+    after_record_id: u64,
+) -> Result<Vec<WindowsTlsTelemetryEvent>> {
+    let script = format!(
+        r#"
+$afterRecordId = [uint64]{after_record_id}
+$rows = @(
+    Get-WinEvent -FilterHashtable @{{ LogName='System'; ProviderName='Schannel' }} -ErrorAction SilentlyContinue |
+        Where-Object {{ [uint64]$_.RecordId -gt $afterRecordId }} |
+        Sort-Object RecordId |
+        Select-Object -First 32 |
+        ForEach-Object {{
+            $xml = [xml]$_.ToXml()
+            $eventData = @{{}}
+            foreach ($item in $xml.Event.EventData.Data) {{
+                if ($item.Name) {{
+                    $eventData[$item.Name] = [string]$item.'#text'
+                }}
+            }}
+            $certSubject = $null
+            $certIssuer = $null
+            $certThumbprint = $null
+            try {{
+                if ($xml.Event.EventData.Binary) {{
+                    $binary = [string]$xml.Event.EventData.Binary
+                    if (-not [string]::IsNullOrWhiteSpace($binary)) {{
+                        $bytes = New-Object byte[] ($binary.Length / 2)
+                        for ($i = 0; $i -lt $bytes.Length; $i++) {{
+                            $bytes[$i] = [Convert]::ToByte($binary.Substring($i * 2, 2), 16)
+                        }}
+                        $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 -ArgumentList @(,$bytes)
+                        $certSubject = $cert.Subject
+                        $certIssuer = $cert.Issuer
+                        $certThumbprint = $cert.Thumbprint
+                    }}
+                }}
+            }} catch {{
+            }}
+            $callerPid = $null
+            if ($eventData.ContainsKey('CallerProcessId') -and $eventData['CallerProcessId']) {{
+                $callerPid = [uint32]$eventData['CallerProcessId']
+            }}
+            [ordered]@{{
+                record_id = [uint64]$_.RecordId
+                event_id = [uint32]$_.Id
+                caller_process_id = $callerPid
+                caller_process_image_name = $eventData['CallerProcessImageName']
+                error_code = $eventData['ErrorCode']
+                cert_subject = $certSubject
+                cert_issuer = $certIssuer
+                cert_thumbprint = $certThumbprint
+            }}
+        }}
+)
+
+$rows | ConvertTo-Json -Compress
+"#
+    );
+    run_powershell_json(runner, &script)
+}
+
 fn snapshot_network_inventory(
     runner: &dyn WindowsCommandRunner,
-    ) -> Result<BTreeMap<String, WindowsNetworkConnection>> {
+) -> Result<BTreeMap<String, WindowsNetworkConnection>> {
     let script = r#"
 $tcpRows = @()
 if ((Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) -ne $null) {
@@ -4939,6 +5299,9 @@ mod tests {
             has_process_creation_events: true,
             has_auth_audit_events: false,
             has_net_connection: true,
+            has_dns_client_operational_log: false,
+            dns_client_operational_log_enabled: false,
+            has_schannel_system_log: false,
             has_firewall: true,
             has_registry_cli: true,
             has_amsi_runtime: false,
@@ -5056,6 +5419,29 @@ mod tests {
         )
     }
 
+    fn probe_output_with_network_surface(
+        has_dns_client_operational_log: bool,
+        dns_client_operational_log_enabled: bool,
+        has_schannel_system_log: bool,
+    ) -> String {
+        format!(
+            concat!(
+                r#"{{"computer_name":"DESKTOP-TLASHJG","user_name":"desktop-tlashjg\\lamba","is_admin":true,"#,
+                r#""has_process_inventory":true,"has_security_log":true,"has_powershell_log":true,"#,
+                r#""has_wmi_log":true,"has_task_scheduler_log":true,"has_sysmon_log":false,"#,
+                r#""has_process_creation_events":true,"has_auth_audit_events":false,"has_net_connection":true,"#,
+                r#""has_dns_client_operational_log":{},"dns_client_operational_log_enabled":{},"has_schannel_system_log":{},"#,
+                r#""has_firewall":true,"has_registry_cli":true,"has_amsi_runtime":false,"has_script_block_logging":false,"#,
+                r#""has_amsi_scan_interface":false,"has_amsi_strict_blocking":false,"has_memory_inventory":false,"#,
+                r#""has_named_pipe_inventory":false,"has_module_inventory":false,"has_vss_inventory":false,"#,
+                r#""has_device_inventory":false}}"#
+            ),
+            has_dns_client_operational_log,
+            dns_client_operational_log_enabled,
+            has_schannel_system_log,
+        )
+    }
+
     fn probe_output_with_surface(
         has_amsi_runtime: bool,
         has_script_block_logging: bool,
@@ -5070,6 +5456,7 @@ mod tests {
                 r#""has_process_inventory":true,"has_security_log":true,"has_powershell_log":true,"#,
                 r#""has_wmi_log":true,"has_task_scheduler_log":true,"has_sysmon_log":false,"#,
                 r#""has_process_creation_events":true,"has_auth_audit_events":false,"has_net_connection":true,"has_firewall":true,"#,
+                r#""has_dns_client_operational_log":false,"dns_client_operational_log_enabled":false,"has_schannel_system_log":false,"#,
                 r#""has_registry_cli":true,"has_amsi_runtime":{},"has_script_block_logging":{},"#,
                 r#""has_amsi_scan_interface":false,"has_amsi_strict_blocking":false,"has_memory_inventory":false,"#,
                 r#""has_named_pipe_inventory":{},"has_module_inventory":{},"has_vss_inventory":{},"#,
@@ -5097,6 +5484,7 @@ mod tests {
                 r#""has_process_inventory":true,"has_security_log":true,"has_powershell_log":true,"#,
                 r#""has_wmi_log":true,"has_task_scheduler_log":true,"has_sysmon_log":false,"#,
                 r#""has_process_creation_events":true,"has_auth_audit_events":false,"has_net_connection":true,"has_firewall":true,"#,
+                r#""has_dns_client_operational_log":false,"dns_client_operational_log_enabled":false,"has_schannel_system_log":false,"#,
                 r#""has_registry_cli":true,"has_amsi_runtime":{},"has_script_block_logging":{},"#,
                 r#""has_amsi_scan_interface":{},"has_amsi_strict_blocking":{},"has_memory_inventory":{},"#,
                 r#""has_named_pipe_inventory":false,"has_module_inventory":false,"has_vss_inventory":false,"#,
@@ -5202,6 +5590,101 @@ mod tests {
                         encode(*service_name),
                         encode(*privilege_list),
                         encode(*failure_reason),
+                    )
+                },
+            )
+            .collect::<Vec<_>>();
+        format!("[{}]", rows.join(","))
+    }
+
+    fn dns_event_output(
+        entries: &[(
+            u64,
+            u32,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+            Option<u32>,
+        )],
+    ) -> String {
+        let rows = entries
+            .iter()
+            .map(
+                |(
+                    record_id,
+                    event_id,
+                    query_name,
+                    query_type,
+                    query_status,
+                    response_status,
+                    query_results,
+                    dns_server_ip,
+                    client_pid,
+                )| {
+                    let encode = |value: Option<&str>| {
+                        value.map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+                            .unwrap_or_else(|| "null".to_string())
+                    };
+                    let client_pid = client_pid
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "null".to_string());
+                    format!(
+                        "{{\"record_id\":{record_id},\"event_id\":{event_id},\"query_name\":{},\"query_type\":{},\"query_status\":{},\"response_status\":{},\"query_results\":{},\"dns_server_ip\":{},\"client_pid\":{client_pid}}}",
+                        encode(*query_name),
+                        encode(*query_type),
+                        encode(*query_status),
+                        encode(*response_status),
+                        encode(*query_results),
+                        encode(*dns_server_ip),
+                    )
+                },
+            )
+            .collect::<Vec<_>>();
+        format!("[{}]", rows.join(","))
+    }
+
+    fn tls_event_output(
+        entries: &[(
+            u64,
+            u32,
+            Option<u32>,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+        )],
+    ) -> String {
+        let rows = entries
+            .iter()
+            .map(
+                |(
+                    record_id,
+                    event_id,
+                    caller_process_id,
+                    caller_process_image_name,
+                    error_code,
+                    cert_subject,
+                    cert_issuer,
+                    cert_thumbprint,
+                )| {
+                    let encode = |value: Option<&str>| {
+                        value.map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+                            .unwrap_or_else(|| "null".to_string())
+                    };
+                    let caller_process_id = caller_process_id
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "null".to_string());
+                    format!(
+                        "{{\"record_id\":{record_id},\"event_id\":{event_id},\"caller_process_id\":{caller_process_id},\"caller_process_image_name\":{},\"error_code\":{},\"cert_subject\":{},\"cert_issuer\":{},\"cert_thumbprint\":{}}}",
+                        encode(*caller_process_image_name),
+                        encode(*error_code),
+                        encode(*cert_subject),
+                        encode(*cert_issuer),
+                        encode(*cert_thumbprint),
                     )
                 },
             )
@@ -6779,6 +7262,81 @@ mod tests {
         assert!(event.contains("network-open"));
         assert!(event.contains("udp"));
         assert!(event.contains("5353"));
+    }
+
+    #[test]
+    fn windows_poll_events_emits_dns_and_tls_network_telemetry() {
+        let mut platform = WindowsPlatform::new_with_runner(
+            Box::new(QueuedWindowsRunner::new([
+                probe_output_with_network_surface(true, true, true),
+                process_output(&[("System", 4, 0, None)]),
+                audit_cursor_output(300),
+                audit_cursor_output(50),
+                audit_cursor_output(80),
+                network_output(&[]),
+                process_output(&[("System", 4, 0, None)]),
+                security_process_event_output(&[]),
+                network_output(&[]),
+                dns_event_output(&[(
+                    51,
+                    3011,
+                    Some("example.com"),
+                    Some("1"),
+                    None,
+                    Some("0"),
+                    Some("104.20.23.154;172.66.147.243"),
+                    Some("192.168.2.254"),
+                    Some(4242),
+                )]),
+                tls_event_output(&[(
+                    81,
+                    36876,
+                    Some(4242),
+                    Some("curl"),
+                    Some("0x80092013"),
+                    Some("CN=example.com"),
+                    Some("CN=Example Issuer"),
+                    Some("DEADBEEF"),
+                )]),
+            ])),
+            false,
+        );
+        platform
+            .start(&SensorConfig {
+                profile: "windows".to_string(),
+                queue_capacity: 1024,
+                require_kernel_driver: false,
+            })
+            .expect("start windows runtime");
+
+        let snapshot = platform.health_snapshot();
+        assert_eq!(
+            snapshot.provider_health.get("WfpNetwork").copied(),
+            Some(true)
+        );
+        assert!(platform.capabilities().network);
+
+        let mut buffer = EventBuffer::default();
+        let drained = platform.poll_events(&mut buffer).expect("poll network telemetry");
+
+        assert_eq!(drained, 2);
+        let events = buffer
+            .records
+            .iter()
+            .map(|record| String::from_utf8(record.clone()).expect("event utf8"))
+            .collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            event.contains("WfpNetwork")
+                && event.contains("dns-response")
+                && event.contains("example.com")
+                && event.contains("192.168.2.254")
+        }));
+        assert!(events.iter().any(|event| {
+            event.contains("WfpNetwork")
+                && event.contains("tls-cert-validation-failure")
+                && event.contains("curl")
+                && event.contains("0x80092013")
+        }));
     }
 
     #[test]
