@@ -1,12 +1,12 @@
 # Aegis Sensor Windows Device / Pipe / VSS 行为采集闭环计划
 
 > 编号：`W25`
-> 状态：`todo`
+> 状态：`done`
 > 日期：`2026-04-22`
 
 ## 1. 缺口定义
 
-当前 Windows 对 Pipe、Device、VSS 只有“可见/消失”资产视图，缺少更适合 EDR 的行为级事件：
+当前 Windows 对 Pipe、Device、VSS 已从“可见/消失”资产视图推进到行为级事件，已补齐：
 
 - Pipe 打开/写入/删除
 - 设备挂载变化
@@ -71,9 +71,18 @@
   - 插拔设备或挂载/卸载卷
 - 数据采集文档更新 Pipe/Device/VSS 行为域。
 
-## 7. 完成判定
+## 7. 完成结果
+
+- Minifilter 文件事件现在会对 `\Device\NamedPipe\*` / `\\.\pipe\*` 路径派生 `pipe-open/pipe-write/pipe-delete`。
+- `Win32_ShadowCopy` 差分除 `shadow-visible/shadow-gone` 外，新增 `shadow-create/shadow-delete`。
+- 新增 `Get-Volume` 卷快照差分，补齐 `device-mount-add/remove/change`。
+- 本地单测已新增 `windows_poll_events_emits_pipe_vss_and_mount_behavior`，`cargo test -p aegis-platform windows_ -- --nocapture` 通过。
+- 真机 `.218` 已确认三条数据源可用：`Get-Volume` 返回卷路径、`\\.\pipe\` 可枚举命名管道、`Win32_ShadowCopy` 可枚举现有快照。
+- Windows 数据采集清单已补充 Pipe 行为、VSS create/delete 和卷挂载变化。
+
+## 8. 完成判定
 
 1. Pipe 行为不再只有 visible/gone。
-2. Device 行为包含挂载变化。
-3. VSS 行为包含 create/delete。
+2. Device 行为已包含挂载变化。
+3. VSS 行为已包含 create/delete。
 4. 代码提交与文档提交各一次。
