@@ -1,15 +1,15 @@
 # Aegis Sensor Windows 深度网络遥测闭环计划
 
 > 编号：`W23`
-> 状态：`todo`
+> 状态：`done`
 > 日期：`2026-04-22`
 
 ## 1. 缺口定义
 
-当前 Windows 网络侧只有连接清单差分，只能给出 `network-open/network-close`，不能满足 EDR 对网络细粒度遥测的要求，尤其缺少：
+当前 Windows 网络侧已从“只有连接清单差分”推进到“连接 + DNS + TLS”，当前已补齐：
 
 - DNS 查询/响应
-- TLS/SNI 元数据
+- TLS 证书校验失败 / 告警元数据
 - 更接近建立时刻的连接事件
 
 ## 2. 目标
@@ -62,9 +62,19 @@
   - 连接建立与关闭
 - Windows 数据采集文档更新网络域。
 
-## 7. 完成判定
+## 7. 完成结果
 
-1. DNS 事件进入 `poll_events()` 主链。
-2. TLS 元数据进入 `poll_events()` 主链。
+- `WfpNetwork` 已不再只包含连接清单差分，新增 DNS Client Operational 与 Schannel 增量事件。
+- 启动阶段会对 `Microsoft-Windows-DNS-Client/Operational` 做启用检查，事件轮询新增 DNS/TLS 游标。
+- 本地单测已新增 `windows_poll_events_emits_dns_and_tls_network_telemetry`，`cargo test -p aegis-platform windows_ -- --nocapture` 通过。
+- 真机 `.218` 已验证：
+  - 启用 DNS Client Operational 后，`Resolve-DnsName example.com` 可产生 `QueryName/QueryType/QueryResults/ClientPID`
+  - System `Schannel` 事件可解析出 `CallerProcessId/CallerProcessImageName/ErrorCode`
+- Windows 数据采集清单已补充 DNS 与 TLS 数据源和采集维度。
+
+## 8. 完成判定
+
+1. DNS 事件已进入 `poll_events()` 主链。
+2. TLS 元数据已进入 `poll_events()` 主链。
 3. 连接清单差分继续保留，但不再是唯一网络数据源。
 4. 代码提交与文档提交各一次。
