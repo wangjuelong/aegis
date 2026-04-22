@@ -55,6 +55,7 @@ pub enum WindowsProviderKind {
     EtwProcess,
     PsProcess,
     AuthAudit,
+    ThreadSensor,
     ObProcess,
     MinifilterFile,
     WfpNetwork,
@@ -198,6 +199,7 @@ struct WindowsHostCapabilities {
     user_name: Option<String>,
     is_admin: bool,
     has_process_inventory: bool,
+    has_thread_inventory: bool,
     has_security_log: bool,
     has_powershell_log: bool,
     has_wmi_log: bool,
@@ -354,6 +356,7 @@ impl WindowsHostCapabilities {
             }
             WindowsProviderKind::PsProcess => self.has_process_inventory,
             WindowsProviderKind::AuthAudit => self.auth_sensor_ready(),
+            WindowsProviderKind::ThreadSensor => self.has_thread_inventory,
             WindowsProviderKind::ObProcess => self.process_protection_ready(),
             WindowsProviderKind::MinifilterFile => self.file_monitor_ready(),
             WindowsProviderKind::WfpNetwork => {
@@ -386,6 +389,7 @@ impl WindowsHostCapabilities {
         }
         facts.push(format!("admin={}", self.is_admin));
         facts.push(format!("process_inventory={}", self.has_process_inventory));
+        facts.push(format!("thread_inventory={}", self.has_thread_inventory));
         facts.push(format!("event_logs={}", self.any_event_log()));
         facts.push(format!(
             "process_creation_audit={}",
@@ -475,6 +479,8 @@ struct WindowsCapabilityProbe {
     user_name: Option<String>,
     is_admin: bool,
     has_process_inventory: bool,
+    #[serde(default)]
+    has_thread_inventory: bool,
     has_security_log: bool,
     has_powershell_log: bool,
     has_wmi_log: bool,
@@ -553,16 +559,25 @@ struct WindowsProcessSnapshot {
     name: String,
     #[serde(default)]
     command_line: Option<String>,
+    #[serde(default)]
+    image_path: Option<String>,
+    #[serde(default)]
+    signature_status: Option<String>,
+    #[serde(default)]
+    signer_subject: Option<String>,
 }
 
 impl WindowsProcessSnapshot {
     fn start_subject(&self) -> String {
         truncate_subject(&format!(
-            "pid={};ppid={};name={};cmdline={}",
+            "pid={};ppid={};name={};cmdline={};image={};signature_status={};signer={}",
             self.process_id,
             self.parent_process_id,
             self.name,
-            self.command_line.as_deref().unwrap_or("-")
+            self.command_line.as_deref().unwrap_or("-"),
+            self.image_path.as_deref().unwrap_or("-"),
+            self.signature_status.as_deref().unwrap_or("-"),
+            self.signer_subject.as_deref().unwrap_or("-"),
         ))
     }
 
@@ -575,6 +590,43 @@ impl WindowsProcessSnapshot {
 struct WindowsTasklistSnapshot {
     process_id: u32,
     image_name: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsThreadSnapshot {
+    thread_id: u32,
+    process_id: u32,
+    #[serde(default)]
+    thread_state: Option<u32>,
+    #[serde(default)]
+    start_address: Option<u64>,
+}
+
+impl WindowsThreadSnapshot {
+    fn start_subject(&self) -> String {
+        truncate_subject(&format!(
+            "tid={};pid={};thread_state={};start_address={}",
+            self.thread_id,
+            self.process_id,
+            self.thread_state
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            self.start_address
+                .map(|value| format!("0x{value:x}"))
+                .unwrap_or_else(|| "-".to_string())
+        ))
+    }
+
+    fn exit_subject(&self) -> String {
+        truncate_subject(&format!(
+            "tid={};pid={};thread_state={}",
+            self.thread_id,
+            self.process_id,
+            self.thread_state
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        ))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -1142,6 +1194,10 @@ struct WindowsModuleSnapshot {
     process_id: u32,
     process_name: String,
     module_path: String,
+    #[serde(default)]
+    signature_status: Option<String>,
+    #[serde(default)]
+    signer_subject: Option<String>,
 }
 
 impl WindowsModuleSnapshot {
@@ -1154,8 +1210,12 @@ impl WindowsModuleSnapshot {
 
     fn subject(&self) -> String {
         truncate_subject(&format!(
-            "pid={};process={};module={}",
-            self.process_id, self.process_name, self.module_path
+            "pid={};process={};module={};signature_status={};signer={}",
+            self.process_id,
+            self.process_name,
+            self.module_path,
+            self.signature_status.as_deref().unwrap_or("-"),
+            self.signer_subject.as_deref().unwrap_or("-"),
         ))
     }
 }
@@ -1262,6 +1322,7 @@ struct WindowsState {
     host: WindowsHostCapabilities,
     host_capabilities_pinned: bool,
     known_processes: BTreeMap<u32, WindowsProcessSnapshot>,
+    known_threads: BTreeMap<u32, WindowsThreadSnapshot>,
     security_process_cursor: Option<u64>,
     auth_event_cursor: Option<u64>,
     dns_event_cursor: Option<u64>,
@@ -1304,6 +1365,7 @@ impl WindowsPlatform {
                 WindowsProviderKind::EtwProcess,
                 WindowsProviderKind::PsProcess,
                 WindowsProviderKind::AuthAudit,
+                WindowsProviderKind::ThreadSensor,
                 WindowsProviderKind::ObProcess,
                 WindowsProviderKind::MinifilterFile,
                 WindowsProviderKind::WfpNetwork,
@@ -1326,6 +1388,7 @@ impl WindowsPlatform {
                 },
                 host_capabilities_pinned,
                 known_processes: BTreeMap::new(),
+                known_threads: BTreeMap::new(),
                 security_process_cursor: None,
                 auth_event_cursor: None,
                 dns_event_cursor: None,
@@ -1432,6 +1495,12 @@ impl PlatformSensor for WindowsPlatform {
                 .with_context(|| "snapshot initial windows process inventory")?;
         } else {
             state.known_processes.clear();
+        }
+        if state.host.has_thread_inventory {
+            state.known_threads = snapshot_thread_inventory(self.runner.as_ref())
+                .with_context(|| "snapshot initial windows thread inventory")?;
+        } else {
+            state.known_threads.clear();
         }
         if state.host.has_process_creation_events {
             state.security_process_cursor = latest_process_audit_record_id(self.runner.as_ref())
@@ -2218,6 +2287,14 @@ try {
     $hasProcessCreationEvents = $false
 }
 
+$hasThreadInventory = $false
+try {
+    $null = Get-CimInstance Win32_Thread -ErrorAction Stop | Select-Object -First 1
+    $hasThreadInventory = $true
+} catch {
+    $hasThreadInventory = $false
+}
+
 $hasAuthAuditEvents = $false
 try {
     $hasAuthAuditEvents = (Get-WinEvent -FilterHashtable @{ LogName='Security'; Id=4624,4625,4672,4768 } -MaxEvents 1 -ErrorAction Stop | Select-Object -First 1) -ne $null
@@ -2515,6 +2592,7 @@ $data = [ordered]@{
     user_name = (whoami)
     is_admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     has_process_inventory = (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) -ne $null
+    has_thread_inventory = $hasThreadInventory
     has_security_log = & $hasLog 'Security'
     has_powershell_log = & $hasLog 'Microsoft-Windows-PowerShell/Operational'
     has_wmi_log = & $hasLog 'Microsoft-Windows-WMI-Activity/Operational'
@@ -2557,6 +2635,7 @@ $data | ConvertTo-Json -Compress
         user_name: probe.user_name,
         is_admin: probe.is_admin,
         has_process_inventory: probe.has_process_inventory,
+        has_thread_inventory: probe.has_thread_inventory,
         has_security_log: probe.has_security_log,
         has_powershell_log: probe.has_powershell_log,
         has_wmi_log: probe.has_wmi_log,
@@ -3301,6 +3380,9 @@ fn collect_live_windows_events(
     if state.host.has_process_inventory {
         collect_process_delta_events(state, runner)?;
     }
+    if state.host.has_thread_inventory {
+        collect_thread_delta_events(state, runner)?;
+    }
     if state.host.has_process_creation_events {
         collect_security_process_audit_events(state, runner)?;
     }
@@ -3705,6 +3787,41 @@ fn collect_process_delta_events(
     Ok(())
 }
 
+fn collect_thread_delta_events(
+    state: &mut WindowsState,
+    runner: &dyn WindowsCommandRunner,
+) -> Result<()> {
+    let current = snapshot_thread_inventory(runner)?;
+    for (thread_id, thread) in &current {
+        if !state.known_threads.contains_key(thread_id) {
+            state.pending_events.push_back(
+                WindowsEventStub {
+                    provider: WindowsProviderKind::ThreadSensor,
+                    operation: "thread-start".to_string(),
+                    subject: thread.start_subject(),
+                }
+                .encode(),
+            );
+        }
+    }
+
+    for (thread_id, thread) in &state.known_threads {
+        if !current.contains_key(thread_id) {
+            state.pending_events.push_back(
+                WindowsEventStub {
+                    provider: WindowsProviderKind::ThreadSensor,
+                    operation: "thread-exit".to_string(),
+                    subject: thread.exit_subject(),
+                }
+                .encode(),
+            );
+        }
+    }
+
+    state.known_threads = current;
+    Ok(())
+}
+
 fn collect_security_process_audit_events(
     state: &mut WindowsState,
     runner: &dyn WindowsCommandRunner,
@@ -3911,11 +4028,29 @@ $rows = @(
     Get-CimInstance Win32_Process |
         Sort-Object ProcessId |
         ForEach-Object {
+            $imagePath = $_.ExecutablePath
+            $signatureStatus = $null
+            $signerSubject = $null
+            if ($imagePath) {
+                try {
+                    $sig = Get-AuthenticodeSignature -FilePath $imagePath -ErrorAction Stop
+                    if ($null -ne $sig) {
+                        $signatureStatus = [string]$sig.Status
+                        if ($null -ne $sig.SignerCertificate) {
+                            $signerSubject = [string]$sig.SignerCertificate.Subject
+                        }
+                    }
+                } catch {
+                }
+            }
             [ordered]@{
                 process_id = [uint32]$_.ProcessId
                 parent_process_id = [uint32]$_.ParentProcessId
                 name = $_.Name
                 command_line = $_.CommandLine
+                image_path = $imagePath
+                signature_status = $signatureStatus
+                signer_subject = $signerSubject
             }
         }
 )
@@ -3926,6 +4061,41 @@ $rows | ConvertTo-Json -Compress
     Ok(rows
         .into_iter()
         .map(|process| (process.process_id, process))
+        .collect())
+}
+
+fn snapshot_thread_inventory(
+    runner: &dyn WindowsCommandRunner,
+) -> Result<BTreeMap<u32, WindowsThreadSnapshot>> {
+    let script = r#"
+$rows = @(
+    Get-CimInstance Win32_Thread -ErrorAction SilentlyContinue |
+        Sort-Object Handle |
+        ForEach-Object {
+            $threadId = $null
+            if ($_.Handle) {
+                $threadId = [uint32]$_.Handle
+            }
+            $processId = $null
+            if ($_.ProcessHandle) {
+                $processId = [uint32]$_.ProcessHandle
+            }
+            [ordered]@{
+                thread_id = $threadId
+                process_id = $processId
+                thread_state = if ($null -eq $_.ThreadState) { $null } else { [uint32]$_.ThreadState }
+                start_address = if ($null -eq $_.StartAddress) { $null } else { [uint64]$_.StartAddress }
+            }
+        } |
+        Where-Object { $null -ne $_.thread_id -and $null -ne $_.process_id }
+)
+
+$rows | ConvertTo-Json -Compress
+"#;
+    let rows: Vec<WindowsThreadSnapshot> = run_powershell_json(runner, script)?;
+    Ok(rows
+        .into_iter()
+        .map(|thread| (thread.thread_id, thread))
         .collect())
 }
 
@@ -4207,10 +4377,24 @@ $rows = @(
                         Where-Object { $_.FileName } |
                         Sort-Object FileName |
                         ForEach-Object {
+                            $signatureStatus = $null
+                            $signerSubject = $null
+                            try {
+                                $sig = Get-AuthenticodeSignature -FilePath $_.FileName -ErrorAction Stop
+                                if ($null -ne $sig) {
+                                    $signatureStatus = [string]$sig.Status
+                                    if ($null -ne $sig.SignerCertificate) {
+                                        $signerSubject = [string]$sig.SignerCertificate.Subject
+                                    }
+                                }
+                            } catch {
+                            }
                             [ordered]@{
                                 process_id = [uint32]$process.Id
                                 process_name = [string]$process.ProcessName
                                 module_path = [string]$_.FileName
+                                signature_status = $signatureStatus
+                                signer_subject = $signerSubject
                             }
                         }
                 )
@@ -5291,6 +5475,7 @@ mod tests {
             user_name: Some("desktop-tlashjg\\lamba".to_string()),
             is_admin: true,
             has_process_inventory: true,
+            has_thread_inventory: false,
             has_security_log: true,
             has_powershell_log: true,
             has_wmi_log: true,
@@ -5769,6 +5954,36 @@ mod tests {
         format!("[{}]", rows.join(","))
     }
 
+    fn module_output_with_signature(
+        entries: &[(
+            u32,
+            &str,
+            &str,
+            Option<&str>,
+            Option<&str>,
+        )],
+    ) -> String {
+        let rows = entries
+            .iter()
+            .map(
+                |(process_id, process_name, module_path, signature_status, signer_subject)| {
+                    let encode = |value: Option<&str>| {
+                        value.map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+                            .unwrap_or_else(|| "null".to_string())
+                    };
+                    format!(
+                        "{{\"process_id\":{process_id},\"process_name\":\"{}\",\"module_path\":\"{}\",\"signature_status\":{},\"signer_subject\":{}}}",
+                        process_name.replace('\\', "\\\\").replace('"', "\\\""),
+                        module_path.replace('\\', "\\\\").replace('"', "\\\""),
+                        encode(*signature_status),
+                        encode(*signer_subject),
+                    )
+                },
+            )
+            .collect::<Vec<_>>();
+        format!("[{}]", rows.join(","))
+    }
+
     fn vss_output(entries: &[(&str, Option<&str>)]) -> String {
         let rows = entries
             .iter()
@@ -6108,6 +6323,57 @@ mod tests {
         format!("[{}]", rows.join(","))
     }
 
+    fn process_output_with_image(
+        processes: &[(&str, u32, u32, Option<&str>, Option<&str>, Option<&str>, Option<&str>)],
+    ) -> String {
+        let rows = processes
+            .iter()
+            .map(
+                |(
+                    name,
+                    pid,
+                    ppid,
+                    cmdline,
+                    image_path,
+                    signature_status,
+                    signer_subject,
+                )| {
+                    let encode = |value: Option<&str>| {
+                        value.map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+                            .unwrap_or_else(|| "null".to_string())
+                    };
+                    format!(
+                        "{{\"process_id\":{pid},\"parent_process_id\":{ppid},\"name\":\"{}\",\"command_line\":{},\"image_path\":{},\"signature_status\":{},\"signer_subject\":{}}}",
+                        name.replace('\\', "\\\\").replace('"', "\\\""),
+                        encode(*cmdline),
+                        encode(*image_path),
+                        encode(*signature_status),
+                        encode(*signer_subject),
+                    )
+                },
+            )
+            .collect::<Vec<_>>();
+        format!("[{}]", rows.join(","))
+    }
+
+    fn thread_output(entries: &[(u32, u32, Option<u32>, Option<u64>)]) -> String {
+        let rows = entries
+            .iter()
+            .map(|(thread_id, process_id, thread_state, start_address)| {
+                let thread_state = thread_state
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "null".to_string());
+                let start_address = start_address
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "null".to_string());
+                format!(
+                    "{{\"thread_id\":{thread_id},\"process_id\":{process_id},\"thread_state\":{thread_state},\"start_address\":{start_address}}}"
+                )
+            })
+            .collect::<Vec<_>>();
+        format!("[{}]", rows.join(","))
+    }
+
     fn tasklist_output(entries: &[(&str, u32)]) -> String {
         let rows = entries
             .iter()
@@ -6229,11 +6495,12 @@ mod tests {
         assert!(providers.contains(&WindowsProviderKind::EtwProcess));
         assert!(providers.contains(&WindowsProviderKind::RegistryCallback));
         assert!(providers.contains(&WindowsProviderKind::AuthAudit));
+        assert!(providers.contains(&WindowsProviderKind::ThreadSensor));
         assert!(providers.contains(&WindowsProviderKind::IpcSensor));
         assert!(providers.contains(&WindowsProviderKind::ModuleLoadSensor));
         assert!(providers.contains(&WindowsProviderKind::SnapshotProtection));
         assert!(providers.contains(&WindowsProviderKind::DeviceControl));
-        assert_eq!(providers.len(), 13);
+        assert_eq!(providers.len(), 14);
     }
 
     #[test]
@@ -7053,6 +7320,116 @@ mod tests {
         assert!(event.contains("PsProcess"));
         assert!(event.contains("process-start"));
         assert!(event.contains("powershell.exe"));
+    }
+
+    #[test]
+    fn windows_poll_events_emits_thread_and_signed_process_module_telemetry() {
+        let mut host = healthy_host();
+        host.has_thread_inventory = true;
+        host.has_module_inventory = true;
+
+        let mut platform = WindowsPlatform::with_runner_for_test(
+            Box::new(QueuedWindowsRunner::new([
+                process_output_with_image(&[(
+                    "System",
+                    4,
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                )]),
+                thread_output(&[(10, 4, Some(2), Some(0x1000))]),
+                audit_cursor_output(900),
+                network_output(&[]),
+                module_output_with_signature(&[(
+                    4,
+                    "System",
+                    r"C:\Windows\System32\ntdll.dll",
+                    Some("Valid"),
+                    Some("CN=Microsoft Windows"),
+                )]),
+                process_output_with_image(&[
+                    ("System", 4, 0, None, None, None, None),
+                    (
+                        "powershell.exe",
+                        4242,
+                        640,
+                        Some("powershell.exe -NoProfile"),
+                        Some(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+                        Some("Valid"),
+                        Some("CN=Microsoft Windows"),
+                    ),
+                ]),
+                thread_output(&[(10, 4, Some(2), Some(0x1000)), (11, 4242, Some(2), Some(0x2000))]),
+                security_process_event_output(&[]),
+                network_output(&[]),
+                module_output_with_signature(&[
+                    (
+                        4,
+                        "System",
+                        r"C:\Windows\System32\ntdll.dll",
+                        Some("Valid"),
+                        Some("CN=Microsoft Windows"),
+                    ),
+                    (
+                        4242,
+                        "powershell",
+                        r"C:\Temp\evil.dll",
+                        Some("NotSigned"),
+                        None,
+                    ),
+                ]),
+            ])),
+            host,
+        );
+        platform
+            .start(&SensorConfig {
+                profile: "windows".to_string(),
+                queue_capacity: 1024,
+                require_kernel_driver: false,
+            })
+            .expect("start windows runtime");
+
+        let snapshot = platform.health_snapshot();
+        assert_eq!(
+            snapshot.provider_health.get("ThreadSensor").copied(),
+            Some(true)
+        );
+        assert_eq!(
+            snapshot.provider_health.get("ModuleLoadSensor").copied(),
+            Some(true)
+        );
+
+        let mut buffer = EventBuffer::default();
+        let drained = platform
+            .poll_events(&mut buffer)
+            .expect("poll thread and signed process/module telemetry");
+
+        assert_eq!(drained, 3);
+        let events = buffer
+            .records
+            .iter()
+            .map(|record| String::from_utf8(record.clone()).expect("event utf8"))
+            .collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            event.contains("PsProcess")
+                && event.contains("process-start")
+                && event.contains("image=C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")
+                && event.contains("signature_status=Valid")
+        }));
+        assert!(events.iter().any(|event| {
+            event.contains("ThreadSensor")
+                && event.contains("thread-start")
+                && event.contains("tid=11")
+                && event.contains("start_address=0x2000")
+        }));
+        assert!(events.iter().any(|event| {
+            event.contains("ModuleLoadSensor")
+                && event.contains("module-visible")
+                && event.contains(r"C:\Temp\evil.dll")
+                && event.contains("signature_status=NotSigned")
+        }));
     }
 
     #[test]
