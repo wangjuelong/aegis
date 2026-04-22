@@ -109,7 +109,7 @@
 | O02 | Windows 真实运行时、事件链路、响应链与系统级交付 | done | 已完成运行时闭环、驱动桥接、真实文件/注册表/脚本/内存采集、自保护与完整性强制执行，`192.168.2.218` 真机验收通过 |
 | O03 | Windows 正式硬件根信任、签名与兼容性验证 | done | 已完成仓库侧 release manifest、签名/验签/install gate、批准依赖校验与支持矩阵文档；Microsoft 正式签发与更多主机 rollout 继续依赖仓库外流程 |
 | O10 | Windows 真实 MSI 工程 | done | 已完成 MSI 构建脚本、`validate.ps1` / `windows-package-verify.sh` 验收链，并在 `.218` 上完成 `msiexec` 安装/卸载闭环 |
-| O11 | Linux Debian/Ubuntu 的真实 DEB 安装验收链 | todo | 当前 `.226` 尚未形成原生 `dpkg -i` / bootstrap-check / watchdog / uninstall 闭环 |
+| O11 | Linux Debian/Ubuntu 的真实 DEB 安装验收链 | done | 已完成 `.123 build -> .226 dpkg -i / dpkg -P` 验收链，本地输出 Ubuntu 验收 JSON 与 install/bootstrap/watchdog/diagnose 工件 |
 | O04 | macOS ESF / Network Extension / System Extension 真实系统级交付 | todo | 当前仅完成 macOS 平台骨架与测试基线 |
 | O05 | macOS notarization、授权流与正式硬件根信任 | todo | 当前未完成签名、公证、用户批准与 Secure Enclave/Keychain 正式接入 |
 
