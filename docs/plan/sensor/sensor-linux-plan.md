@@ -38,7 +38,8 @@ Linux 平台目标覆盖：
 ## 4. 当前总体结论
 
 - Linux 主链能力已基本闭环。
-- 当前仓库范围内，Linux 已无剩余未完成项。
+- 当前仓库范围内仍剩 1 个打包验收缺口：
+  - Linux Debian/Ubuntu 的真实 DEB 安装验收链
 
 ## 5. Linux 研发计划与状态
 
@@ -59,6 +60,7 @@ Linux 平台目标覆盖：
 | L13 | Linux 容器 / Sidecar / Runtime Connector 交付链 | done | 已完成 Host Agent DaemonSet、Sidecar Lite Pod 样例、Runtime SDK / Cloud Connector 样例目录与 `scripts/linux-container-validate.sh` 校验链 |
 | L14 | Linux 设备控制链 | done | 已完成 `DeviceControl` provider、设备基线/挂载变化事件、`udev`/`USBGuard`/mount monitor 配置交付与真机安装链验证 |
 | L15 | Linux Runtime SDK / Cloud Connector 多语言交付 | done | 已完成 `Python/Node.js/Go/Java/.NET` 五种参考 SDK、多云 connector 合同与统一验证脚本 |
+| L16 | Linux Debian/Ubuntu 的真实 DEB 安装验收链 | todo | 当前 `DEB` 仍只做 `dpkg-deb --info`，未在 Ubuntu/Debian 主机上完成真实安装/卸载/服务验收 |
 
 ## 6. 已完成验证
 
@@ -111,3 +113,4 @@ Linux 测试机已完成：
 - `L13 = done`
 - `L14 = done`
 - `L15 = done`
+- `L16 = todo`
