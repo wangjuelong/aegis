@@ -70,16 +70,16 @@ Linux 平台目标覆盖：
 - `cargo test --workspace`
 - `cargo check -p aegis-agentd`
 - `AEGIS_STATE_ROOT=$(mktemp -d) cargo run -p aegis-agentd -- --diagnose`
-- `bash -n scripts/linux-ebpf-install.sh scripts/linux-ebpf-verify.sh scripts/linux-ebpf-sync.sh scripts/linux-ebpf-uninstall.sh packaging/linux-ebpf/build.sh scripts/linux-tpm-sealed-verify.sh scripts/linux-tpm-quote-verify.sh scripts/linux-tpm-policy-verify.sh`
+- `bash -n scripts/linux/ebpf-install.sh scripts/linux/ebpf-verify.sh scripts/linux/ebpf-sync.sh scripts/linux/ebpf-uninstall.sh packaging/linux-ebpf/build.sh scripts/linux/tpm-sealed-verify.sh scripts/linux/tpm-quote-verify.sh scripts/linux/tpm-policy-verify.sh`
 
 Linux 测试机已完成：
 
-- `scripts/linux-ebpf-install.sh`
-- `scripts/linux-ebpf-verify.sh`
-- `scripts/linux-ebpf-uninstall.sh`
-- `scripts/linux-tpm-sealed-verify.sh`
-- `scripts/linux-tpm-quote-verify.sh`
-- `scripts/linux-tpm-policy-verify.sh`
+- `scripts/linux/ebpf-install.sh`
+- `scripts/linux/ebpf-verify.sh`
+- `scripts/linux/ebpf-uninstall.sh`
+- `scripts/linux/tpm-sealed-verify.sh`
+- `scripts/linux/tpm-quote-verify.sh`
+- `scripts/linux/tpm-policy-verify.sh`
 - `scripts/linux-package-verify.sh`
 
 本地容器 / Sidecar 交付验证已完成：

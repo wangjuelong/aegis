@@ -74,13 +74,13 @@
 - `crates/aegis-core/src/linux_tpm.rs`
 - `crates/aegis-core/src/self_protection.rs`
 - `crates/aegis-agentd/src/main.rs`
-- `scripts/linux-tpm-attestation-bundle.sh`
-- `scripts/linux-tpm-attestation-verify.sh`
+- `scripts/linux/tpm-attestation-bundle.sh`
+- `scripts/linux/tpm-attestation-verify.sh`
 
 ## 6. 实际交付结果
 
-- 新增 `scripts/linux-tpm-attestation-bundle.sh`，可在 agent 侧生成 quote / PCR / qualification / CSR 组成的 attestation bundle。
-- 新增 `scripts/linux-tpm-attestation-verify.sh`，可在 verifier 侧完成本地 CA 签发、证书链校验与 `tpm2_checkquote` 验证，并输出 `verified-receipt.json`。
+- 新增 `scripts/linux/tpm-attestation-bundle.sh`，可在 agent 侧生成 quote / PCR / qualification / CSR 组成的 attestation bundle。
+- 新增 `scripts/linux/tpm-attestation-verify.sh`，可在 verifier 侧完成本地 CA 签发、证书链校验与 `tpm2_checkquote` 验证，并输出 `verified-receipt.json`。
 - `aegis-agentd --diagnose` 已接入 Linux 证书与 verifier receipt 状态：设备证书、bundle、receipt 是否存在及是否验证通过不再硬编码。
 - 本地 mock TPM toolchain 已完成正反向烟测：bundle 生成成功、verifier receipt 成功、错误 nonce 严格失败。
 
