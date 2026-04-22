@@ -83,7 +83,7 @@ if [[ -z "$AEGIS_RUSTUP_TOOLCHAIN" ]]; then
 fi
 
 rm -rf "$PAYLOAD_ROOT" "$OUTPUT_ROOT" "$REPO_ROOT/target/linux-package-validate/target"
-mkdir -p "$PAYLOAD_ROOT/bin" "$PAYLOAD_ROOT/ebpf" "$PAYLOAD_ROOT/systemd" "$PAYLOAD_ROOT/scripts" "$OUTPUT_ROOT"
+mkdir -p "$PAYLOAD_ROOT/bin" "$PAYLOAD_ROOT/ebpf" "$PAYLOAD_ROOT/systemd" "$PAYLOAD_ROOT/device-control" "$PAYLOAD_ROOT/scripts" "$OUTPUT_ROOT"
 
 rpm -q "$PACKAGE_NAME" >/dev/null 2>&1 && rpm -e "$PACKAGE_NAME" >/dev/null 2>&1 || true
 bash "$REPO_ROOT/packaging/linux/uninstall.sh" --manifest "$REPO_ROOT/packaging/linux/manifest.json" --install-root "$INSTALL_ROOT" --state-root "$STATE_ROOT" --config-root "$CONFIG_ROOT" >/dev/null 2>&1 || true
@@ -133,6 +133,11 @@ cp -f "$REPO_ROOT/packaging/linux-ebpf/"*.bpf.o "$PAYLOAD_ROOT/ebpf/"
 cp -f "$REPO_ROOT/packaging/linux-ebpf/manifest.json" "$PAYLOAD_ROOT/ebpf/manifest.json"
 cp -f "$REPO_ROOT/packaging/linux-ebpf/README.md" "$PAYLOAD_ROOT/ebpf/README.md"
 cp -f "$REPO_ROOT/packaging/linux/systemd/"*.service "$PAYLOAD_ROOT/systemd/"
+cp -f "$REPO_ROOT/packaging/linux/device-control/README.md" "$PAYLOAD_ROOT/device-control/README.md"
+mkdir -p "$PAYLOAD_ROOT/device-control/udev" "$PAYLOAD_ROOT/device-control/usbguard"
+cp -f "$REPO_ROOT/packaging/linux/device-control/udev/"* "$PAYLOAD_ROOT/device-control/udev/"
+cp -f "$REPO_ROOT/packaging/linux/device-control/usbguard/"* "$PAYLOAD_ROOT/device-control/usbguard/"
+cp -f "$REPO_ROOT/packaging/linux/device-control/mount-monitor.conf" "$PAYLOAD_ROOT/device-control/mount-monitor.conf"
 cp -f "$REPO_ROOT/packaging/linux/install.sh" "$PAYLOAD_ROOT/scripts/install.sh"
 cp -f "$REPO_ROOT/packaging/linux/uninstall.sh" "$PAYLOAD_ROOT/scripts/uninstall.sh"
 cp -f "$REPO_ROOT/packaging/linux/build-packages.sh" "$PAYLOAD_ROOT/scripts/build-packages.sh"
@@ -169,6 +174,13 @@ cp -f "$watchdog_snapshot_path" "$OUTPUT_ROOT/watchdog-state.json"
 install_result_path="$OUTPUT_ROOT/install-result.json"
 bootstrap_report_path="$OUTPUT_ROOT/bootstrap-check.json"
 watchdog_snapshot_path="$OUTPUT_ROOT/watchdog-state.json"
+device_control_paths=$(python3 - "$install_result_path" <<'PY'
+import json
+import sys
+payload = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+print(" ".join(payload.get("device_control_paths") or []))
+PY
+)
 
 rpm -e "$PACKAGE_NAME" >/dev/null
 
@@ -179,13 +191,15 @@ required_failures=()
 [[ ! -e "$INSTALL_ROOT" ]] || required_failures+=("install_root_cleanup")
 [[ ! -e "$CONFIG_ROOT" ]] || required_failures+=("config_root_cleanup")
 [[ ! -e "$STATE_ROOT" ]] || required_failures+=("state_root_cleanup")
+[[ -n "$device_control_paths" ]] || required_failures+=("device_control_paths")
 
-python3 - "$deb_package_path" "$rpm_package_path" "$install_result_path" "$bootstrap_report_path" "$watchdog_snapshot_path" "$diagnose_path" "${required_failures[*]}" <<'PY'
+python3 - "$deb_package_path" "$rpm_package_path" "$install_result_path" "$bootstrap_report_path" "$watchdog_snapshot_path" "$diagnose_path" "$device_control_paths" "${required_failures[*]}" <<'PY'
 import json
 import pathlib
 import sys
 
-required_failures = [item for item in sys.argv[7].split(" ") if item]
+device_control_paths = [item for item in sys.argv[7].split(" ") if item]
+required_failures = [item for item in sys.argv[8].split(" ") if item]
 payload = {
     "deb_package": sys.argv[1],
     "rpm_package": sys.argv[2],
@@ -193,6 +207,7 @@ payload = {
     "bootstrap_report_path": sys.argv[4],
     "watchdog_snapshot_path": sys.argv[5],
     "diagnose": json.loads(pathlib.Path(sys.argv[6]).read_text(encoding="utf-8")),
+    "device_control_paths": device_control_paths,
     "required_failures": required_failures,
 }
 print(json.dumps(payload, indent=2, ensure_ascii=False))

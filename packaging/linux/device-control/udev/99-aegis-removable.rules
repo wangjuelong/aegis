@@ -1,0 +1,2 @@
+ACTION=="add|change", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{AegisManaged}="1", TAG+="systemd"
+ACTION=="add|change", SUBSYSTEM=="block", ENV{ID_DRIVE_FLASH_SD}=="1", ENV{AegisManaged}="1", TAG+="systemd"

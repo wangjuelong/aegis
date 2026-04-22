@@ -27,6 +27,7 @@ pub enum LinuxProviderKind {
     FileEbpf,
     NetworkEbpf,
     AuthAudit,
+    DeviceControl,
     ContainerMetadata,
     FanotifyFallback,
     AuditFallback,
@@ -61,6 +62,96 @@ impl LinuxEventStub {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LinuxDeviceRecord {
+    path: String,
+    name: String,
+    transport: Option<String>,
+    removable: bool,
+    mountpoint: Option<String>,
+    vendor: Option<String>,
+    model: Option<String>,
+    serial: Option<String>,
+}
+
+impl LinuxDeviceRecord {
+    fn trackable(&self) -> bool {
+        self.removable
+            || self.transport.as_deref() == Some("usb")
+            || self
+                .mountpoint
+                .as_deref()
+                .is_some_and(|mount| mount.starts_with("/media/") || mount.starts_with("/run/media/"))
+    }
+
+    fn subject(&self) -> String {
+        let mut parts = vec![format!("path={}", self.path), format!("name={}", self.name)];
+        if let Some(transport) = &self.transport {
+            parts.push(format!("tran={transport}"));
+        }
+        parts.push(format!("removable={}", self.removable));
+        if let Some(mountpoint) = &self.mountpoint {
+            parts.push(format!("mount={mountpoint}"));
+        }
+        if let Some(vendor) = &self.vendor {
+            parts.push(format!("vendor={vendor}"));
+        }
+        if let Some(model) = &self.model {
+            parts.push(format!("model={model}"));
+        }
+        if let Some(serial) = &self.serial {
+            parts.push(format!("serial={serial}"));
+        }
+        parts.join(" ")
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct LinuxLsblkOutput {
+    #[serde(default)]
+    blockdevices: Vec<LinuxLsblkDevice>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct LinuxLsblkDevice {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    tran: Option<String>,
+    #[serde(default)]
+    rm: Option<LinuxLsblkRemovable>,
+    #[serde(default)]
+    mountpoint: Option<String>,
+    #[serde(default)]
+    vendor: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    serial: Option<String>,
+    #[serde(default)]
+    children: Vec<LinuxLsblkDevice>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum LinuxLsblkRemovable {
+    Bool(bool),
+    Number(u8),
+    Text(String),
+}
+
+impl LinuxLsblkRemovable {
+    fn as_bool(&self) -> bool {
+        match self {
+            Self::Bool(value) => *value,
+            Self::Number(value) => *value != 0,
+            Self::Text(value) => matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LinuxFirewallBackend {
     Nftables,
@@ -76,6 +167,7 @@ struct LinuxHostCapabilities {
     has_fanotify: bool,
     has_auth_log: bool,
     has_journalctl: bool,
+    has_device_control: bool,
     has_nft: bool,
     has_iptables: bool,
     has_apparmor: bool,
@@ -245,6 +337,7 @@ struct LinuxState {
     host: LinuxHostCapabilities,
     host_capabilities_pinned: bool,
     known_processes: BTreeMap<u32, Option<String>>,
+    known_devices: BTreeMap<String, LinuxDeviceRecord>,
     auth_offsets: BTreeMap<PathBuf, u64>,
     firewall_backend: Option<LinuxFirewallBackend>,
     kernel: LinuxKernelRuntimeState,
@@ -281,6 +374,7 @@ impl LinuxPlatform {
                 LinuxProviderKind::FileEbpf,
                 LinuxProviderKind::NetworkEbpf,
                 LinuxProviderKind::AuthAudit,
+                LinuxProviderKind::DeviceControl,
                 LinuxProviderKind::ContainerMetadata,
                 LinuxProviderKind::FanotifyFallback,
                 LinuxProviderKind::AuditFallback,
@@ -298,6 +392,7 @@ impl LinuxPlatform {
                 host: capabilities,
                 host_capabilities_pinned,
                 known_processes: BTreeMap::new(),
+                known_devices: BTreeMap::new(),
                 auth_offsets: BTreeMap::new(),
                 firewall_backend,
             }),
@@ -373,6 +468,9 @@ impl LinuxPlatform {
                             )
                     }
                     LinuxProviderKind::AuthAudit => running && host.auth_available(),
+                    LinuxProviderKind::DeviceControl => {
+                        running && host.running_on_linux && host.has_device_control
+                    }
                     LinuxProviderKind::ContainerMetadata => running && host.has_container_metadata,
                     LinuxProviderKind::FanotifyFallback => {
                         running
@@ -451,6 +549,7 @@ impl PlatformSensor for LinuxPlatform {
         }
         refresh_kernel_runtime(&mut state);
         state.known_processes = snapshot_processes();
+        state.known_devices = snapshot_device_control_state();
         state.execution.running = true;
         Ok(())
     }
@@ -791,6 +890,7 @@ fn probe_host_capabilities() -> LinuxHostCapabilities {
             .into_iter()
             .any(|path| path.exists()),
         has_journalctl: command_exists("journalctl"),
+        has_device_control: command_exists("lsblk") && path_exists("/sys/bus/usb/devices"),
         has_nft: command_exists("nft"),
         has_iptables: command_exists("iptables"),
         has_apparmor: apparmor_enabled(&lsm_stack),
@@ -1222,8 +1322,9 @@ fn collect_live_linux_events(state: &mut LinuxState) {
     if !state.host.running_on_linux {
         return;
     }
-    collect_process_delta_events(state);
-    collect_auth_log_events(state);
+        collect_process_delta_events(state);
+        collect_auth_log_events(state);
+        collect_device_control_events(state);
 }
 
 fn collect_process_delta_events(state: &mut LinuxState) {
@@ -1304,6 +1405,139 @@ fn collect_auth_log_events(state: &mut LinuxState) {
             );
         }
     }
+}
+
+fn collect_device_control_events(state: &mut LinuxState) {
+    let current = snapshot_device_control_state();
+    for event in diff_device_control_events(&state.known_devices, &current) {
+        state.pending_events.push_back(event.encode());
+    }
+    state.known_devices = current;
+}
+
+fn snapshot_device_control_state() -> BTreeMap<String, LinuxDeviceRecord> {
+    if !cfg!(target_os = "linux") {
+        return BTreeMap::new();
+    }
+
+    let Some(raw) = run_command_capture(
+        "lsblk",
+        [
+            "-J",
+            "-o",
+            "NAME,PATH,RM,TRAN,MOUNTPOINT,VENDOR,MODEL,SERIAL",
+        ],
+    ) else {
+        return BTreeMap::new();
+    };
+
+    parse_device_control_snapshot(&raw).unwrap_or_default()
+}
+
+fn parse_device_control_snapshot(raw: &str) -> Result<BTreeMap<String, LinuxDeviceRecord>> {
+    let output: LinuxLsblkOutput = serde_json::from_str(raw)?;
+    let mut devices = BTreeMap::new();
+    for device in output.blockdevices {
+        collect_lsblk_device(&mut devices, device);
+    }
+    Ok(devices)
+}
+
+fn collect_lsblk_device(
+    devices: &mut BTreeMap<String, LinuxDeviceRecord>,
+    device: LinuxLsblkDevice,
+) {
+    let path = device
+        .path
+        .clone()
+        .or_else(|| device.name.as_ref().map(|name| format!("/dev/{name}")))
+        .unwrap_or_default();
+    let record = LinuxDeviceRecord {
+        path: path.clone(),
+        name: device.name.unwrap_or_default(),
+        transport: device.tran.map(|value| value.trim().to_ascii_lowercase()),
+        removable: device
+            .rm
+            .as_ref()
+            .map(LinuxLsblkRemovable::as_bool)
+            .unwrap_or(false),
+        mountpoint: device
+            .mountpoint
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        vendor: device
+            .vendor
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        model: device
+            .model
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        serial: device
+            .serial
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+    };
+    if !record.path.is_empty() && record.trackable() {
+        devices.insert(record.path.clone(), record);
+    }
+    for child in device.children {
+        collect_lsblk_device(devices, child);
+    }
+}
+
+fn diff_device_control_events(
+    previous: &BTreeMap<String, LinuxDeviceRecord>,
+    current: &BTreeMap<String, LinuxDeviceRecord>,
+) -> Vec<LinuxEventStub> {
+    let mut events = Vec::new();
+
+    for (path, device) in current {
+        if !previous.contains_key(path) {
+            events.push(LinuxEventStub {
+                provider: LinuxProviderKind::DeviceControl,
+                operation: "device-attach".to_string(),
+                subject: truncate_subject(&device.subject()),
+                container_id: None,
+            });
+        }
+    }
+
+    for (path, device) in previous {
+        if !current.contains_key(path) {
+            events.push(LinuxEventStub {
+                provider: LinuxProviderKind::DeviceControl,
+                operation: "device-detach".to_string(),
+                subject: truncate_subject(&device.subject()),
+                container_id: None,
+            });
+        }
+    }
+
+    for (path, current_device) in current {
+        let Some(previous_device) = previous.get(path) else {
+            continue;
+        };
+        if previous_device.mountpoint != current_device.mountpoint {
+            let operation = match (
+                previous_device.mountpoint.as_deref(),
+                current_device.mountpoint.as_deref(),
+            ) {
+                (None, Some(_)) => "mount-add",
+                (Some(_), None) => "mount-remove",
+                (Some(_), Some(_)) => "mount-change",
+                (None, None) => continue,
+            };
+            events.push(LinuxEventStub {
+                provider: LinuxProviderKind::DeviceControl,
+                operation: operation.to_string(),
+                subject: truncate_subject(&current_device.subject()),
+                container_id: None,
+            });
+        }
+    }
+
+    events
 }
 
 fn snapshot_processes() -> BTreeMap<u32, Option<String>> {
@@ -1868,7 +2102,8 @@ fn now_unix_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        LinuxDegradeLevel, LinuxEventStub, LinuxHostCapabilities, LinuxPlatform, LinuxProviderKind,
+        diff_device_control_events, parse_device_control_snapshot, LinuxDegradeLevel,
+        LinuxEventStub, LinuxHostCapabilities, LinuxPlatform, LinuxProviderKind,
     };
     use crate::{
         KernelIntegrity, PlatformProtection, PlatformResponse, PlatformRuntime, PlatformSensor,
@@ -1900,6 +2135,7 @@ mod tests {
             has_fanotify: true,
             has_auth_log: true,
             has_journalctl: true,
+            has_device_control: true,
             has_nft: true,
             has_iptables: true,
             has_apparmor: true,
@@ -1919,9 +2155,10 @@ mod tests {
         let providers = platform.provider_kinds();
 
         assert!(providers.contains(&LinuxProviderKind::ProcessEbpf));
+        assert!(providers.contains(&LinuxProviderKind::DeviceControl));
         assert!(providers.contains(&LinuxProviderKind::ContainerMetadata));
         assert!(providers.contains(&LinuxProviderKind::FanotifyFallback));
-        assert_eq!(providers.len(), 7);
+        assert_eq!(providers.len(), 8);
     }
 
     #[test]
@@ -1947,6 +2184,10 @@ mod tests {
         );
         assert_eq!(
             snapshot.provider_health.get("ContainerMetadata").copied(),
+            Some(true)
+        );
+        assert_eq!(
+            snapshot.provider_health.get("DeviceControl").copied(),
             Some(true)
         );
     }
@@ -2002,6 +2243,97 @@ mod tests {
             .iter()
             .map(|record| String::from_utf8_lossy(record))
             .any(|record| record.contains("container-1")));
+    }
+
+    #[test]
+    fn linux_device_control_snapshot_parses_usb_and_mount_state() {
+        let snapshot = parse_device_control_snapshot(
+            r#"{
+  "blockdevices": [
+    {
+      "name": "sdb",
+      "path": "/dev/sdb",
+      "rm": true,
+      "tran": "usb",
+      "mountpoint": "/run/media/user/USB",
+      "vendor": "Kingston",
+      "model": "DataTraveler",
+      "serial": "ABC123",
+      "children": [
+        {
+          "name": "sdb1",
+          "path": "/dev/sdb1",
+          "rm": true,
+          "tran": "usb",
+          "mountpoint": "/run/media/user/USB",
+          "vendor": "Kingston",
+          "model": "DataTraveler",
+          "serial": "ABC123"
+        }
+      ]
+    }
+  ]
+}"#,
+        )
+        .expect("parse device snapshot");
+
+        let root = snapshot.get("/dev/sdb").expect("root device");
+        assert_eq!(root.transport.as_deref(), Some("usb"));
+        assert!(root.removable);
+        let partition = snapshot.get("/dev/sdb1").expect("partition device");
+        assert_eq!(
+            partition.mountpoint.as_deref(),
+            Some("/run/media/user/USB")
+        );
+    }
+
+    #[test]
+    fn linux_device_control_diff_emits_attach_detach_and_mount_events() {
+        let previous = parse_device_control_snapshot(
+            r#"{
+  "blockdevices": [
+    {
+      "name": "sdb",
+      "path": "/dev/sdb",
+      "rm": 1,
+      "tran": "usb",
+      "mountpoint": null
+    }
+  ]
+}"#,
+        )
+        .expect("parse previous snapshot");
+        let current = parse_device_control_snapshot(
+            r#"{
+  "blockdevices": [
+    {
+      "name": "sdb",
+      "path": "/dev/sdb",
+      "rm": 1,
+      "tran": "usb",
+      "mountpoint": "/media/usb"
+    },
+    {
+      "name": "sdc",
+      "path": "/dev/sdc",
+      "rm": 1,
+      "tran": "usb",
+      "mountpoint": null
+    }
+  ]
+}"#,
+        )
+        .expect("parse current snapshot");
+
+        let events = diff_device_control_events(&previous, &current);
+        let rendered = events
+            .iter()
+            .map(|event| format!("{:?}:{}:{}", event.provider, event.operation, event.subject))
+            .collect::<Vec<_>>();
+
+        assert!(rendered.iter().any(|event| event.contains("device-attach")));
+        assert!(rendered.iter().any(|event| event.contains("mount-add")));
+        assert!(!rendered.iter().any(|event| event.contains("device-detach")));
     }
 
     #[test]
@@ -2187,6 +2519,7 @@ mod tests {
             has_fanotify: true,
             has_auth_log: true,
             has_journalctl: false,
+            has_device_control: false,
             has_nft: false,
             has_iptables: true,
             has_apparmor: false,

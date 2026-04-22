@@ -10,6 +10,7 @@ CONFIG_ROOT=${CONFIG_ROOT:-}
 
 copied_paths=()
 installed_units=()
+device_control_paths=()
 install_completed=0
 tmp_root=
 
@@ -81,6 +82,7 @@ cleanup_on_error() {
     [[ -n "$INSTALL_ROOT" ]] && rm -rf "$INSTALL_ROOT"
     [[ -n "$STATE_ROOT" ]] && rm -rf "$STATE_ROOT"
     [[ -n "$CONFIG_ROOT" ]] && rm -rf "$CONFIG_ROOT"
+    rm -f /etc/udev/rules.d/99-aegis-removable.rules /etc/usbguard/rules.conf
   fi
   [[ -n "$tmp_root" ]] && rm -rf "$tmp_root"
   exit "$exit_code"
@@ -190,6 +192,34 @@ config_path="$CONFIG_ROOT/agent.toml"
 
 "$agent_path" --write-default-config --state-root "$STATE_ROOT" --config "$config_path" >"$tmp_root/config.json"
 
+device_control_root="$INSTALL_ROOT/device-control"
+if [[ -d "$device_control_root" ]]; then
+  udev_rule_source="$device_control_root/udev/99-aegis-removable.rules"
+  usbguard_policy_source="$device_control_root/usbguard/rules.conf"
+  mount_monitor_source="$device_control_root/mount-monitor.conf"
+
+  if [[ -f "$udev_rule_source" ]]; then
+    ensure_directory "/etc/udev/rules.d"
+    install -m 0644 "$udev_rule_source" "/etc/udev/rules.d/99-aegis-removable.rules"
+    device_control_paths+=("/etc/udev/rules.d/99-aegis-removable.rules")
+    if command -v udevadm >/dev/null 2>&1; then
+      udevadm control --reload-rules >/dev/null 2>&1 || true
+    fi
+  fi
+
+  if [[ -f "$usbguard_policy_source" ]]; then
+    ensure_directory "/etc/usbguard"
+    install -m 0644 "$usbguard_policy_source" "/etc/usbguard/rules.conf"
+    device_control_paths+=("/etc/usbguard/rules.conf")
+  fi
+
+  if [[ -f "$mount_monitor_source" ]]; then
+    ensure_directory "$CONFIG_ROOT/device-control"
+    install -m 0644 "$mount_monitor_source" "$CONFIG_ROOT/device-control/mount-monitor.conf"
+    device_control_paths+=("$CONFIG_ROOT/device-control/mount-monitor.conf")
+  fi
+fi
+
 for entry in "${service_units[@]}"; do
   IFS=$'\t' read -r _ name unit_name required <<<"$entry"
   source_unit="$INSTALL_ROOT/systemd/$unit_name"
@@ -222,7 +252,7 @@ systemctl is-active --quiet aegis-watchdog.service
 
 "$watchdog_path" --once --state-root "$STATE_ROOT" >"$tmp_root/watchdog.json"
 
-python3 - "$STATE_ROOT/install-result.json" "$PAYLOAD_ROOT" "$INSTALL_ROOT" "$STATE_ROOT" "$config_path" "$MANIFEST_PATH" "$tmp_root/config.json" "$tmp_root/bootstrap.json" "$tmp_root/watchdog.json" "${copied_paths[*]}" "${installed_units[*]}" <<'PY'
+python3 - "$STATE_ROOT/install-result.json" "$PAYLOAD_ROOT" "$INSTALL_ROOT" "$STATE_ROOT" "$config_path" "$MANIFEST_PATH" "$tmp_root/config.json" "$tmp_root/bootstrap.json" "$tmp_root/watchdog.json" "${copied_paths[*]}" "${installed_units[*]}" "${device_control_paths[*]}" <<'PY'
 import json
 import pathlib
 import sys
@@ -239,6 +269,7 @@ bootstrap_report = json.loads(pathlib.Path(sys.argv[8]).read_text(encoding="utf-
 watchdog_report = json.loads(pathlib.Path(sys.argv[9]).read_text(encoding="utf-8"))
 copied_paths = [item for item in sys.argv[10].split(" ") if item]
 service_units = [item for item in sys.argv[11].split(" ") if item]
+device_control_paths = [item for item in sys.argv[12].split(" ") if item]
 
 payload = {
     "observed_at_ms": int(time.time() * 1000),
@@ -249,6 +280,7 @@ payload = {
     "manifest_path": manifest_path,
     "copied_paths": copied_paths,
     "service_units": service_units,
+    "device_control_paths": device_control_paths,
     "config_result": config_result,
     "bootstrap_report_path": str(pathlib.Path(state_root) / "bootstrap-check.json"),
     "watchdog_snapshot_path": str(pathlib.Path(state_root) / "watchdog-state.json"),

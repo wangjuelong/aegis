@@ -40,6 +40,13 @@
       "required": true
     },
     {
+      "name": "device_control_tree",
+      "kind": "metadata",
+      "source_relative_path": "device-control",
+      "install_relative_path": "device-control",
+      "required": true
+    },
+    {
       "name": "scripts_tree",
       "kind": "script",
       "source_relative_path": "scripts",
