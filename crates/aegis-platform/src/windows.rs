@@ -49,6 +49,8 @@ const WINDOWS_QUERY_SCRIPT_EVENTS_SCRIPT: &str =
     include_str!("../../../scripts/windows/query-script-events.ps1");
 const WINDOWS_QUERY_MEMORY_SNAPSHOT_SCRIPT: &str =
     include_str!("../../../scripts/windows/query-memory-snapshot.ps1");
+const WINDOWS_QUERY_MEMORY_REGIONS_SCRIPT: &str =
+    include_str!("../../../scripts/windows/query-memory-regions.ps1");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowsProviderKind {
@@ -218,6 +220,7 @@ struct WindowsHostCapabilities {
     has_amsi_scan_interface: bool,
     has_amsi_strict_blocking: bool,
     has_memory_inventory: bool,
+    has_memory_region_inventory: bool,
     has_named_pipe_inventory: bool,
     has_module_inventory: bool,
     has_vss_inventory: bool,
@@ -343,7 +346,7 @@ impl WindowsHostCapabilities {
         self.reachable
             && self.running_on_windows
             && self.has_process_inventory
-            && self.has_memory_inventory
+            && (self.has_memory_inventory || self.has_memory_region_inventory)
     }
 
     fn provider_health(&self, provider: WindowsProviderKind, running: bool) -> bool {
@@ -416,6 +419,10 @@ impl WindowsHostCapabilities {
             self.has_amsi_strict_blocking
         ));
         facts.push(format!("memory_inventory={}", self.has_memory_inventory));
+        facts.push(format!(
+            "memory_region_inventory={}",
+            self.has_memory_region_inventory
+        ));
         facts.push(format!("volume_inventory={}", self.has_volume_inventory));
         facts.push(self.driver_transport_summary());
         facts.push(format!(
@@ -508,6 +515,8 @@ struct WindowsCapabilityProbe {
     has_amsi_strict_blocking: bool,
     #[serde(default)]
     has_memory_inventory: bool,
+    #[serde(default)]
+    has_memory_region_inventory: bool,
     has_named_pipe_inventory: bool,
     has_module_inventory: bool,
     has_vss_inventory: bool,
@@ -894,6 +903,62 @@ struct WindowsMemorySnapshot {
     paged_memory_bytes: u64,
     #[serde(default)]
     path: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsMemoryRegionSnapshot {
+    process_id: u32,
+    process_name: String,
+    base_address: u64,
+    region_size: u64,
+    protection: String,
+    memory_type: String,
+    #[serde(default)]
+    mapped_path: Option<String>,
+    #[serde(default)]
+    sample_base64: Option<String>,
+}
+
+impl WindowsMemoryRegionSnapshot {
+    fn key(&self) -> String {
+        format!(
+            "{}|{:x}|{}|{}",
+            self.process_id, self.base_address, self.protection, self.memory_type
+        )
+    }
+
+    fn sample_sha256(&self) -> String {
+        let bytes = self
+            .sample_base64
+            .as_deref()
+            .and_then(|value| STANDARD.decode(value).ok())
+            .unwrap_or_default();
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn sample_text(&self) -> String {
+        self.sample_base64
+            .as_deref()
+            .and_then(|value| STANDARD.decode(value).ok())
+            .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+            .unwrap_or_default()
+    }
+
+    fn event_subject(&self) -> String {
+        truncate_subject(&format!(
+            "pid={};name={};region_base=0x{:x};region_size={};protection={};memory_type={};mapped_path={};sha256={}",
+            self.process_id,
+            self.process_name,
+            self.base_address,
+            self.region_size,
+            self.protection,
+            self.memory_type,
+            self.mapped_path.as_deref().unwrap_or("-"),
+            self.sample_sha256(),
+        ))
+    }
 }
 
 impl WindowsScriptAssessment {
@@ -1362,6 +1427,7 @@ struct WindowsState {
     script_block_cursor: Option<u64>,
     pending_script_blocks: BTreeMap<String, WindowsScriptBlockAssembly>,
     known_memory_processes: BTreeMap<u32, WindowsMemorySnapshot>,
+    known_memory_regions: BTreeMap<String, String>,
     known_connections: BTreeMap<String, WindowsNetworkConnection>,
     known_named_pipes: BTreeMap<String, WindowsNamedPipeSnapshot>,
     known_modules: BTreeMap<String, WindowsModuleSnapshot>,
@@ -1429,6 +1495,7 @@ impl WindowsPlatform {
                 script_block_cursor: None,
                 pending_script_blocks: BTreeMap::new(),
                 known_memory_processes: BTreeMap::new(),
+                known_memory_regions: BTreeMap::new(),
                 known_connections: BTreeMap::new(),
                 known_named_pipes: BTreeMap::new(),
                 known_modules: BTreeMap::new(),
@@ -1569,10 +1636,16 @@ impl PlatformSensor for WindowsPlatform {
             state.pending_script_blocks.clear();
         }
         if state.host.memory_sensor_ready() {
-            state.known_memory_processes = snapshot_memory_inventory(self.runner.as_ref())
-                .with_context(|| "snapshot initial windows memory inventory")?;
+            if state.host.has_memory_inventory {
+                state.known_memory_processes = snapshot_memory_inventory(self.runner.as_ref())
+                    .with_context(|| "snapshot initial windows memory inventory")?;
+            } else {
+                state.known_memory_processes.clear();
+            }
+            state.known_memory_regions.clear();
         } else {
             state.known_memory_processes.clear();
+            state.known_memory_regions.clear();
         }
         if state.host.has_net_connection {
             state.known_connections = snapshot_network_inventory(self.runner.as_ref())
@@ -2473,6 +2546,65 @@ if ((Get-Command Get-Process -ErrorAction SilentlyContinue) -ne $null) {
     }
 }
 
+$hasMemoryRegionInventory = $false
+if ($hasMemoryInventory) {
+    if (-not ("AegisProbe.MemoryBridge" -as [type])) {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+namespace AegisProbe {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MEMORY_BASIC_INFORMATION {
+        public IntPtr BaseAddress;
+        public IntPtr AllocationBase;
+        public UInt32 AllocationProtect;
+        public UIntPtr RegionSize;
+        public UInt32 State;
+        public UInt32 Protect;
+        public UInt32 Type;
+    }
+
+    public static class MemoryBridge {
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr OpenProcess(UInt32 desiredAccess, bool inheritHandle, UInt32 processId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr VirtualQueryEx(
+            IntPtr processHandle,
+            IntPtr address,
+            out MEMORY_BASIC_INFORMATION buffer,
+            UIntPtr length);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool CloseHandle(IntPtr handle);
+    }
+}
+"@ | Out-Null
+    }
+    try {
+        $PROCESS_QUERY_INFORMATION = 0x0400
+        $process = Get-Process -Id $PID -ErrorAction Stop
+        $handle = [AegisProbe.MemoryBridge]::OpenProcess([uint32]$PROCESS_QUERY_INFORMATION, $false, [uint32]$process.Id)
+        if ($handle -ne [IntPtr]::Zero) {
+            try {
+                $mbi = New-Object AegisProbe.MEMORY_BASIC_INFORMATION
+                $result = [AegisProbe.MemoryBridge]::VirtualQueryEx(
+                    $handle,
+                    [IntPtr]::Zero,
+                    [ref]$mbi,
+                    [System.UIntPtr]::new([uint64][System.Runtime.InteropServices.Marshal]::SizeOf([type]'AegisProbe.MEMORY_BASIC_INFORMATION'))
+                )
+                $hasMemoryRegionInventory = $result -ne [IntPtr]::Zero
+            } finally {
+                [void][AegisProbe.MemoryBridge]::CloseHandle($handle)
+            }
+        }
+    } catch {
+        $hasMemoryRegionInventory = $false
+    }
+}
+
 $hasNamedPipeInventory = $false
 try {
     $null = Get-ChildItem -Path '\\.\pipe\' -ErrorAction Stop | Select-Object -First 1
@@ -2661,6 +2793,7 @@ $data = [ordered]@{
     has_amsi_scan_interface = $hasAmsiScanInterface
     has_amsi_strict_blocking = $hasAmsiStrictBlocking
     has_memory_inventory = $hasMemoryInventory
+    has_memory_region_inventory = $hasMemoryRegionInventory
     has_named_pipe_inventory = $hasNamedPipeInventory
     has_module_inventory = $hasModuleInventory
     has_vss_inventory = $hasVssInventory
@@ -2705,6 +2838,7 @@ $data | ConvertTo-Json -Compress
         has_amsi_scan_interface: probe.has_amsi_scan_interface,
         has_amsi_strict_blocking: probe.has_amsi_strict_blocking,
         has_memory_inventory: probe.has_memory_inventory,
+        has_memory_region_inventory: probe.has_memory_region_inventory,
         has_named_pipe_inventory: probe.has_named_pipe_inventory,
         has_module_inventory: probe.has_module_inventory,
         has_vss_inventory: probe.has_vss_inventory,
@@ -3781,69 +3915,161 @@ fn collect_memory_events(
     const MIN_PRIVATE_DELTA_BYTES: u64 = 16 * 1024 * 1024;
     const HOT_PRIVATE_BYTES: u64 = 64 * 1024 * 1024;
 
-    let current = snapshot_memory_inventory(runner)?;
-    for (pid, sample) in &current {
-        match state.known_memory_processes.get(pid) {
-            Some(previous) => {
-                let private_delta = sample
-                    .private_memory_bytes
-                    .saturating_sub(previous.private_memory_bytes);
-                let working_delta = sample
-                    .working_set_bytes
-                    .saturating_sub(previous.working_set_bytes);
-                let grew_enough = if previous.private_memory_bytes == 0 {
-                    sample.private_memory_bytes >= HOT_PRIVATE_BYTES
-                } else {
-                    sample.private_memory_bytes.saturating_mul(100)
-                        >= previous.private_memory_bytes.saturating_mul(125)
-                };
-                if sample.private_memory_bytes >= MIN_PRIVATE_BYTES
-                    && private_delta >= MIN_PRIVATE_DELTA_BYTES
-                    && grew_enough
-                {
-                    state.pending_events.push_back(
-                        WindowsEventStub {
-                            provider: WindowsProviderKind::MemorySensor,
-                            operation: "memory-growth".to_string(),
-                            subject: truncate_subject(&format!(
-                                "pid={};name={};private_memory_bytes={};private_delta_bytes={};working_set_bytes={};working_delta_bytes={};path={}",
-                                sample.process_id,
-                                sample.process_name,
-                                sample.private_memory_bytes,
-                                private_delta,
-                                sample.working_set_bytes,
-                                working_delta,
-                                sample.path.as_deref().unwrap_or("-")
-                            )),
-                        }
-                        .encode(),
-                    );
+    if state.host.has_memory_inventory {
+        let current = snapshot_memory_inventory(runner)?;
+        for (pid, sample) in &current {
+            match state.known_memory_processes.get(pid) {
+                Some(previous) => {
+                    let private_delta = sample
+                        .private_memory_bytes
+                        .saturating_sub(previous.private_memory_bytes);
+                    let working_delta = sample
+                        .working_set_bytes
+                        .saturating_sub(previous.working_set_bytes);
+                    let grew_enough = if previous.private_memory_bytes == 0 {
+                        sample.private_memory_bytes >= HOT_PRIVATE_BYTES
+                    } else {
+                        sample.private_memory_bytes.saturating_mul(100)
+                            >= previous.private_memory_bytes.saturating_mul(125)
+                    };
+                    if sample.private_memory_bytes >= MIN_PRIVATE_BYTES
+                        && private_delta >= MIN_PRIVATE_DELTA_BYTES
+                        && grew_enough
+                    {
+                        state.pending_events.push_back(
+                            WindowsEventStub {
+                                provider: WindowsProviderKind::MemorySensor,
+                                operation: "memory-growth".to_string(),
+                                subject: truncate_subject(&format!(
+                                    "pid={};name={};private_memory_bytes={};private_delta_bytes={};working_set_bytes={};working_delta_bytes={};path={}",
+                                    sample.process_id,
+                                    sample.process_name,
+                                    sample.private_memory_bytes,
+                                    private_delta,
+                                    sample.working_set_bytes,
+                                    working_delta,
+                                    sample.path.as_deref().unwrap_or("-")
+                                )),
+                            }
+                            .encode(),
+                        );
+                    }
                 }
-            }
-            None => {
-                if sample.private_memory_bytes >= HOT_PRIVATE_BYTES {
-                    state.pending_events.push_back(
-                        WindowsEventStub {
-                            provider: WindowsProviderKind::MemorySensor,
-                            operation: "memory-hot".to_string(),
-                            subject: truncate_subject(&format!(
-                                "pid={};name={};private_memory_bytes={};working_set_bytes={};path={}",
-                                sample.process_id,
-                                sample.process_name,
-                                sample.private_memory_bytes,
-                                sample.working_set_bytes,
-                                sample.path.as_deref().unwrap_or("-")
-                            )),
-                        }
-                        .encode(),
-                    );
+                None => {
+                    if sample.private_memory_bytes >= HOT_PRIVATE_BYTES {
+                        state.pending_events.push_back(
+                            WindowsEventStub {
+                                provider: WindowsProviderKind::MemorySensor,
+                                operation: "memory-hot".to_string(),
+                                subject: truncate_subject(&format!(
+                                    "pid={};name={};private_memory_bytes={};working_set_bytes={};path={}",
+                                    sample.process_id,
+                                    sample.process_name,
+                                    sample.private_memory_bytes,
+                                    sample.working_set_bytes,
+                                    sample.path.as_deref().unwrap_or("-")
+                                )),
+                            }
+                            .encode(),
+                        );
+                    }
                 }
             }
         }
+
+        state.known_memory_processes = current;
     }
 
-    state.known_memory_processes = current;
+    if state.host.has_memory_region_inventory {
+        let current_regions = snapshot_memory_region_inventory(runner)?;
+        let mut known_regions = BTreeMap::new();
+        for region in &current_regions {
+            let hash = region.sample_sha256();
+            let key = region.key();
+            known_regions.insert(key.clone(), hash.clone());
+            if state.known_memory_regions.get(&key) == Some(&hash) {
+                continue;
+            }
+
+            if region.memory_type.eq_ignore_ascii_case("private")
+                && region.protection.contains("EXECUTE")
+            {
+                state.pending_events.push_back(
+                    WindowsEventStub {
+                        provider: WindowsProviderKind::MemorySensor,
+                        operation: "memory-private-exec".to_string(),
+                        subject: region.event_subject(),
+                    }
+                    .encode(),
+                );
+            }
+            if region.protection.contains("EXECUTE_READWRITE")
+                || region.protection.contains("EXECUTE_WRITECOPY")
+            {
+                state.pending_events.push_back(
+                    WindowsEventStub {
+                        provider: WindowsProviderKind::MemorySensor,
+                        operation: "memory-rwx".to_string(),
+                        subject: region.event_subject(),
+                    }
+                    .encode(),
+                );
+            }
+            if region.memory_type.eq_ignore_ascii_case("image")
+                && region
+                    .mapped_path
+                    .as_deref()
+                    .map(|value| value.trim().is_empty())
+                    .unwrap_or(true)
+            {
+                state.pending_events.push_back(
+                    WindowsEventStub {
+                        provider: WindowsProviderKind::MemorySensor,
+                        operation: "memory-image-anomaly".to_string(),
+                        subject: region.event_subject(),
+                    }
+                    .encode(),
+                );
+            }
+
+            for rule_name in windows_memory_yara_matches(region) {
+                state.pending_events.push_back(
+                    WindowsEventStub {
+                        provider: WindowsProviderKind::MemorySensor,
+                        operation: "memory-yara-match".to_string(),
+                        subject: truncate_subject(&format!(
+                            "{};yara_rule={}",
+                            region.event_subject(),
+                            rule_name
+                        )),
+                    }
+                    .encode(),
+                );
+            }
+        }
+        state.known_memory_regions = known_regions;
+    }
     Ok(())
+}
+
+fn windows_memory_yara_matches(region: &WindowsMemoryRegionSnapshot) -> Vec<&'static str> {
+    let content = region.sample_text().to_ascii_lowercase();
+    let mut matches = Vec::new();
+    if content.contains("mimikatz") || content.contains("sekurlsa") {
+        matches.push("CredentialAccess");
+    }
+    if content.contains("reflectiveloader")
+        || content.contains("beacon")
+        || content.contains("meterpreter")
+        || content.contains("amsiutils")
+        || content.contains("virtualalloc")
+    {
+        matches.push("SuspiciousMemoryPayload");
+    }
+    if region.memory_type.eq_ignore_ascii_case("private") && content.starts_with("mz") {
+        matches.push("PrivatePeImage");
+    }
+    matches
 }
 
 fn collect_process_delta_events(
@@ -4658,6 +4884,12 @@ fn snapshot_memory_inventory(
         .into_iter()
         .map(|sample| (sample.process_id, sample))
         .collect())
+}
+
+fn snapshot_memory_region_inventory(
+    runner: &dyn WindowsCommandRunner,
+) -> Result<Vec<WindowsMemoryRegionSnapshot>> {
+    run_embedded_powershell_json(runner, WINDOWS_QUERY_MEMORY_REGIONS_SCRIPT, &[])
 }
 
 fn snapshot_tasklist_inventory(
@@ -5608,6 +5840,7 @@ mod tests {
     };
     use aegis_model::{EventBuffer, ForensicSpec, IsolationRulesV2, RollbackTarget, SensorConfig};
     use anyhow::{anyhow, bail, Result};
+    use base64::Engine as _;
     use std::collections::VecDeque;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -5680,6 +5913,7 @@ mod tests {
             has_amsi_scan_interface: false,
             has_amsi_strict_blocking: false,
             has_memory_inventory: false,
+            has_memory_region_inventory: false,
             has_named_pipe_inventory: false,
             has_module_inventory: false,
             has_vss_inventory: false,
@@ -5830,7 +6064,7 @@ mod tests {
                 r#""has_process_creation_events":true,"has_auth_audit_events":false,"has_net_connection":true,"has_firewall":true,"#,
                 r#""has_dns_client_operational_log":false,"dns_client_operational_log_enabled":false,"has_schannel_system_log":false,"#,
                 r#""has_registry_cli":true,"has_amsi_runtime":{},"has_script_block_logging":{},"#,
-                r#""has_amsi_scan_interface":false,"has_amsi_strict_blocking":false,"has_memory_inventory":false,"#,
+                r#""has_amsi_scan_interface":false,"has_amsi_strict_blocking":false,"has_memory_inventory":false,"has_memory_region_inventory":false,"#,
                 r#""has_named_pipe_inventory":{},"has_module_inventory":{},"has_vss_inventory":{},"#,
                 r#""has_device_inventory":{}}}"#
             ),
@@ -5858,7 +6092,7 @@ mod tests {
                 r#""has_process_creation_events":true,"has_auth_audit_events":false,"has_net_connection":true,"has_firewall":true,"#,
                 r#""has_dns_client_operational_log":false,"dns_client_operational_log_enabled":false,"has_schannel_system_log":false,"#,
                 r#""has_registry_cli":true,"has_amsi_runtime":{},"has_script_block_logging":{},"#,
-                r#""has_amsi_scan_interface":{},"has_amsi_strict_blocking":{},"has_memory_inventory":{},"#,
+                r#""has_amsi_scan_interface":{},"has_amsi_strict_blocking":{},"has_memory_inventory":{},"has_memory_region_inventory":false,"#,
                 r#""has_named_pipe_inventory":false,"has_module_inventory":false,"has_vss_inventory":false,"#,
                 r#""has_device_inventory":false}}"#
             ),
@@ -6304,6 +6538,54 @@ mod tests {
                     format!(
                         "{{\"process_id\":{process_id},\"process_name\":\"{}\",\"working_set_bytes\":{working_set_bytes},\"private_memory_bytes\":{private_memory_bytes},\"virtual_memory_bytes\":{virtual_memory_bytes},\"paged_memory_bytes\":{paged_memory_bytes},\"path\":{path}}}",
                         process_name.replace('\\', "\\\\").replace('"', "\\\"")
+                    )
+                },
+            )
+            .collect::<Vec<_>>();
+        format!("[{}]", rows.join(","))
+    }
+
+    fn memory_region_output(
+        entries: &[(
+            u32,
+            &str,
+            u64,
+            u64,
+            &str,
+            &str,
+            Option<&str>,
+            Option<&str>,
+        )],
+    ) -> String {
+        let rows = entries
+            .iter()
+            .map(
+                |(
+                    process_id,
+                    process_name,
+                    base_address,
+                    region_size,
+                    protection,
+                    memory_type,
+                    mapped_path,
+                    sample_text,
+                )| {
+                    let mapped_path = mapped_path
+                        .map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+                        .unwrap_or_else(|| "null".to_string());
+                    let sample_base64 = sample_text
+                        .map(|value| {
+                            format!(
+                                "\"{}\"",
+                                base64::engine::general_purpose::STANDARD.encode(value.as_bytes())
+                            )
+                        })
+                        .unwrap_or_else(|| "null".to_string());
+                    format!(
+                        "{{\"process_id\":{process_id},\"process_name\":\"{}\",\"base_address\":{base_address},\"region_size\":{region_size},\"protection\":\"{}\",\"memory_type\":\"{}\",\"mapped_path\":{mapped_path},\"sample_base64\":{sample_base64}}}",
+                        process_name.replace('\\', "\\\\").replace('"', "\\\""),
+                        protection.replace('\\', "\\\\").replace('"', "\\\""),
+                        memory_type.replace('\\', "\\\\").replace('"', "\\\""),
                     )
                 },
             )
@@ -7471,6 +7753,118 @@ mod tests {
             event.contains("MemorySensor")
                 && event.contains("memory-growth")
                 && event.contains("private_delta_bytes=")
+        }));
+    }
+
+    #[test]
+    fn windows_poll_events_emits_memory_region_and_yara_signals() {
+        let mut host = healthy_host();
+        host.has_memory_inventory = true;
+        host.has_memory_region_inventory = true;
+        host.has_process_creation_events = false;
+        host.has_net_connection = false;
+
+        let mut platform = WindowsPlatform::with_runner_for_test(
+            Box::new(QueuedWindowsRunner::new([
+                process_output_with_image(&[(
+                    "powershell.exe",
+                    4242,
+                    640,
+                    Some("powershell.exe -NoProfile"),
+                    Some(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+                    Some("Valid"),
+                    Some("CN=Microsoft Windows"),
+                )]),
+                memory_output(&[(
+                    4242,
+                    "powershell",
+                    12 * 1024 * 1024,
+                    8 * 1024 * 1024,
+                    64 * 1024 * 1024,
+                    4 * 1024 * 1024,
+                    Some(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+                )]),
+                process_output_with_image(&[(
+                    "powershell.exe",
+                    4242,
+                    640,
+                    Some("powershell.exe -NoProfile"),
+                    Some(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+                    Some("Valid"),
+                    Some("CN=Microsoft Windows"),
+                )]),
+                memory_output(&[(
+                    4242,
+                    "powershell",
+                    12 * 1024 * 1024,
+                    8 * 1024 * 1024,
+                    64 * 1024 * 1024,
+                    4 * 1024 * 1024,
+                    Some(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+                )]),
+                memory_region_output(&[
+                    (
+                        4242,
+                        "powershell",
+                        0x100000,
+                        4096,
+                        "EXECUTE_READWRITE",
+                        "private",
+                        None,
+                        Some("ReflectiveLoader MZ"),
+                    ),
+                    (
+                        4242,
+                        "powershell",
+                        0x200000,
+                        4096,
+                        "EXECUTE_READ",
+                        "image",
+                        None,
+                        Some("benign"),
+                    ),
+                ]),
+            ])),
+            host,
+        );
+        platform
+            .start(&SensorConfig {
+                profile: "windows".to_string(),
+                queue_capacity: 1024,
+                require_kernel_driver: false,
+            })
+            .expect("start windows runtime");
+
+        let mut buffer = EventBuffer::default();
+        let drained = platform
+            .poll_events(&mut buffer)
+            .expect("poll memory region telemetry");
+
+        assert_eq!(drained, 4);
+        let events = buffer
+            .records
+            .iter()
+            .map(|record| String::from_utf8(record.clone()).expect("event utf8"))
+            .collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            event.contains("MemorySensor")
+                && event.contains("memory-private-exec")
+                && event.contains("region_base=0x100000")
+        }));
+        assert!(events.iter().any(|event| {
+            event.contains("MemorySensor")
+                && event.contains("memory-rwx")
+                && event.contains("region_base=0x100000")
+        }));
+        assert!(events.iter().any(|event| {
+            event.contains("MemorySensor")
+                && event.contains("memory-yara-match")
+                && event.contains("SuspiciousMemoryPayload")
+        }));
+        assert!(events.iter().any(|event| {
+            event.contains("MemorySensor")
+                && event.contains("memory-image-anomaly")
+                && event.contains("region_base=0x200000")
         }));
     }
 
