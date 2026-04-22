@@ -222,6 +222,7 @@ struct WindowsHostCapabilities {
     has_module_inventory: bool,
     has_vss_inventory: bool,
     has_device_inventory: bool,
+    has_volume_inventory: bool,
     has_driver_service: bool,
     has_driver_service_running: bool,
     has_driver_control_device: bool,
@@ -368,7 +369,7 @@ impl WindowsHostCapabilities {
             WindowsProviderKind::IpcSensor => self.has_named_pipe_inventory,
             WindowsProviderKind::ModuleLoadSensor => self.has_module_inventory,
             WindowsProviderKind::SnapshotProtection => self.has_vss_inventory,
-            WindowsProviderKind::DeviceControl => self.has_device_inventory,
+            WindowsProviderKind::DeviceControl => self.has_device_inventory || self.has_volume_inventory,
         }
     }
 
@@ -415,6 +416,7 @@ impl WindowsHostCapabilities {
             self.has_amsi_strict_blocking
         ));
         facts.push(format!("memory_inventory={}", self.has_memory_inventory));
+        facts.push(format!("volume_inventory={}", self.has_volume_inventory));
         facts.push(self.driver_transport_summary());
         facts.push(format!(
             "file_monitor={};file_protocol={};file_queue={};protected_paths={};blocks={};hash_blocks={};pid_blocks={};path_blocks={};file_detail={}",
@@ -510,6 +512,8 @@ struct WindowsCapabilityProbe {
     has_module_inventory: bool,
     has_vss_inventory: bool,
     has_device_inventory: bool,
+    #[serde(default)]
+    has_volume_inventory: bool,
     #[serde(default)]
     has_driver_service: bool,
     #[serde(default)]
@@ -1260,6 +1264,34 @@ impl WindowsDeviceSnapshot {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsVolumeSnapshot {
+    #[serde(default)]
+    drive_letter: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    file_system_label: Option<String>,
+}
+
+impl WindowsVolumeSnapshot {
+    fn key(&self) -> String {
+        self.path
+            .clone()
+            .or_else(|| self.drive_letter.clone())
+            .unwrap_or_default()
+    }
+
+    fn subject(&self) -> String {
+        truncate_subject(&format!(
+            "drive_letter={};path={};label={}",
+            self.drive_letter.as_deref().unwrap_or("-"),
+            self.path.as_deref().unwrap_or("-"),
+            self.file_system_label.as_deref().unwrap_or("-")
+        ))
+    }
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 struct WindowsProtectionSurfaceArtifact {
     protected_pids: Vec<u32>,
@@ -1335,6 +1367,7 @@ struct WindowsState {
     known_modules: BTreeMap<String, WindowsModuleSnapshot>,
     known_vss_snapshots: BTreeMap<String, WindowsVssSnapshot>,
     known_devices: BTreeMap<String, WindowsDeviceSnapshot>,
+    known_volumes: BTreeMap<String, WindowsVolumeSnapshot>,
     file_monitor_cursor: Option<u32>,
     registry_monitor_cursor: Option<u32>,
     firewall_backup_path: Option<String>,
@@ -1401,6 +1434,7 @@ impl WindowsPlatform {
                 known_modules: BTreeMap::new(),
                 known_vss_snapshots: BTreeMap::new(),
                 known_devices: BTreeMap::new(),
+                known_volumes: BTreeMap::new(),
                 file_monitor_cursor: None,
                 registry_monitor_cursor: None,
                 firewall_backup_path: None,
@@ -1569,6 +1603,12 @@ impl PlatformSensor for WindowsPlatform {
                 .with_context(|| "snapshot initial windows device inventory")?;
         } else {
             state.known_devices.clear();
+        }
+        if state.host.has_volume_inventory {
+            state.known_volumes = snapshot_volume_inventory(self.runner.as_ref())
+                .with_context(|| "snapshot initial windows volume inventory")?;
+        } else {
+            state.known_volumes.clear();
         }
         state.file_monitor_cursor = state.host.file_monitor_current_sequence;
         state.registry_monitor_cursor = state.host.registry_current_sequence;
@@ -2474,6 +2514,16 @@ if ((Get-Command Get-PnpDevice -ErrorAction SilentlyContinue) -ne $null) {
     }
 }
 
+$hasVolumeInventory = $false
+if ((Get-Command Get-Volume -ErrorAction SilentlyContinue) -ne $null) {
+    try {
+        $null = Get-Volume -ErrorAction Stop | Select-Object -First 1
+        $hasVolumeInventory = $true
+    } catch {
+        $hasVolumeInventory = $false
+    }
+}
+
 if (-not ("AegisProbe.DriverBridge" -as [type])) {
     Add-Type -TypeDefinition @"
 using System;
@@ -2615,6 +2665,7 @@ $data = [ordered]@{
     has_module_inventory = $hasModuleInventory
     has_vss_inventory = $hasVssInventory
     has_device_inventory = $hasDeviceInventory
+    has_volume_inventory = $hasVolumeInventory
     has_driver_service = $hasDriverService
     has_driver_service_running = $hasDriverServiceRunning
     has_driver_control_device = $hasDriverControlDevice
@@ -2658,6 +2709,7 @@ $data | ConvertTo-Json -Compress
         has_module_inventory: probe.has_module_inventory,
         has_vss_inventory: probe.has_vss_inventory,
         has_device_inventory: probe.has_device_inventory,
+        has_volume_inventory: probe.has_volume_inventory,
         has_driver_service: probe.has_driver_service,
         has_driver_service_running: probe.has_driver_service_running,
         has_driver_control_device: probe.has_driver_control_device,
@@ -3206,6 +3258,24 @@ fn file_monitor_event_subject(event: &WindowsFileMonitorEvent) -> String {
     ))
 }
 
+fn windows_pipe_name_from_path(path: &str) -> Option<String> {
+    let normalized = path.replace('/', "\\");
+    let lowered = normalized.to_ascii_lowercase();
+    if let Some(index) = lowered.find("\\device\\namedpipe\\") {
+        let suffix = &normalized[index + "\\Device\\NamedPipe\\".len()..];
+        if !suffix.is_empty() {
+            return Some(format!(r"\\.\pipe\{}", suffix.trim_start_matches('\\')));
+        }
+    }
+    if let Some(index) = lowered.find("\\\\.\\pipe\\") {
+        let suffix = &normalized[index + "\\\\.\\pipe\\".len()..];
+        if !suffix.is_empty() {
+            return Some(format!(r"\\.\pipe\{}", suffix.trim_start_matches('\\')));
+        }
+    }
+    None
+}
+
 fn registry_monitor_event_subject(event: &WindowsRegistryMonitorEvent) -> String {
     truncate_subject(&format!(
         "sequence={};operation={};blocked={};key={};value={};old={};new={}",
@@ -3315,6 +3385,27 @@ fn collect_file_monitor_events(
             }
             .encode(),
         );
+        if let Some(pipe_name) = windows_pipe_name_from_path(&event.path) {
+            let pipe_operation = match event.operation.as_str() {
+                "open" | "block-create" => Some("pipe-open"),
+                "write" | "block-write" => Some("pipe-write"),
+                "delete" | "block-delete" => Some("pipe-delete"),
+                _ => None,
+            };
+            if let Some(pipe_operation) = pipe_operation {
+                state.pending_events.push_back(
+                    WindowsEventStub {
+                        provider: WindowsProviderKind::IpcSensor,
+                        operation: pipe_operation.to_string(),
+                        subject: truncate_subject(&format!(
+                            "sequence={};pid={};pipe={};source_operation={}",
+                            event.sequence, event.process_id, pipe_name, event.operation
+                        )),
+                    }
+                    .encode(),
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -3415,6 +3506,9 @@ fn collect_live_windows_events(
     }
     if state.host.has_device_inventory {
         collect_device_events(state, runner)?;
+    }
+    if state.host.has_volume_inventory {
+        collect_volume_events(state, runner)?;
     }
     Ok(())
 }
@@ -3965,6 +4059,14 @@ fn collect_vss_events(state: &mut WindowsState, runner: &dyn WindowsCommandRunne
                 }
                 .encode(),
             );
+            state.pending_events.push_back(
+                WindowsEventStub {
+                    provider: WindowsProviderKind::SnapshotProtection,
+                    operation: "shadow-create".to_string(),
+                    subject: snapshot.subject(),
+                }
+                .encode(),
+            );
         }
     }
 
@@ -3974,6 +4076,14 @@ fn collect_vss_events(state: &mut WindowsState, runner: &dyn WindowsCommandRunne
                 WindowsEventStub {
                     provider: WindowsProviderKind::SnapshotProtection,
                     operation: "shadow-gone".to_string(),
+                    subject: snapshot.subject(),
+                }
+                .encode(),
+            );
+            state.pending_events.push_back(
+                WindowsEventStub {
+                    provider: WindowsProviderKind::SnapshotProtection,
+                    operation: "shadow-delete".to_string(),
                     subject: snapshot.subject(),
                 }
                 .encode(),
@@ -4017,6 +4127,57 @@ fn collect_device_events(
     }
 
     state.known_devices = current;
+    Ok(())
+}
+
+fn collect_volume_events(
+    state: &mut WindowsState,
+    runner: &dyn WindowsCommandRunner,
+) -> Result<()> {
+    let current = snapshot_volume_inventory(runner)?;
+    for (key, volume) in &current {
+        if !state.known_volumes.contains_key(key) {
+            state.pending_events.push_back(
+                WindowsEventStub {
+                    provider: WindowsProviderKind::DeviceControl,
+                    operation: "device-mount-add".to_string(),
+                    subject: volume.subject(),
+                }
+                .encode(),
+            );
+        }
+    }
+
+    for (key, volume) in &state.known_volumes {
+        if !current.contains_key(key) {
+            state.pending_events.push_back(
+                WindowsEventStub {
+                    provider: WindowsProviderKind::DeviceControl,
+                    operation: "device-mount-remove".to_string(),
+                    subject: volume.subject(),
+                }
+                .encode(),
+            );
+        }
+    }
+
+    for (key, volume) in &current {
+        let Some(previous) = state.known_volumes.get(key) else {
+            continue;
+        };
+        if previous.file_system_label != volume.file_system_label {
+            state.pending_events.push_back(
+                WindowsEventStub {
+                    provider: WindowsProviderKind::DeviceControl,
+                    operation: "device-mount-change".to_string(),
+                    subject: volume.subject(),
+                }
+                .encode(),
+            );
+        }
+    }
+
+    state.known_volumes = current;
     Ok(())
 }
 
@@ -4460,6 +4621,31 @@ $rows = @(
     Ok(rows
         .into_iter()
         .map(|device| (device.instance_id.clone(), device))
+        .collect())
+}
+
+fn snapshot_volume_inventory(
+    runner: &dyn WindowsCommandRunner,
+) -> Result<BTreeMap<String, WindowsVolumeSnapshot>> {
+    let script = r#"
+$rows = @(
+    Get-Volume -ErrorAction Stop |
+        Sort-Object DriveLetter, Path |
+        ForEach-Object {
+            [ordered]@{
+                drive_letter = if ($_.DriveLetter) { [string]$_.DriveLetter } else { $null }
+                path = if ($_.Path) { [string]$_.Path } else { $null }
+                file_system_label = if ($_.FileSystemLabel) { [string]$_.FileSystemLabel } else { $null }
+            }
+        }
+)
+
+@($rows) | ConvertTo-Json -Compress
+"#;
+    let rows: Vec<WindowsVolumeSnapshot> = run_powershell_json(runner, script)?;
+    Ok(rows
+        .into_iter()
+        .map(|volume| (volume.key(), volume))
         .collect())
 }
 
@@ -5498,6 +5684,7 @@ mod tests {
             has_module_inventory: false,
             has_vss_inventory: false,
             has_device_inventory: false,
+            has_volume_inventory: false,
             has_driver_service: false,
             has_driver_service_running: false,
             has_driver_control_device: false,
@@ -6018,6 +6205,25 @@ mod tests {
                 format!(
                     "{{\"instance_id\":\"{}\",\"class\":{class},\"friendly_name\":{friendly_name},\"status\":{status}}}",
                     instance_id.replace('\\', "\\\\").replace('"', "\\\"")
+                )
+            })
+            .collect::<Vec<_>>();
+        format!("[{}]", rows.join(","))
+    }
+
+    fn volume_output(entries: &[(Option<&str>, Option<&str>, Option<&str>)]) -> String {
+        let rows = entries
+            .iter()
+            .map(|(drive_letter, path, file_system_label)| {
+                let encode = |value: Option<&str>| {
+                    value.map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+                        .unwrap_or_else(|| "null".to_string())
+                };
+                format!(
+                    "{{\"drive_letter\":{},\"path\":{},\"file_system_label\":{}}}",
+                    encode(*drive_letter),
+                    encode(*path),
+                    encode(*file_system_label),
                 )
             })
             .collect::<Vec<_>>();
@@ -7802,7 +8008,7 @@ mod tests {
             .poll_events(&mut buffer)
             .expect("poll asset visibility events");
 
-        assert_eq!(drained, 4);
+        assert_eq!(drained, 5);
         let events = buffer
             .records
             .iter()
@@ -7824,9 +8030,118 @@ mod tests {
                 && event.contains(r"{22222222-2222-2222-2222-222222222222}")
         }));
         assert!(events.iter().any(|event| {
+            event.contains("SnapshotProtection")
+                && event.contains("shadow-create")
+                && event.contains(r"{22222222-2222-2222-2222-222222222222}")
+        }));
+        assert!(events.iter().any(|event| {
             event.contains("DeviceControl")
                 && event.contains("device-visible")
                 && event.contains("YubiKey")
+        }));
+    }
+
+    #[test]
+    fn windows_poll_events_emits_pipe_vss_and_mount_behavior() {
+        let mut host = healthy_host_with_driver_surfaces();
+        host.has_named_pipe_inventory = true;
+        host.has_vss_inventory = true;
+        host.has_device_inventory = true;
+        host.has_volume_inventory = true;
+        host.has_process_creation_events = false;
+        host.registry_callback_registered = false;
+
+        let mut platform = WindowsPlatform::with_runner_for_test(
+            Box::new(QueuedWindowsRunner::new([
+                process_output(&[("System", 4, 0, None)]),
+                network_output(&[]),
+                named_pipe_output(&[r"\\.\pipe\svcctl"]),
+                vss_output(&[(
+                    r"{11111111-1111-1111-1111-111111111111}",
+                    Some(r"\\?\Volume{aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa}\"),
+                )]),
+                device_output(&[(
+                    r"USB\VID_0781&PID_5581\000000000001",
+                    Some("USB"),
+                    Some("SanDisk USB"),
+                    Some("OK"),
+                )]),
+                volume_output(&[(Some("C"), Some("\\\\?\\Volume{system}\\"), Some("System"))]),
+                file_events_output(
+                    1201,
+                    256,
+                    &[(
+                        1201,
+                        1713612010,
+                        4242,
+                        "write",
+                        r"\Device\NamedPipe\msagent_1234",
+                    )],
+                ),
+                process_output(&[("System", 4, 0, None)]),
+                network_output(&[]),
+                named_pipe_output(&[r"\\.\pipe\svcctl"]),
+                vss_output(&[
+                    (
+                        r"{11111111-1111-1111-1111-111111111111}",
+                        Some(r"\\?\Volume{aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa}\"),
+                    ),
+                    (
+                        r"{22222222-2222-2222-2222-222222222222}",
+                        Some(r"\\?\Volume{bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb}\"),
+                    ),
+                ]),
+                device_output(&[(
+                    r"USB\VID_0781&PID_5581\000000000001",
+                    Some("USB"),
+                    Some("SanDisk USB"),
+                    Some("OK"),
+                )]),
+                volume_output(&[
+                    (Some("C"), Some("\\\\?\\Volume{system}\\"), Some("System")),
+                    (Some("E"), Some("\\\\?\\Volume{usb}\\"), Some("AegisUSB")),
+                ]),
+            ])),
+            host,
+        );
+        platform
+            .start(&SensorConfig {
+                profile: "windows".to_string(),
+                queue_capacity: 1024,
+                require_kernel_driver: false,
+            })
+            .expect("start windows runtime");
+
+        let mut buffer = EventBuffer::default();
+        let drained = platform
+            .poll_events(&mut buffer)
+            .expect("poll pipe vss and mount behavior");
+
+        assert_eq!(drained, 5);
+        let events = buffer
+            .records
+            .iter()
+            .map(|record| String::from_utf8(record.clone()).expect("event utf8"))
+            .collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            event.contains("IpcSensor")
+                && event.contains("pipe-write")
+                && event.contains(r"\\.\pipe\msagent_1234")
+        }));
+        assert!(events.iter().any(|event| {
+            event.contains("SnapshotProtection")
+                && event.contains("shadow-create")
+                && event.contains(r"{22222222-2222-2222-2222-222222222222}")
+        }));
+        assert!(events.iter().any(|event| {
+            event.contains("SnapshotProtection")
+                && event.contains("shadow-visible")
+                && event.contains(r"{22222222-2222-2222-2222-222222222222}")
+        }));
+        assert!(events.iter().any(|event| {
+            event.contains("DeviceControl")
+                && event.contains("device-mount-add")
+                && event.contains("AegisUSB")
         }));
     }
 
