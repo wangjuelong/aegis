@@ -54,6 +54,7 @@ const WINDOWS_QUERY_MEMORY_SNAPSHOT_SCRIPT: &str =
 pub enum WindowsProviderKind {
     EtwProcess,
     PsProcess,
+    AuthAudit,
     ObProcess,
     MinifilterFile,
     WfpNetwork,
@@ -203,6 +204,7 @@ struct WindowsHostCapabilities {
     has_task_scheduler_log: bool,
     has_sysmon_log: bool,
     has_process_creation_events: bool,
+    has_auth_audit_events: bool,
     has_net_connection: bool,
     has_firewall: bool,
     has_registry_cli: bool,
@@ -313,6 +315,13 @@ impl WindowsHostCapabilities {
             && self.has_amsi_strict_blocking
     }
 
+    fn auth_sensor_ready(&self) -> bool {
+        self.reachable
+            && self.running_on_windows
+            && self.has_security_log
+            && self.has_auth_audit_events
+    }
+
     fn memory_sensor_ready(&self) -> bool {
         self.reachable
             && self.running_on_windows
@@ -330,6 +339,7 @@ impl WindowsHostCapabilities {
                 self.any_event_log() && self.has_process_creation_events
             }
             WindowsProviderKind::PsProcess => self.has_process_inventory,
+            WindowsProviderKind::AuthAudit => self.auth_sensor_ready(),
             WindowsProviderKind::ObProcess => self.process_protection_ready(),
             WindowsProviderKind::MinifilterFile => self.file_monitor_ready(),
             WindowsProviderKind::WfpNetwork => self.has_net_connection,
@@ -365,6 +375,7 @@ impl WindowsHostCapabilities {
             "process_creation_audit={}",
             self.has_process_creation_events
         ));
+        facts.push(format!("auth_audit={}", self.has_auth_audit_events));
         facts.push(format!("amsi_runtime={}", self.has_amsi_runtime));
         facts.push(format!(
             "script_block_logging={}",
@@ -449,6 +460,8 @@ struct WindowsCapabilityProbe {
     has_task_scheduler_log: bool,
     has_sysmon_log: bool,
     has_process_creation_events: bool,
+    #[serde(default)]
+    has_auth_audit_events: bool,
     has_net_connection: bool,
     has_firewall: bool,
     has_registry_cli: bool,
@@ -535,6 +548,88 @@ impl WindowsProcessSnapshot {
 struct WindowsTasklistSnapshot {
     process_id: u32,
     image_name: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsAuthAuditCursor {
+    record_id: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct WindowsAuthEvent {
+    record_id: u64,
+    event_id: u32,
+    #[serde(default)]
+    target_user: Option<String>,
+    #[serde(default)]
+    target_domain: Option<String>,
+    #[serde(default)]
+    subject_user: Option<String>,
+    #[serde(default)]
+    subject_domain: Option<String>,
+    #[serde(default)]
+    logon_type: Option<String>,
+    #[serde(default)]
+    logon_process: Option<String>,
+    #[serde(default)]
+    authentication_package: Option<String>,
+    #[serde(default)]
+    source_ip: Option<String>,
+    #[serde(default)]
+    source_port: Option<String>,
+    #[serde(default)]
+    workstation: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    sub_status: Option<String>,
+    #[serde(default)]
+    ticket_encryption_type: Option<String>,
+    #[serde(default)]
+    ticket_options: Option<String>,
+    #[serde(default)]
+    service_name: Option<String>,
+    #[serde(default)]
+    privilege_list: Option<String>,
+    #[serde(default)]
+    failure_reason: Option<String>,
+}
+
+impl WindowsAuthEvent {
+    fn operation(&self) -> &'static str {
+        match self.event_id {
+            4624 => "auth-logon-success",
+            4625 => "auth-logon-failure",
+            4672 => "auth-privilege-assigned",
+            4768 => "auth-kerberos-tgt",
+            _ => "auth-event",
+        }
+    }
+
+    fn subject(&self) -> String {
+        truncate_subject(&format!(
+            "record_id={};event_id={};target_user={};target_domain={};subject_user={};subject_domain={};logon_type={};logon_process={};auth_package={};source_ip={};source_port={};workstation={};status={};sub_status={};ticket_encryption_type={};ticket_options={};service_name={};privileges={};failure_reason={}",
+            self.record_id,
+            self.event_id,
+            self.target_user.as_deref().unwrap_or("-"),
+            self.target_domain.as_deref().unwrap_or("-"),
+            self.subject_user.as_deref().unwrap_or("-"),
+            self.subject_domain.as_deref().unwrap_or("-"),
+            self.logon_type.as_deref().unwrap_or("-"),
+            self.logon_process.as_deref().unwrap_or("-"),
+            self.authentication_package.as_deref().unwrap_or("-"),
+            self.source_ip.as_deref().unwrap_or("-"),
+            self.source_port.as_deref().unwrap_or("-"),
+            self.workstation.as_deref().unwrap_or("-"),
+            self.status.as_deref().unwrap_or("-"),
+            self.sub_status.as_deref().unwrap_or("-"),
+            self.ticket_encryption_type.as_deref().unwrap_or("-"),
+            self.ticket_options.as_deref().unwrap_or("-"),
+            self.service_name.as_deref().unwrap_or("-"),
+            self.privilege_list.as_deref().unwrap_or("-"),
+            self.failure_reason.as_deref().unwrap_or("-"),
+        ))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -1040,6 +1135,7 @@ struct WindowsState {
     host_capabilities_pinned: bool,
     known_processes: BTreeMap<u32, WindowsProcessSnapshot>,
     security_process_cursor: Option<u64>,
+    auth_event_cursor: Option<u64>,
     script_block_cursor: Option<u64>,
     pending_script_blocks: BTreeMap<String, WindowsScriptBlockAssembly>,
     known_memory_processes: BTreeMap<u32, WindowsMemorySnapshot>,
@@ -1077,6 +1173,7 @@ impl WindowsPlatform {
             providers: vec![
                 WindowsProviderKind::EtwProcess,
                 WindowsProviderKind::PsProcess,
+                WindowsProviderKind::AuthAudit,
                 WindowsProviderKind::ObProcess,
                 WindowsProviderKind::MinifilterFile,
                 WindowsProviderKind::WfpNetwork,
@@ -1100,6 +1197,7 @@ impl WindowsPlatform {
                 host_capabilities_pinned,
                 known_processes: BTreeMap::new(),
                 security_process_cursor: None,
+                auth_event_cursor: None,
                 script_block_cursor: None,
                 pending_script_blocks: BTreeMap::new(),
                 known_memory_processes: BTreeMap::new(),
@@ -1209,6 +1307,12 @@ impl PlatformSensor for WindowsPlatform {
         } else {
             state.security_process_cursor = None;
         }
+        if state.host.auth_sensor_ready() {
+            state.auth_event_cursor = latest_auth_audit_record_id(self.runner.as_ref())
+                .with_context(|| "snapshot initial windows auth audit cursor")?;
+        } else {
+            state.auth_event_cursor = None;
+        }
         if state.host.script_sensor_ready() {
             state.script_block_cursor = latest_script_block_record_id(self.runner.as_ref())
                 .with_context(|| "snapshot initial windows script-block cursor")?;
@@ -1296,7 +1400,7 @@ impl PlatformSensor for WindowsPlatform {
             file: host.file_monitor_ready(),
             network: host.has_net_connection,
             registry: host.registry_provider_ready(),
-            auth: host.any_event_log(),
+            auth: host.auth_sensor_ready(),
             script: host.script_sensor_ready(),
             memory: host.memory_sensor_ready(),
             container: false,
@@ -1970,6 +2074,13 @@ try {
     $hasProcessCreationEvents = $false
 }
 
+$hasAuthAuditEvents = $false
+try {
+    $hasAuthAuditEvents = (Get-WinEvent -FilterHashtable @{ LogName='Security'; Id=4624,4625,4672,4768 } -MaxEvents 1 -ErrorAction Stop | Select-Object -First 1) -ne $null
+} catch {
+    $hasAuthAuditEvents = $false
+}
+
 $hasAmsiRuntime = $false
 try {
     $amsiDll = Join-Path $env:WINDIR 'System32\amsi.dll'
@@ -2244,6 +2355,7 @@ $data = [ordered]@{
     has_task_scheduler_log = & $hasLog 'Microsoft-Windows-TaskScheduler/Operational'
     has_sysmon_log = & $hasLog 'Microsoft-Windows-Sysmon/Operational'
     has_process_creation_events = $hasProcessCreationEvents
+    has_auth_audit_events = $hasAuthAuditEvents
     has_net_connection = (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) -ne $null
     has_firewall = ((Get-Command Get-NetFirewallRule -ErrorAction SilentlyContinue) -ne $null) -and ((Get-Command netsh.exe -ErrorAction SilentlyContinue) -ne $null)
     has_registry_cli = (Get-Command reg.exe -ErrorAction SilentlyContinue) -ne $null
@@ -2282,6 +2394,7 @@ $data | ConvertTo-Json -Compress
         has_task_scheduler_log: probe.has_task_scheduler_log,
         has_sysmon_log: probe.has_sysmon_log,
         has_process_creation_events: probe.has_process_creation_events,
+        has_auth_audit_events: probe.has_auth_audit_events,
         has_net_connection: probe.has_net_connection,
         has_firewall: probe.has_firewall,
         has_registry_cli: probe.has_registry_cli,
@@ -3019,6 +3132,9 @@ fn collect_live_windows_events(
     if state.host.has_process_creation_events {
         collect_security_process_audit_events(state, runner)?;
     }
+    if state.host.auth_sensor_ready() {
+        collect_auth_audit_events(state, runner)?;
+    }
     if state.host.script_sensor_ready() {
         collect_script_block_events(state, runner)?;
     }
@@ -3058,6 +3174,21 @@ if ($null -eq $event) {
     Ok(cursor.map(|value| value.record_id))
 }
 
+fn latest_auth_audit_record_id(runner: &dyn WindowsCommandRunner) -> Result<Option<u64>> {
+    let script = r#"
+$event = Get-WinEvent -FilterHashtable @{ LogName='Security'; Id=4624,4625,4672,4768 } -MaxEvents 1 -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($null -eq $event) {
+    'null'
+} else {
+    [ordered]@{
+        record_id = [uint64]$event.RecordId
+    } | ConvertTo-Json -Compress
+}
+"#;
+    let cursor: Option<WindowsAuthAuditCursor> = run_powershell_json(runner, script)?;
+    Ok(cursor.map(|value| value.record_id))
+}
+
 fn latest_script_block_record_id(runner: &dyn WindowsCommandRunner) -> Result<Option<u64>> {
     let script = r#"
 $event = Get-WinEvent -FilterHashtable @{ LogName='Microsoft-Windows-PowerShell/Operational'; Id=4104 } -MaxEvents 1 -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -3071,6 +3202,32 @@ if ($null -eq $event) {
 "#;
     let cursor: Option<WindowsScriptBlockCursor> = run_powershell_json(runner, script)?;
     Ok(cursor.map(|value| value.record_id))
+}
+
+fn collect_auth_audit_events(
+    state: &mut WindowsState,
+    runner: &dyn WindowsCommandRunner,
+) -> Result<()> {
+    let Some(after_record_id) = state.auth_event_cursor else {
+        state.auth_event_cursor = latest_auth_audit_record_id(runner)?;
+        return Ok(());
+    };
+
+    let events = snapshot_auth_events_after(runner, after_record_id)?;
+    if let Some(last) = events.last() {
+        state.auth_event_cursor = Some(last.record_id);
+    }
+    for event in events {
+        state.pending_events.push_back(
+            WindowsEventStub {
+                provider: WindowsProviderKind::AuthAudit,
+                operation: event.operation().to_string(),
+                subject: event.subject(),
+            }
+            .encode(),
+        );
+    }
+    Ok(())
 }
 
 fn collect_script_block_events(
@@ -3551,9 +3708,58 @@ $rows | ConvertTo-Json -Compress
     run_powershell_json(runner, &script)
 }
 
+fn snapshot_auth_events_after(
+    runner: &dyn WindowsCommandRunner,
+    after_record_id: u64,
+) -> Result<Vec<WindowsAuthEvent>> {
+    let script = format!(
+        r#"
+$afterRecordId = [uint64]{after_record_id}
+$rows = @(
+    Get-WinEvent -FilterHashtable @{{ LogName='Security'; Id=4624,4625,4672,4768 }} -ErrorAction SilentlyContinue |
+        Where-Object {{ [uint64]$_.RecordId -gt $afterRecordId }} |
+        Sort-Object RecordId |
+        ForEach-Object {{
+            $xml = [xml]$_.ToXml()
+            $eventData = @{{}}
+            foreach ($item in $xml.Event.EventData.Data) {{
+                if ($item.Name) {{
+                    $eventData[$item.Name] = [string]$item.'#text'
+                }}
+            }}
+            [ordered]@{{
+                record_id = [uint64]$_.RecordId
+                event_id = [uint32]$_.Id
+                target_user = $eventData['TargetUserName']
+                target_domain = $eventData['TargetDomainName']
+                subject_user = $eventData['SubjectUserName']
+                subject_domain = $eventData['SubjectDomainName']
+                logon_type = $eventData['LogonType']
+                logon_process = $eventData['LogonProcessName']
+                authentication_package = $eventData['AuthenticationPackageName']
+                source_ip = if ($eventData.ContainsKey('IpAddress')) {{ $eventData['IpAddress'] }} else {{ $eventData['ClientAddress'] }}
+                source_port = if ($eventData.ContainsKey('IpPort')) {{ $eventData['IpPort'] }} else {{ $eventData['ClientPort'] }}
+                workstation = $eventData['WorkstationName']
+                status = $eventData['Status']
+                sub_status = $eventData['SubStatus']
+                ticket_encryption_type = $eventData['TicketEncryptionType']
+                ticket_options = $eventData['TicketOptions']
+                service_name = $eventData['ServiceName']
+                privilege_list = $eventData['PrivilegeList']
+                failure_reason = $eventData['FailureReason']
+            }}
+        }}
+)
+
+$rows | ConvertTo-Json -Compress
+"#
+    );
+    run_powershell_json(runner, &script)
+}
+
 fn snapshot_network_inventory(
     runner: &dyn WindowsCommandRunner,
-) -> Result<BTreeMap<String, WindowsNetworkConnection>> {
+    ) -> Result<BTreeMap<String, WindowsNetworkConnection>> {
     let script = r#"
 $tcpRows = @()
 if ((Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) -ne $null) {
@@ -4731,6 +4937,7 @@ mod tests {
             has_task_scheduler_log: true,
             has_sysmon_log: false,
             has_process_creation_events: true,
+            has_auth_audit_events: false,
             has_net_connection: true,
             has_firewall: true,
             has_registry_cli: true,
@@ -4862,7 +5069,7 @@ mod tests {
                 r#"{{"computer_name":"DESKTOP-TLASHJG","user_name":"desktop-tlashjg\\lamba","is_admin":true,"#,
                 r#""has_process_inventory":true,"has_security_log":true,"has_powershell_log":true,"#,
                 r#""has_wmi_log":true,"has_task_scheduler_log":true,"has_sysmon_log":false,"#,
-                r#""has_process_creation_events":true,"has_net_connection":true,"has_firewall":true,"#,
+                r#""has_process_creation_events":true,"has_auth_audit_events":false,"has_net_connection":true,"has_firewall":true,"#,
                 r#""has_registry_cli":true,"has_amsi_runtime":{},"has_script_block_logging":{},"#,
                 r#""has_amsi_scan_interface":false,"has_amsi_strict_blocking":false,"has_memory_inventory":false,"#,
                 r#""has_named_pipe_inventory":{},"has_module_inventory":{},"has_vss_inventory":{},"#,
@@ -4889,7 +5096,7 @@ mod tests {
                 r#"{{"computer_name":"DESKTOP-TLASHJG","user_name":"desktop-tlashjg\\lamba","is_admin":true,"#,
                 r#""has_process_inventory":true,"has_security_log":true,"has_powershell_log":true,"#,
                 r#""has_wmi_log":true,"has_task_scheduler_log":true,"has_sysmon_log":false,"#,
-                r#""has_process_creation_events":true,"has_net_connection":true,"has_firewall":true,"#,
+                r#""has_process_creation_events":true,"has_auth_audit_events":false,"has_net_connection":true,"has_firewall":true,"#,
                 r#""has_registry_cli":true,"has_amsi_runtime":{},"has_script_block_logging":{},"#,
                 r#""has_amsi_scan_interface":{},"has_amsi_strict_blocking":{},"has_memory_inventory":{},"#,
                 r#""has_named_pipe_inventory":false,"has_module_inventory":false,"has_vss_inventory":false,"#,
@@ -4921,6 +5128,83 @@ mod tests {
                     "{{\"record_id\":{record_id},\"process_name\":{process_name},\"command_line\":{command_line}}}"
                 )
             })
+            .collect::<Vec<_>>();
+        format!("[{}]", rows.join(","))
+    }
+
+    fn auth_event_output(
+        entries: &[(
+            u64,
+            u32,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+        )],
+    ) -> String {
+        let rows = entries
+            .iter()
+            .map(
+                |(
+                    record_id,
+                    event_id,
+                    target_user,
+                    target_domain,
+                    subject_user,
+                    subject_domain,
+                    logon_type,
+                    logon_process,
+                    authentication_package,
+                    source_ip,
+                    source_port,
+                    workstation,
+                    status,
+                    sub_status,
+                    ticket_encryption_type,
+                    ticket_options,
+                    service_name,
+                    privilege_list,
+                    failure_reason,
+                )| {
+                    let encode = |value: Option<&str>| {
+                        value.map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+                            .unwrap_or_else(|| "null".to_string())
+                    };
+                    format!(
+                        "{{\"record_id\":{record_id},\"event_id\":{event_id},\"target_user\":{},\"target_domain\":{},\"subject_user\":{},\"subject_domain\":{},\"logon_type\":{},\"logon_process\":{},\"authentication_package\":{},\"source_ip\":{},\"source_port\":{},\"workstation\":{},\"status\":{},\"sub_status\":{},\"ticket_encryption_type\":{},\"ticket_options\":{},\"service_name\":{},\"privilege_list\":{},\"failure_reason\":{}}}",
+                        encode(*target_user),
+                        encode(*target_domain),
+                        encode(*subject_user),
+                        encode(*subject_domain),
+                        encode(*logon_type),
+                        encode(*logon_process),
+                        encode(*authentication_package),
+                        encode(*source_ip),
+                        encode(*source_port),
+                        encode(*workstation),
+                        encode(*status),
+                        encode(*sub_status),
+                        encode(*ticket_encryption_type),
+                        encode(*ticket_options),
+                        encode(*service_name),
+                        encode(*privilege_list),
+                        encode(*failure_reason),
+                    )
+                },
+            )
             .collect::<Vec<_>>();
         format!("[{}]", rows.join(","))
     }
@@ -5461,11 +5745,12 @@ mod tests {
 
         assert!(providers.contains(&WindowsProviderKind::EtwProcess));
         assert!(providers.contains(&WindowsProviderKind::RegistryCallback));
+        assert!(providers.contains(&WindowsProviderKind::AuthAudit));
         assert!(providers.contains(&WindowsProviderKind::IpcSensor));
         assert!(providers.contains(&WindowsProviderKind::ModuleLoadSensor));
         assert!(providers.contains(&WindowsProviderKind::SnapshotProtection));
         assert!(providers.contains(&WindowsProviderKind::DeviceControl));
-        assert_eq!(providers.len(), 12);
+        assert_eq!(providers.len(), 13);
     }
 
     #[test]
@@ -5932,7 +6217,7 @@ mod tests {
         );
         assert!(platform.capabilities().process);
         assert!(platform.capabilities().network);
-        assert!(platform.capabilities().auth);
+        assert!(!platform.capabilities().auth);
         assert!(!platform.capabilities().registry);
         assert!(
             !platform
@@ -6353,6 +6638,84 @@ mod tests {
         let second_drained = platform
             .poll_events(&mut second_buffer)
             .expect("poll security audit events again");
+
+        assert_eq!(second_drained, 0);
+        assert!(second_buffer.records.is_empty());
+    }
+
+    #[test]
+    fn windows_poll_events_emits_auth_audit_delta_once() {
+        let mut host = healthy_host();
+        host.has_auth_audit_events = true;
+
+        let mut platform = WindowsPlatform::with_runner_for_test(
+            Box::new(QueuedWindowsRunner::new([
+                process_output(&[("System", 4, 0, None)]),
+                audit_cursor_output(100),
+                audit_cursor_output(500),
+                network_output(&[]),
+                process_output(&[("System", 4, 0, None)]),
+                security_process_event_output(&[]),
+                auth_event_output(&[(
+                    501,
+                    4625,
+                    Some("svc-aegis"),
+                    Some("CONTOSO"),
+                    Some("SYSTEM"),
+                    Some("NT AUTHORITY"),
+                    Some("3"),
+                    Some("NtLmSsp"),
+                    Some("NTLM"),
+                    Some("10.0.0.25"),
+                    Some("54421"),
+                    Some("WKSTN-1"),
+                    Some("0xc000006d"),
+                    Some("0xc000006a"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("Unknown user name or bad password"),
+                )]),
+                network_output(&[]),
+                process_output(&[("System", 4, 0, None)]),
+                security_process_event_output(&[]),
+                auth_event_output(&[]),
+                network_output(&[]),
+            ])),
+            host,
+        );
+        platform
+            .start(&SensorConfig {
+                profile: "windows".to_string(),
+                queue_capacity: 1024,
+                require_kernel_driver: false,
+            })
+            .expect("start windows runtime");
+
+        let snapshot = platform.health_snapshot();
+        assert_eq!(
+            snapshot.provider_health.get("AuthAudit").copied(),
+            Some(true)
+        );
+        assert!(platform.capabilities().auth);
+
+        let mut first_buffer = EventBuffer::default();
+        let first_drained = platform
+            .poll_events(&mut first_buffer)
+            .expect("poll auth audit events");
+
+        assert_eq!(first_drained, 1);
+        let first_event = String::from_utf8(first_buffer.records[0].clone()).expect("event utf8");
+        assert!(first_event.contains("AuthAudit"));
+        assert!(first_event.contains("auth-logon-failure"));
+        assert!(first_event.contains("svc-aegis"));
+        assert!(first_event.contains("10.0.0.25"));
+
+        let mut second_buffer = EventBuffer::default();
+        let second_drained = platform
+            .poll_events(&mut second_buffer)
+            .expect("poll auth audit events again");
 
         assert_eq!(second_drained, 0);
         assert!(second_buffer.records.is_empty());
