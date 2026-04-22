@@ -1,12 +1,12 @@
 # Aegis Sensor Windows 进程线程模块细粒度采集闭环计划
 
 > 编号：`W24`
-> 状态：`todo`
+> 状态：`done`
 > 日期：`2026-04-22`
 
 ## 1. 缺口定义
 
-当前 Windows 进程主链由 `Win32_Process` 快照差分和 `4688` 审计组成，模块主链由进程模块清单差分组成，缺少更细粒度的线程与进程上下文：
+当前 Windows 进程主链已从“进程快照 + 4688 审计 + 模块可见性”推进到“进程镜像路径/签名 + 线程增量 + 模块签名上下文”，已补齐：
 
 - 线程创建/终止
 - 更完整的进程镜像路径、签名与父子上下文
@@ -65,8 +65,19 @@
   - 模块动态加载
 - 文档同步更新采集维度与字段说明。
 
-## 7. 完成判定
+## 7. 完成结果
 
-1. 线程事件进入 `poll_events()` 主链。
-2. 进程与模块事件补齐镜像路径和签名字段。
+- 新增 `WindowsProviderKind::ThreadSensor`，`Win32_Thread` 已接入启动基线和增量轮询。
+- `Win32_Process` 事件已补齐 `image_path`、`signature_status`、`signer_subject`。
+- 模块事件已补齐签名状态与签名主体。
+- 本地单测已新增 `windows_poll_events_emits_thread_and_signed_process_module_telemetry`，`cargo test -p aegis-platform windows_ -- --nocapture` 通过。
+- 真机 `.218` 已验证：
+  - `Win32_Thread` 可返回 `Handle/ProcessHandle/ThreadState/StartAddress`
+  - `Get-AuthenticodeSignature` 可返回 `winlogon.exe` 等镜像的签名状态与签名主体
+- Windows 数据采集清单已更新线程源和签名字段。
+
+## 8. 完成判定
+
+1. 线程事件已进入 `poll_events()` 主链。
+2. 进程与模块事件已补齐镜像路径和签名字段。
 3. 代码提交与文档提交各一次。

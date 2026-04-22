@@ -39,7 +39,7 @@
 
 - 跨平台公共研发包已完成，仓库内主链路已经闭合。
 - Linux 在当前测试机可闭合的运行时、eBPF 资产链、TPM key protection、sealed object、quote/checkquote、PCR policy session 已完成。
-- Windows 当前已完成平台代码骨架、provider 注册、事件注入、能力矩阵与测试基线，以及真实主机能力探测链、真实进程差分、隐藏进程检测、Security 4688 进程审计事件链、Security `4624/4625/4672/4768` 认证审计事件链、网络连接差分 + DNS Client Operational + Schannel 深度网络遥测、真实文件/注册表/脚本/内存系统采集、自保护/完整性强制执行、真机验收脚本/兼容性矩阵、Windows 驱动工程/安装卸载链/版本化控制通道、Windows 专用 DPAPI/TPM 根信任与回滚锚点方案，以及 release manifest、签名/验签/install gate 与 Windows 11 真机发布验证；但从 EDR 数据采集要求再审视，Windows 仍缺细粒度进程线程模块、Device/Pipe/VSS 行为、内存注入/YARA 三个采集闭环。
+- Windows 当前已完成平台代码骨架、provider 注册、事件注入、能力矩阵与测试基线，以及真实主机能力探测链、真实进程差分、隐藏进程检测、Security 4688 进程审计事件链、Security `4624/4625/4672/4768` 认证审计事件链、网络连接差分 + DNS Client Operational + Schannel 深度网络遥测、线程增量与进程/模块签名上下文、真实文件/注册表/脚本/内存系统采集、自保护/完整性强制执行、真机验收脚本/兼容性矩阵、Windows 驱动工程/安装卸载链/版本化控制通道、Windows 专用 DPAPI/TPM 根信任与回滚锚点方案，以及 release manifest、签名/验签/install gate 与 Windows 11 真机发布验证；但从 EDR 数据采集要求再审视，Windows 仍缺 Device/Pipe/VSS 行为、内存注入/YARA 两个采集闭环。
 - macOS 当前完成的是平台代码骨架、授权状态机、provider 基线、订阅集与测试基线，真实 ESF / Network Extension / System Extension 交付尚未完成。
 
 ## 5. 跨平台公共研发计划与状态
@@ -106,7 +106,7 @@
 | O07 | Linux 容器 / Sidecar / Runtime Connector 交付链 | done | 已完成最小权限 Host Agent DaemonSet、Sidecar Lite Pod 样例、Runtime SDK / Cloud Connector 样例目录与 `scripts/linux-container-validate.sh` 校验链 |
 | O08 | Linux 设备控制链（udev / USBGuard / mount monitor） | done | 已完成 Linux `DeviceControl` provider、设备控制配置目录与 `scripts/linux-device-control-validate.sh` / `.123` 安装链验收 |
 | O09 | Linux Runtime SDK / Cloud Connector 多语言交付 | done | 已完成 `Python/Node.js/Go/Java/.NET` 五种参考 SDK、多云 connector 合同与 `scripts/linux-container-validate.sh` 多语言验证链 |
-| O02 | Windows 真实运行时、事件链路、响应链与系统级交付 | doing | 运行时主链已闭环，但仍有 3 个 Windows EDR 数据采集缺口待收口，详见 `sensor-windows-plan.md` 中 `W24-W26` |
+| O02 | Windows 真实运行时、事件链路、响应链与系统级交付 | doing | 运行时主链已闭环，但仍有 2 个 Windows EDR 数据采集缺口待收口，详见 `sensor-windows-plan.md` 中 `W25-W26` |
 | O03 | Windows 正式硬件根信任、签名与兼容性验证 | done | 已完成仓库侧 release manifest、签名/验签/install gate、批准依赖校验与支持矩阵文档；Microsoft 正式签发与更多主机 rollout 继续依赖仓库外流程 |
 | O10 | Windows 真实 MSI 工程 | done | 已完成 MSI 构建脚本、`validate.ps1` / `windows-package-verify.sh` 验收链，并在 `.218` 上完成 `msiexec` 安装/卸载闭环 |
 | O11 | Linux Debian/Ubuntu 的真实 DEB 安装验收链 | done | 已完成 `.123 build -> .226 dpkg -i / dpkg -P` 验收链，本地输出 Ubuntu 验收 JSON 与 install/bootstrap/watchdog/diagnose 工件 |
