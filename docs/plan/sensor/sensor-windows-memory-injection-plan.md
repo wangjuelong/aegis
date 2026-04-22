@@ -1,12 +1,12 @@
 # Aegis Sensor Windows 内存注入 / YARA / 映射采集闭环计划
 
 > 编号：`W26`
-> 状态：`todo`
+> 状态：`done`
 > 日期：`2026-04-22`
 
 ## 1. 缺口定义
 
-当前 Windows 内存侧只有 `memory-hot` / `memory-growth` 两种资源信号，不足以满足 EDR 对内存注入与恶意映射的要求，缺少：
+当前 Windows 内存侧已从 `memory-hot / memory-growth` 资源信号推进到“资源 + 区域安全信号”双链路，已补齐：
 
 - 私有可执行内存区域
 - RWX / RX 私有页
@@ -70,8 +70,17 @@
   - 受控样本触发 YARA
 - 数据采集文档更新内存域。
 
-## 7. 完成判定
+## 7. 完成结果
 
-1. 内存安全类事件进入 `poll_events()` 主链。
-2. 资源类和安全类内存事件明确区分。
+- 新增 `scripts/windows/query-memory-regions.ps1`，通过 `OpenProcess / VirtualQueryEx / ReadProcessMemory / GetMappedFileName` 枚举可执行区域。
+- `MemorySensor` 已新增 `memory-private-exec / memory-rwx / memory-image-anomaly / memory-yara-match` 四类事件。
+- 内存规则命中已基于区域样本内容生成真实规则名，不再只停留在资源占用信号。
+- 本地单测已新增 `windows_poll_events_emits_memory_region_and_yara_signals`，`cargo test -p aegis-platform windows_ -- --nocapture` 通过。
+- 真机 `.218` 已验证 `query-memory-regions.ps1` 能返回真实可执行区域、保护属性、映射路径与样本数据。
+- Windows 数据采集清单已补充内存区域数据源与 4 类安全事件维度。
+
+## 8. 完成判定
+
+1. 内存安全类事件已进入 `poll_events()` 主链。
+2. 资源类和安全类内存事件已明确区分。
 3. 代码提交与文档提交各一次。
