@@ -30,11 +30,15 @@ Linux 平台目标覆盖：
 - Linux 安装/发布工程
 - Linux 远程 attestation / verifier 分离信任链
 - Linux 容器 / sidecar / runtime connector 交付链
+- Linux 设备控制链
+- Linux Runtime SDK / Cloud Connector 多语言交付链
 
 ## 4. 当前总体结论
 
-- 当前开发机与 Linux 测试机可闭合的 Linux 研发项已完成。
-- 当前仓库范围内，Linux 已无剩余未完成项。
+- Linux 主链能力已基本闭环。
+- 当前仓库内仍有 2 个需要继续收口的 Linux 缺口：
+  - Linux 设备控制链
+  - Linux Runtime SDK / Cloud Connector 多语言交付链
 
 ## 5. Linux 研发计划与状态
 
@@ -53,6 +57,8 @@ Linux 平台目标覆盖：
 | L11 | 更高阶 remote attestation / verifier 分离信任链 | done | 已完成 attestation bundle、verifier receipt、设备证书/receipt 诊断状态与本地正反向烟测 |
 | L12 | Linux 生产部署、签名与发行工程 | done | 已完成 install manifest、systemd、`DEB/RPM` 组装、原生 RPM 安装/自检/watchdog/卸载与 `scripts/linux-package-verify.sh` 真机闭环 |
 | L13 | Linux 容器 / Sidecar / Runtime Connector 交付链 | done | 已完成 Host Agent DaemonSet、Sidecar Lite Pod 样例、Runtime SDK / Cloud Connector 样例目录与 `scripts/linux-container-validate.sh` 校验链 |
+| L14 | Linux 设备控制链 | todo | 当前仍缺 `udev rules`、`USBGuard`、挂载监控与 `DeviceControl` provider |
+| L15 | Linux Runtime SDK / Cloud Connector 多语言交付 | todo | 当前仍只有 Rust example 与静态 contract 样例，未形成多语言可运行交付 |
 
 ## 6. 已完成验证
 
@@ -95,3 +101,4 @@ Linux 测试机已完成：
 - `L11 = done`
 - `L12 = done`
 - `L13 = done`
+- `L14-L15 = todo`
