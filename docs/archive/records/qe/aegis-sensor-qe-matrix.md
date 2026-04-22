@@ -2,7 +2,7 @@
 
 - 执行日期：2026-04-20
 - 执行分支：`wangjuelong/feat/windows-system-completion`
-- 环境基线：[`docs/env/开发环境.md`](../env/开发环境.md)
+- 环境基线：[`docs/env/开发环境.md`](../../../env/开发环境.md)
 - 当前轮次定位：G01-G06 收口回归与诊断链验证
 
 ## 1. 执行结果
@@ -56,5 +56,5 @@
 ## 4. 环境与限制说明
 
 - 本轮结果来自当前 macOS 开发机上的工作区回归、示例运行，以及 `192.168.2.218` Windows 真机 release 验收。
-- Windows 与 Linux 测试主机信息已在 [`docs/env/开发环境.md`](../env/开发环境.md) 记录，可用于后续安装冒烟或现场联调。
+- Windows 与 Linux 测试主机信息已在 [`docs/env/开发环境.md`](../../../env/开发环境.md) 记录，可用于后续安装冒烟或现场联调。
 - 当前 QE 结果能够证明代码契约、跨平台 mock 行为、发布前诊断路径与 Windows release gate 可工作；不宣称已覆盖 Windows 10 / Windows Server 全量主机池。

@@ -26,13 +26,13 @@
 - `cargo run -p aegis-core --example runtime_sdk_connector`：通过
 - `packaging/windows/validate.ps1 -BundleChannel release`：在 `192.168.2.218` 通过，`required_failures=[]`
 
-相关 QE 细节见 [`docs/qe/aegis-sensor-qe-matrix.md`](../qe/aegis-sensor-qe-matrix.md)。
+相关 QE 细节见 [`docs/archive/records/qe/aegis-sensor-qe-matrix.md`](../qe/aegis-sensor-qe-matrix.md)。
 
 ## 3. 运维与排障入口
 
 - 诊断模式：`cargo run -p aegis-agentd -- --diagnose`
 - Runtime SDK 最小示例：`cargo run -p aegis-core --example runtime_sdk_connector`
-- 研发环境池：[`docs/env/开发环境.md`](../env/开发环境.md)
+- 研发环境池：[`docs/env/开发环境.md`](../../../env/开发环境.md)
 
 ## 4. 回滚说明
 

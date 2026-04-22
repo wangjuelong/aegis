@@ -258,7 +258,7 @@
 - 修改：`scripts/windows-package-verify.sh`
 - 修改：`crates/aegis-core/src/upgrade.rs`
 - 修改：`docs/plan/sensor/sensor-windows-validation-matrix.md`
-- 修改：`docs/release/aegis-sensor-release-notes.md`
+- 修改：`docs/archive/records/release/aegis-sensor-release-notes.md`
 
 ### W15: 注册表真实保护链
 
