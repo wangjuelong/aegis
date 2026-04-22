@@ -28,27 +28,27 @@ const AEGIS_WINDOWS_DRIVER_PROTOCOL_VERSION: u32 = 0x0001_0000;
 const AEGIS_WINDOWS_DRIVER_IOCTL_QUERY_VERSION: u32 = 0x0022_2000;
 const AEGIS_WINDOWS_FILE_MONITOR_PORT_NAME: &str = r"\AegisFileMonitorPort";
 const WINDOWS_QUERY_FILE_EVENTS_SCRIPT: &str =
-    include_str!("../../../scripts/windows-query-file-events.ps1");
+    include_str!("../../../scripts/windows/query-file-events.ps1");
 const WINDOWS_CONFIGURE_FILE_PROTECTION_SCRIPT: &str =
-    include_str!("../../../scripts/windows-configure-file-protection.ps1");
+    include_str!("../../../scripts/windows/configure-file-protection.ps1");
 const WINDOWS_CONFIGURE_PREEMPTIVE_BLOCK_SCRIPT: &str =
-    include_str!("../../../scripts/windows-configure-preemptive-block.ps1");
+    include_str!("../../../scripts/windows/configure-preemptive-block.ps1");
 const WINDOWS_CONFIGURE_REGISTRY_PROTECTION_SCRIPT: &str =
-    include_str!("../../../scripts/windows-configure-registry-protection.ps1");
+    include_str!("../../../scripts/windows/configure-registry-protection.ps1");
 const WINDOWS_QUERY_REGISTRY_EVENTS_SCRIPT: &str =
-    include_str!("../../../scripts/windows-query-registry-events.ps1");
+    include_str!("../../../scripts/windows/query-registry-events.ps1");
 const WINDOWS_ROLLBACK_REGISTRY_SCRIPT: &str =
-    include_str!("../../../scripts/windows-rollback-registry.ps1");
+    include_str!("../../../scripts/windows/rollback-registry.ps1");
 const WINDOWS_PROTECT_PROCESS_SCRIPT: &str =
-    include_str!("../../../scripts/windows-protect-process.ps1");
+    include_str!("../../../scripts/windows/protect-process.ps1");
 const WINDOWS_QUERY_DRIVER_INTEGRITY_SCRIPT: &str =
-    include_str!("../../../scripts/windows-query-driver-integrity.ps1");
+    include_str!("../../../scripts/windows/query-driver-integrity.ps1");
 const WINDOWS_SCAN_SCRIPT_WITH_AMSI_SCRIPT: &str =
-    include_str!("../../../scripts/windows-scan-script-with-amsi.ps1");
+    include_str!("../../../scripts/windows/scan-script-with-amsi.ps1");
 const WINDOWS_QUERY_SCRIPT_EVENTS_SCRIPT: &str =
-    include_str!("../../../scripts/windows-query-script-events.ps1");
+    include_str!("../../../scripts/windows/query-script-events.ps1");
 const WINDOWS_QUERY_MEMORY_SNAPSHOT_SCRIPT: &str =
-    include_str!("../../../scripts/windows-query-memory-snapshot.ps1");
+    include_str!("../../../scripts/windows/query-memory-snapshot.ps1");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowsProviderKind {

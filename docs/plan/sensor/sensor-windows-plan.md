@@ -7,7 +7,9 @@
 
 ## 1. 文档定位
 
-本文件统一描述 Windows 平台研发计划与完成状态，不再使用单独的 Windows 子目录索引。
+本文件统一描述 Windows 平台研发计划与完成状态。
+
+已完成的 Windows 细项计划已归档到 `docs/plan/sensor/archive/windows/`。
 
 ## 2. 状态定义
 
