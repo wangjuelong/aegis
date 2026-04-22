@@ -21,7 +21,7 @@ REMOTE_ROOT_WIN="C:\\ProgramData\\Aegis\\validation\\${REMOTE_PAYLOAD_ID}"
 
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
 
-for tool in sshpass ssh scp python3; do
+for tool in sshpass ssh scp python3 tar; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "missing required tool: $tool" >&2
     exit 1
@@ -57,23 +57,30 @@ scp_upload() {
   sshpass -p "$PASSWORD" scp -r "${SSH_OPTS[@]}" "$source_path" "$USER_NAME@$HOST:$destination_path" >/dev/null
 }
 
+tar_upload_dir() {
+  local source_path=$1
+  local destination_root=$2
+  COPYFILE_DISABLE=1 COPY_EXTENDED_ATTRIBUTES_DISABLE=1 tar -cf - -C "$(dirname -- "$source_path")" "$(basename -- "$source_path")" | \
+    sshpass -p "$PASSWORD" ssh "${SSH_OPTS[@]}" "$USER_NAME@$HOST" "tar -xf - -C $destination_root"
+}
+
 if [[ -f "$REPO_ROOT/Cargo.lock" ]]; then
   scp_upload "$REPO_ROOT/Cargo.lock" "${REMOTE_ROOT_POSIX}/"
 fi
 scp_upload "$REPO_ROOT/Cargo.toml" "${REMOTE_ROOT_POSIX}/"
-scp_upload "$REPO_ROOT/crates/aegis-agentd" "${REMOTE_ROOT_POSIX}/crates/"
-scp_upload "$REPO_ROOT/crates/aegis-core" "${REMOTE_ROOT_POSIX}/crates/"
-scp_upload "$REPO_ROOT/crates/aegis-model" "${REMOTE_ROOT_POSIX}/crates/"
-scp_upload "$REPO_ROOT/crates/aegis-platform" "${REMOTE_ROOT_POSIX}/crates/"
-scp_upload "$REPO_ROOT/crates/aegis-script" "${REMOTE_ROOT_POSIX}/crates/"
-scp_upload "$REPO_ROOT/crates/aegis-updater" "${REMOTE_ROOT_POSIX}/crates/"
-scp_upload "$REPO_ROOT/crates/aegis-watchdog" "${REMOTE_ROOT_POSIX}/crates/"
-scp_upload "$REPO_ROOT/proto" "${REMOTE_ROOT_POSIX}/"
-scp_upload "$REPO_ROOT/packaging/windows" "${REMOTE_ROOT_POSIX}/packaging/"
-scp_upload "$REPO_ROOT/scripts" "${REMOTE_ROOT_POSIX}/"
-scp_upload "$VENDOR_DIR" "${REMOTE_ROOT_POSIX}/"
+tar_upload_dir "$REPO_ROOT/crates/aegis-agentd" "${REMOTE_ROOT_POSIX}/crates"
+tar_upload_dir "$REPO_ROOT/crates/aegis-core" "${REMOTE_ROOT_POSIX}/crates"
+tar_upload_dir "$REPO_ROOT/crates/aegis-model" "${REMOTE_ROOT_POSIX}/crates"
+tar_upload_dir "$REPO_ROOT/crates/aegis-platform" "${REMOTE_ROOT_POSIX}/crates"
+tar_upload_dir "$REPO_ROOT/crates/aegis-script" "${REMOTE_ROOT_POSIX}/crates"
+tar_upload_dir "$REPO_ROOT/crates/aegis-updater" "${REMOTE_ROOT_POSIX}/crates"
+tar_upload_dir "$REPO_ROOT/crates/aegis-watchdog" "${REMOTE_ROOT_POSIX}/crates"
+tar_upload_dir "$REPO_ROOT/proto" "${REMOTE_ROOT_POSIX}"
+tar_upload_dir "$REPO_ROOT/packaging/windows" "${REMOTE_ROOT_POSIX}/packaging"
+tar_upload_dir "$REPO_ROOT/scripts" "${REMOTE_ROOT_POSIX}"
+tar_upload_dir "$VENDOR_DIR" "${REMOTE_ROOT_POSIX}"
 scp_upload "$VENDOR_CONFIG_DIR/config.toml" "${REMOTE_ROOT_POSIX}/.cargo/"
-scp_upload "$REPO_ROOT/windows/driver" "${REMOTE_ROOT_POSIX}/windows/"
+tar_upload_dir "$REPO_ROOT/windows/driver" "${REMOTE_ROOT_POSIX}/windows"
 if [[ -n "$ELAM_APPROVAL_FILE" ]]; then
   scp_upload "$ELAM_APPROVAL_FILE" "${REMOTE_ROOT_POSIX}/approval-inputs/elam-approved.txt"
 fi

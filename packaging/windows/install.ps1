@@ -2,7 +2,8 @@ param(
     [string]$PayloadRoot = $PSScriptRoot,
     [string]$ManifestPath = (Join-Path $PayloadRoot "manifest.json"),
     [string]$InstallRoot,
-    [string]$StateRoot
+    [string]$StateRoot,
+    [switch]$PayloadAlreadyInstalled
 )
 
 Set-StrictMode -Version Latest
@@ -29,6 +30,11 @@ function Ensure-Directory {
     param([Parameter(Mandatory = $true)][string]$Path)
     New-Item -ItemType Directory -Force -Path $Path | Out-Null
     $Path
+}
+
+function Normalize-Path {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    [System.IO.Path]::GetFullPath($Path)
 }
 
 function Get-Manifest {
@@ -157,6 +163,9 @@ if ([string]::IsNullOrWhiteSpace($InstallRoot)) {
 if ([string]::IsNullOrWhiteSpace($StateRoot)) {
     $StateRoot = [string]$manifest.state_root
 }
+$payloadRoot = Normalize-Path -Path $payloadRoot
+$InstallRoot = Normalize-Path -Path $InstallRoot
+$StateRoot = Normalize-Path -Path $StateRoot
 
 $copiedPaths = New-Object System.Collections.Generic.List[string]
 $installReceiptPath = Join-Path $StateRoot "install-result.json"
@@ -192,38 +201,52 @@ try {
         )
     }
 
-    foreach ($component in @($manifest.components)) {
-        $copiedPaths.Add((Copy-BundleComponent -Component $component -PayloadRoot $payloadRoot -InstallRoot $InstallRoot)) | Out-Null
-    }
-
-    foreach ($dependency in @($manifest.release_dependencies)) {
-        if ([string]::IsNullOrWhiteSpace([string]$dependency.install_relative_path)) {
-            continue
-        }
-        $payloadDependencyPath = Join-Path $payloadRoot $dependency.install_relative_path
-        if (Test-Path -LiteralPath $payloadDependencyPath) {
-            $copiedPaths.Add((Copy-RelativeArtifact `
-                    -SourceRoot $payloadRoot `
-                    -RelativePath ([string]$dependency.install_relative_path) `
-                    -DestinationRoot $InstallRoot `
-                    -Description "release dependency artifact")) | Out-Null
-        } elseif ([bool]$dependency.required) {
-            throw "required release dependency artifact is missing from payload: $payloadDependencyPath"
-        }
-    }
-
     $installedManifestPath = Join-Path $InstallRoot "manifest.json"
-    Copy-Item -LiteralPath $resolvedManifestPath -Destination $installedManifestPath -Force
-    $copiedPaths.Add($installedManifestPath) | Out-Null
     $installedInstallScriptPath = Join-Path $InstallRoot "install.ps1"
-    Copy-Item -LiteralPath $MyInvocation.MyCommand.Path -Destination $installedInstallScriptPath -Force
-    $copiedPaths.Add($installedInstallScriptPath) | Out-Null
     $installedUninstallScriptPath = Join-Path $InstallRoot "uninstall.ps1"
-    Copy-Item -LiteralPath (Join-Path $PSScriptRoot "uninstall.ps1") -Destination $installedUninstallScriptPath -Force
-    $copiedPaths.Add($installedUninstallScriptPath) | Out-Null
     $installedReleaseVerifierScriptPath = Join-Path $InstallRoot "verify-release.ps1"
-    Copy-Item -LiteralPath $releaseVerifierScript -Destination $installedReleaseVerifierScriptPath -Force
-    $copiedPaths.Add($installedReleaseVerifierScriptPath) | Out-Null
+
+    if (-not $PayloadAlreadyInstalled) {
+        foreach ($component in @($manifest.components)) {
+            $copiedPaths.Add((Copy-BundleComponent -Component $component -PayloadRoot $payloadRoot -InstallRoot $InstallRoot)) | Out-Null
+        }
+
+        foreach ($dependency in @($manifest.release_dependencies)) {
+            if ([string]::IsNullOrWhiteSpace([string]$dependency.install_relative_path)) {
+                continue
+            }
+            $payloadDependencyPath = Join-Path $payloadRoot $dependency.install_relative_path
+            if (Test-Path -LiteralPath $payloadDependencyPath) {
+                $copiedPaths.Add((Copy-RelativeArtifact `
+                        -SourceRoot $payloadRoot `
+                        -RelativePath ([string]$dependency.install_relative_path) `
+                        -DestinationRoot $InstallRoot `
+                        -Description "release dependency artifact")) | Out-Null
+            } elseif ([bool]$dependency.required) {
+                throw "required release dependency artifact is missing from payload: $payloadDependencyPath"
+            }
+        }
+
+        Copy-Item -LiteralPath $resolvedManifestPath -Destination $installedManifestPath -Force
+        $copiedPaths.Add($installedManifestPath) | Out-Null
+        Copy-Item -LiteralPath $MyInvocation.MyCommand.Path -Destination $installedInstallScriptPath -Force
+        $copiedPaths.Add($installedInstallScriptPath) | Out-Null
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot "uninstall.ps1") -Destination $installedUninstallScriptPath -Force
+        $copiedPaths.Add($installedUninstallScriptPath) | Out-Null
+        Copy-Item -LiteralPath $releaseVerifierScript -Destination $installedReleaseVerifierScriptPath -Force
+        $copiedPaths.Add($installedReleaseVerifierScriptPath) | Out-Null
+    } else {
+        foreach ($requiredPath in @(
+                $installedManifestPath,
+                $installedInstallScriptPath,
+                $installedUninstallScriptPath,
+                $installedReleaseVerifierScriptPath
+            )) {
+            if (-not (Test-Path -LiteralPath $requiredPath)) {
+                throw "msi-staged install is missing required installed artifact: $requiredPath"
+            }
+        }
+    }
 
     $agentPath = Get-InstalledComponentPath -Manifest $manifest -InstallRoot $InstallRoot -Name "agentd"
     $watchdogPath = Get-InstalledComponentPath -Manifest $manifest -InstallRoot $InstallRoot -Name "watchdog"
@@ -300,6 +323,7 @@ try {
         installed_at = (Get-Date).ToString("o")
         install_root = $InstallRoot
         state_root = $StateRoot
+        install_mode = if ($PayloadAlreadyInstalled) { "msi" } else { "payload" }
         manifest_path = $installedManifestPath
         install_result_path = $installReceiptPath
         copied_paths = @($copiedPaths)

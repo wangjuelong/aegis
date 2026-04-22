@@ -52,15 +52,41 @@ function Invoke-External {
         [Parameter(Mandatory = $false)][string]$WorkingDirectory
     )
 
+    $stdoutPath = Join-Path $env:TEMP "aegis-exec-$([guid]::NewGuid().ToString('N')).stdout.log"
+    $stderrPath = Join-Path $env:TEMP "aegis-exec-$([guid]::NewGuid().ToString('N')).stderr.log"
     if ($WorkingDirectory) {
         Push-Location $WorkingDirectory
     }
     try {
-        & $FilePath @Arguments
-        if ($LASTEXITCODE -ne 0) {
-            throw "command failed with exit code ${LASTEXITCODE}: $FilePath $($Arguments -join ' ')"
+        $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -Wait -PassThru `
+            -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+        $stdout = if (Test-Path -LiteralPath $stdoutPath) {
+            Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue
+        } else {
+            ""
+        }
+        $stderr = if (Test-Path -LiteralPath $stderrPath) {
+            Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue
+        } else {
+            ""
+        }
+        if ($process.ExitCode -ne 0) {
+            $message = (@($stderr, $stdout) | Where-Object {
+                    -not [string]::IsNullOrWhiteSpace($_)
+                } | Out-String).Trim()
+            if ([string]::IsNullOrWhiteSpace($message)) {
+                $message = "command failed with exit code $($process.ExitCode): $FilePath $($Arguments -join ' ')"
+            }
+            throw $message
+        }
+        $trimmedOutput = (@($stdout, $stderr) | Where-Object {
+                -not [string]::IsNullOrWhiteSpace($_)
+            } | Out-String).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($trimmedOutput)) {
+            [Console]::Error.WriteLine($trimmedOutput)
         }
     } finally {
+        Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
         if ($WorkingDirectory) {
             Pop-Location
         }
@@ -147,6 +173,7 @@ $manifestSource = Resolve-ExistingPath -Path $manifestTemplatePath -Description 
 $installScriptPath = Resolve-ExistingPath -Path (Join-Path $resolvedRepoRoot "packaging\windows\install.ps1") -Description "windows install script"
 $uninstallScriptPath = Resolve-ExistingPath -Path (Join-Path $resolvedRepoRoot "packaging\windows\uninstall.ps1") -Description "windows uninstall script"
 $releaseVerifierScriptPath = Resolve-ExistingPath -Path (Join-Path $resolvedRepoRoot "packaging\windows\verify-release.ps1") -Description "windows release verifier"
+$msiBuildScriptPath = Resolve-ExistingPath -Path (Join-Path $resolvedRepoRoot "scripts\windows\build-msi.ps1") -Description "windows msi build script"
 $driverBuildScriptPath = Resolve-ExistingPath -Path (Join-Path $resolvedRepoRoot "scripts\windows\build-driver.ps1") -Description "windows driver build script"
 $driverInstallScriptPath = Resolve-ExistingPath -Path (Join-Path $resolvedRepoRoot "scripts\windows\install-driver.ps1") -Description "windows driver install script"
 $driverUninstallScriptPath = Resolve-ExistingPath -Path (Join-Path $resolvedRepoRoot "scripts\windows\uninstall-driver.ps1") -Description "windows driver uninstall script"
@@ -165,6 +192,16 @@ if ($ToolchainRoot) {
     $rustcExecutable = Resolve-ExistingPath -Path (Join-Path $resolvedToolchainRoot "bin\rustc.exe") -Description "offline rustc executable"
     $rustdocExecutable = Resolve-ExistingPath -Path (Join-Path $resolvedToolchainRoot "bin\rustdoc.exe") -Description "offline rustdoc executable"
     $toolchainBinPath = Resolve-ExistingPath -Path (Join-Path $resolvedToolchainRoot "bin") -Description "offline toolchain bin directory"
+} else {
+    $candidateOfflineRoot = "C:\ProgramData\Aegis\toolchains\$RustToolchain"
+    if (Test-Path -LiteralPath $candidateOfflineRoot) {
+        $resolvedToolchainRoot = Resolve-ExistingPath -Path $candidateOfflineRoot -Description "detected offline rust toolchain root"
+        $cargoExecutable = Resolve-ExistingPath -Path (Join-Path $resolvedToolchainRoot "bin\cargo.exe") -Description "detected offline cargo executable"
+        $rustcExecutable = Resolve-ExistingPath -Path (Join-Path $resolvedToolchainRoot "bin\rustc.exe") -Description "detected offline rustc executable"
+        $rustdocExecutable = Resolve-ExistingPath -Path (Join-Path $resolvedToolchainRoot "bin\rustdoc.exe") -Description "detected offline rustdoc executable"
+        $toolchainBinPath = Resolve-ExistingPath -Path (Join-Path $resolvedToolchainRoot "bin") -Description "detected offline toolchain bin directory"
+        $ToolchainRoot = $resolvedToolchainRoot
+    }
 }
 
 if ($BundleChannel -eq "release") {
@@ -262,6 +299,9 @@ Copy-Item -LiteralPath (Join-Path $cargoTargetRoot "release\aegis-watchdog.exe")
 Copy-Item -LiteralPath (Join-Path $cargoTargetRoot "release\aegis-updater.exe") -Destination (Join-Path $PayloadRoot "bin\aegis-updater.exe") -Force
 Copy-Item -LiteralPath $driverInstallScriptPath -Destination (Join-Path $PayloadRoot "scripts\windows-install-driver.ps1") -Force
 Copy-Item -LiteralPath $driverUninstallScriptPath -Destination (Join-Path $PayloadRoot "scripts\windows-uninstall-driver.ps1") -Force
+Copy-Item -LiteralPath $installScriptPath -Destination (Join-Path $PayloadRoot "install.ps1") -Force
+Copy-Item -LiteralPath $uninstallScriptPath -Destination (Join-Path $PayloadRoot "uninstall.ps1") -Force
+Copy-Item -LiteralPath $releaseVerifierScriptPath -Destination (Join-Path $PayloadRoot "verify-release.ps1") -Force
 Copy-Item -LiteralPath $driverSourceRoot -Destination (Join-Path $PayloadRoot "driver") -Recurse -Force
 
 Invoke-External -FilePath "powershell" -Arguments @(
@@ -281,6 +321,9 @@ Invoke-External -FilePath "powershell" -Arguments @(
 
 $releaseSignResult = $null
 $payloadReleaseVerification = $null
+$msiBuildResult = $null
+$msiInstallLogPath = Join-Path $PayloadRoot "aegis-install-msi.log"
+$msiUninstallLogPath = Join-Path $PayloadRoot "aegis-uninstall-msi.log"
 if ($BundleChannel -eq "release") {
     $releaseSignResult = & powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $releaseSignScriptPath `
         -BundleRoot $PayloadRoot `
@@ -305,18 +348,53 @@ if ($BundleChannel -eq "release") {
     $payloadReleaseVerification = $payloadReleaseVerification | ConvertFrom-Json -ErrorAction Stop
 }
 
-$installJson = & powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $installScriptPath `
-    -PayloadRoot $PayloadRoot `
-    -InstallRoot $InstallRoot `
-    -StateRoot $StateRoot
-if ($LASTEXITCODE -ne 0) {
-    throw "windows install validation failed"
+$msiBuildArguments = @(
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    $msiBuildScriptPath,
+    "-PayloadRoot",
+    $PayloadRoot,
+    "-OutputRoot",
+    (Join-Path $PayloadRoot "msi"),
+    "-BundleChannel",
+    $BundleChannel
+)
+if ($BundleChannel -eq "release") {
+    $msiBuildArguments += @(
+        "-SigningCertificateThumbprint",
+        $SigningCertificateThumbprint,
+        "-SigningCertificateStorePath",
+        $SigningCertificateStorePath,
+        "-TimestampServer",
+        $TimestampServer
+    )
 }
-$installResult = $installJson | ConvertFrom-Json -ErrorAction Stop
+$msiBuildJson = & powershell @msiBuildArguments
+if ($LASTEXITCODE -ne 0) {
+    throw "windows msi build validation failed"
+}
+$msiBuildResult = $msiBuildJson | ConvertFrom-Json -ErrorAction Stop
+
+$msiInstallProcess = Start-Process -FilePath "msiexec.exe" -ArgumentList @(
+        "/i",
+        [string]$msiBuildResult.msi_path,
+        "/qn",
+        "/norestart",
+        "/l*v",
+        $msiInstallLogPath
+    ) -Wait -PassThru
+if ($msiInstallProcess.ExitCode -ne 0) {
+    throw "windows msi install validation failed with exit code $($msiInstallProcess.ExitCode)"
+}
 
 $bootstrapReportPath = Join-Path $StateRoot "bootstrap-check.json"
 $watchdogSnapshotPath = Join-Path $StateRoot "watchdog-state.json"
 $installResultPath = Join-Path $StateRoot "install-result.json"
+$installedManifestPath = Join-Path $InstallRoot "manifest.json"
+$installResult = Get-Content -LiteralPath $installResultPath -Raw | ConvertFrom-Json -ErrorAction Stop
 $bootstrapReport = Get-Content -LiteralPath $bootstrapReportPath -Raw | ConvertFrom-Json -ErrorAction Stop
 $watchdogSnapshot = Get-Content -LiteralPath $watchdogSnapshotPath -Raw | ConvertFrom-Json -ErrorAction Stop
 
@@ -331,12 +409,22 @@ if ($watchdogSnapshot.alerts.Count -gt 0) {
     $requiredFailures.Add("watchdog_alerts") | Out-Null
 }
 
-& powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $uninstallScriptPath `
-    -InstallRoot $InstallRoot `
-    -StateRoot $StateRoot `
-    -RemoveStateRoot | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    throw "windows uninstall validation failed"
+$msiUninstallProcess = Start-Process -FilePath "msiexec.exe" -ArgumentList @(
+        "/x",
+        [string]$msiBuildResult.msi_path,
+        "/qn",
+        "/norestart",
+        "/l*v",
+        $msiUninstallLogPath
+    ) -Wait -PassThru
+if ($msiUninstallProcess.ExitCode -ne 0) {
+    throw "windows msi uninstall validation failed with exit code $($msiUninstallProcess.ExitCode)"
+}
+if (Test-Path -LiteralPath $InstallRoot) {
+    $requiredFailures.Add("install_root_cleanup") | Out-Null
+}
+if (Test-Path -LiteralPath $StateRoot) {
+    $requiredFailures.Add("state_root_cleanup") | Out-Null
 }
 
 [ordered]@{
@@ -344,6 +432,11 @@ if ($LASTEXITCODE -ne 0) {
     validated_at = (Get-Date).ToString("o")
     repo_root = $resolvedRepoRoot
     payload_root = $PayloadRoot
+    msi_build_result = $msiBuildResult
+    msi_install_log_path = $msiInstallLogPath
+    msi_uninstall_log_path = $msiUninstallLogPath
+    msi_install_exit_code = $msiInstallProcess.ExitCode
+    msi_uninstall_exit_code = $msiUninstallProcess.ExitCode
     install_root = $InstallRoot
     state_root = $StateRoot
     install_result_path = $installResultPath
