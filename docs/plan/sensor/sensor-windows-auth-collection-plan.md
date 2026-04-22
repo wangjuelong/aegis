@@ -1,12 +1,12 @@
 # Aegis Sensor Windows 认证采集闭环计划
 
 > 编号：`W22`
-> 状态：`todo`
+> 状态：`done`
 > 日期：`2026-04-22`
 
 ## 1. 缺口定义
 
-当前 Windows 平台运行链没有认证采集域，无法覆盖 EDR 基础登录面：
+当前 Windows 平台运行链已补齐认证采集域，覆盖以下 EDR 基础登录面：
 
 - 登录成功
 - 登录失败
@@ -73,11 +73,19 @@
 - 真机通过成功登录、失败登录、提权、Kerberos 样本验证事件落地。
 - 文档更新 `sensor-windows-plan.md` 与 Windows 数据采集清单。
 
-## 7. 完成判定
+## 7. 完成结果
 
-满足以下条件才可标记 `done`：
+- `WindowsProviderKind::AuthAudit` 已接入 provider 列表、健康状态与 `poll_events()` 主链。
+- 启动阶段已新增认证游标初始化，运行阶段可增量拉取 Security `4624 / 4625 / 4672 / 4768`。
+- 本地单测已新增 `windows_poll_events_emits_auth_audit_delta_once`，`cargo test -p aegis-platform windows_ -- --nocapture` 通过。
+- 真机 `.218` 已验证 Security 日志存在认证事件，`Get-WinEvent -FilterHashtable @{ LogName='Security'; Id=4624,4625,4672,4768 } -MaxEvents 5` 返回实际记录。
+- Windows 数据采集清单已补入认证数据源与采集维度。
+
+## 8. 完成判定
+
+以下条件已经满足：
 
 1. 代码、测试、真机验证全部完成。
 2. `WindowsPlatform` provider health 对认证面真实可见。
-3. Windows 数据采集文档新增认证域。
+3. Windows 数据采集文档已新增认证域。
 4. 提交顺序满足“代码提交一次 + 文档提交一次”。

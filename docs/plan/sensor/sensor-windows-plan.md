@@ -41,7 +41,7 @@ Windows 平台目标覆盖：
 - `W06.2` 已完成：`block_network/clear_all_blocks` 已接入真实 Windows 防火墙与 Minifilter 双清理链；`block_hash/block_pid/block_path` 已通过 `W16` 收口为真实 preemptive block。
 - `W07.1` 已完成：仓库已新增 `scripts/windows-runtime-verify.sh` / `scripts/windows-runtime-verify.ps1` 真机验收脚本，并在 `192.168.2.218` 跑通完整矩阵；详细结果见 `docs/plan/sensor/sensor-windows-validation-matrix.md`。
 - `W08.1` 已完成：`aegis-core` 已接入 Windows 专用 DPAPI 主密钥与回滚锚点实现，诊断状态会输出 `provider_detail`、Windows TPM 可用性与回滚锚点状态；并已在 `192.168.2.218` 实测拿到 `tpm_present=true`、`tpm_ready=true` 和 DPAPI machine/user scope 往返成功结果。
-- 早先代码审查确认的驱动/保护面缺口已经收口，但围绕“Windows 是否满足 EDR 级数据采集要求”的再审查又识别出 5 个新增缺口，当前尚未完成。
+- 早先代码审查确认的驱动/保护面缺口已经收口，但围绕“Windows 是否满足 EDR 级数据采集要求”的再审查又识别出 5 个新增缺口；其中 `W22` 已完成，当前还剩 4 个未完成。
 - 当前 Windows 打包链已经补齐真实 MSI 工程，`.218` 可通过 `scripts/windows-package-verify.sh` 完成 `.msi` 构建、`msiexec /i`、bootstrap-check、watchdog 与 `msiexec /x` 闭环。
 - `W11/W15` 已完成：`ObRegisterCallbacks` 进程保护、Minifilter 路径保护、注册表真实 pre-callback 阻断与驱动完整性回执均已接入，保护面工件只反映真实已下发状态。
 - `W12` 已完成：共享脚本解码、AMSI 脚本阻断/告警链、PowerShell 4104 脚本块事件与内存快照增量已接入，`192.168.2.218` 已验证 benign script 事件捕获和官方 AMSI 测试样本阻断。
@@ -52,7 +52,7 @@ Windows 平台目标覆盖：
 - `W18` 已完成：`block_hash` 已切到 create 返回前的严格预阻断，`.222` 上 `preemptive_blocking` 再次返回 `required_failures=[]`。
 - `W19` 已完成：`clear_all_blocks()` 已解耦 firewall / Minifilter 两个平面，部分成功结果与残留块会显式写入工件，本地单测与 `.222` 正常整机验收均已通过。
 - `W20` 已完成：`supports_amsi` / `AmsiStatus` 现在要求真实 `strict_block_ready`；`.222` 上 strict blocking 仍不可用，但平台已显式声明 unsupported，不再 overclaim。
-- 因此仓库侧 Windows 保护面缺口已清零，但 Windows EDR 数据采集面仍保持 `doing`，除正式 AMSI strict-block 验证主机前置条件外，还需继续收口认证、深度网络、细粒度进程线程模块、Device/Pipe/VSS 行为、内存注入/YARA 五个采集缺口。
+- 因此仓库侧 Windows 保护面缺口已清零，但 Windows EDR 数据采集面仍保持 `doing`，除正式 AMSI strict-block 验证主机前置条件外，还需继续收口深度网络、细粒度进程线程模块、Device/Pipe/VSS 行为、内存注入/YARA 四个采集缺口；认证采集 `W22` 已完成。
 
 ## 5. Windows 研发计划与状态
 
@@ -127,7 +127,7 @@ Windows 平台目标覆盖：
 | W13 | 打包、看门狗、自举与发布前自检 | done | 不允许继续把系统级交付等同于单个 `powershell.exe` 运行时；安装链必须显式校验驱动/服务/依赖 | 已完成开发包 manifest/install/uninstall/validate、`aegis-agentd` 首启配置与 bootstrap 检查、`aegis-watchdog --once` 状态快照，以及 `192.168.2.218` 真机安装/回滚闭环 |
 | W14 | 正式签名、兼容性矩阵与发布验证 | done | 不允许把自签名或未验签产物标记为正式发布；无签名凭据必须严格失败 | 已完成 release manifest、签名/验签脚本、安装前后 release gate、支持矩阵文档与 `192.168.2.218` 真机发布验收 |
 | W21 | Windows MSI 工程 | done | 不允许继续把 payload/install gate 写成 MSI；必须产出真实 `.msi` 并在 `.218` 上完成 `msiexec /i` / `msiexec /x` 闭环 | 已完成 MSI 构建脚本、自定义动作、`validate.ps1` / `windows-package-verify.sh` 真机验收链，`.218` 返回 `required_failures=[]` |
-| W22 | Windows 认证采集闭环 | todo | 不允许继续缺失认证域；必须覆盖 `4624/4625/4672/4768` 并进入主事件流 | 详见 `sensor-windows-auth-collection-plan.md` |
+| W22 | Windows 认证采集闭环 | done | 不允许继续缺失认证域；必须覆盖 `4624/4625/4672/4768` 并进入主事件流 | 已完成 `AuthAudit` provider、认证游标、Security 日志增量拉取与真机验证；详见 `sensor-windows-auth-collection-plan.md` |
 | W23 | Windows 深度网络遥测闭环 | todo | 不允许继续只有连接清单差分；必须补齐 DNS/TLS 元数据 | 详见 `sensor-windows-network-deep-telemetry-plan.md` |
 | W24 | Windows 进程线程模块细粒度采集闭环 | todo | 不允许继续只有进程快照和模块可见性；必须补齐线程、镜像路径和签名上下文 | 详见 `sensor-windows-process-thread-module-plan.md` |
 | W25 | Windows Device / Pipe / VSS 行为采集闭环 | todo | 不允许继续只有 visible/gone 资产视图；必须补齐行为事件 | 详见 `sensor-windows-device-pipe-vss-behavior-plan.md` |
@@ -159,7 +159,7 @@ Windows 平台目标覆盖：
 - Windows 真实系统级交付：`doing`
 - Windows 正式签名、发布验证：`done`
 - Windows MSI 工程：`done`
-- Windows 认证采集闭环：`todo`
+- Windows 认证采集闭环：`done`
 - Windows 深度网络遥测闭环：`todo`
 - Windows 进程线程模块细粒度采集闭环：`todo`
 - Windows Device / Pipe / VSS 行为采集闭环：`todo`
@@ -192,7 +192,7 @@ Windows 平台目标覆盖：
 - `W13 = done`
 - `W14 = done`
 - `W21 = done`
-- `W22 = todo`
+- `W22 = done`
 - `W23 = todo`
 - `W24 = todo`
 - `W25 = todo`
@@ -206,5 +206,5 @@ Windows 专项的最终目标不变：
 2. 再补齐真正的 Windows 驱动工程、文件/注册表/脚本/内存系统采集与保护链
 3. 先补齐带 Defender strict-block 的正式 Windows 验证主机
 4. 再保持 `block_hash/pid/path`、注册表保护、目标路径阻断、脚本/内存、安装/签名链在新增 Windows 主机上的持续回归验收
-5. 再完成 `W22-W26` 五个 Windows EDR 数据采集缺口
+5. 再完成 `W23-W26` 四个 Windows EDR 数据采集缺口
 6. 再将真机兼容性矩阵从 `192.168.2.218 / 192.168.2.222` 扩展到更多 Windows 版本与硬件形态
