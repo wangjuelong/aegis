@@ -18,7 +18,7 @@ cd "$REPO_ROOT"
 run_cargo test -p aegis-core sidecar_and_daemonset_contracts_validate_expected_constraints -- --nocapture >/dev/null
 run_cargo test -p aegis-core container_detection_engine_flags_escape_and_lateral_signals -- --nocapture >/dev/null
 run_cargo run -p aegis-core --example runtime_sdk_connector >/tmp/aegis-runtime-sdk-rust.out 2>/dev/null
-python3 packaging/linux/runtime-sdk/python/example.py >/tmp/aegis-runtime-sdk-python.out
+PYTHONDONTWRITEBYTECODE=1 python3 -B packaging/linux/runtime-sdk/python/example.py >/tmp/aegis-runtime-sdk-python.out
 node packaging/linux/runtime-sdk/node/example.mjs >/tmp/aegis-runtime-sdk-node.out
 (cd packaging/linux/runtime-sdk/go/example && go run .) >/tmp/aegis-runtime-sdk-go.out
 java_build_dir=$(mktemp -d)
@@ -26,7 +26,7 @@ javac -d "$java_build_dir" $(find packaging/linux/runtime-sdk/java/src/main/java
 java -cp "$java_build_dir" io.aegis.runtime.RuntimeExample >/tmp/aegis-runtime-sdk-java.out
 rm -rf "$java_build_dir"
 docker run --rm -v "$REPO_ROOT:/workspace" -w /workspace mcr.microsoft.com/dotnet/sdk:8.0 \
-  dotnet run --project packaging/linux/runtime-sdk/dotnet/Aegis.Runtime.Example.csproj >/tmp/aegis-runtime-sdk-dotnet.out 2>/dev/null
+  bash -lc 'set -euo pipefail; rm -rf /tmp/aegis-dotnet-sdk && mkdir -p /tmp/aegis-dotnet-sdk && cp -a /workspace/packaging/linux/runtime-sdk/dotnet/. /tmp/aegis-dotnet-sdk/ && dotnet run --project /tmp/aegis-dotnet-sdk/Aegis.Runtime.Example.csproj' >/tmp/aegis-runtime-sdk-dotnet.out 2>/dev/null
 
 python3 - <<'PY' "$REPO_ROOT" "/tmp/aegis-runtime-sdk-rust.out" "/tmp/aegis-runtime-sdk-python.out" "/tmp/aegis-runtime-sdk-node.out" "/tmp/aegis-runtime-sdk-go.out" "/tmp/aegis-runtime-sdk-java.out" "/tmp/aegis-runtime-sdk-dotnet.out"
 import json
