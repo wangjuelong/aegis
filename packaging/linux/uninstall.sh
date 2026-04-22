@@ -95,13 +95,22 @@ while IFS= read -r line; do
   fi
 done < <(manifest_stream)
 
+removed_paths=()
 for unit in "${service_units[@]}"; do
   systemctl disable --now "$unit" >/dev/null 2>&1 || true
   rm -f "/etc/systemd/system/$unit"
 done
 systemctl daemon-reload
 
-removed_paths=()
+for path in \
+  "/etc/udev/rules.d/99-aegis-removable.rules" \
+  "/etc/usbguard/rules.conf"; do
+  if [[ -e "$path" ]]; then
+    rm -f "$path"
+    removed_paths+=("$path")
+  fi
+done
+
 for path in "$INSTALL_ROOT" "$STATE_ROOT" "$CONFIG_ROOT"; do
   if [[ -n "$path" && -e "$path" ]]; then
     rm -rf "$path"
