@@ -42,7 +42,7 @@ Windows 平台目标覆盖：
 - `W07.1` 已完成：仓库已新增 `scripts/windows-runtime-verify.sh` / `scripts/windows-runtime-verify.ps1` 真机验收脚本，并在 `192.168.2.218` 跑通完整矩阵；详细结果见 `docs/plan/sensor/sensor-windows-validation-matrix.md`。
 - `W08.1` 已完成：`aegis-core` 已接入 Windows 专用 DPAPI 主密钥与回滚锚点实现，诊断状态会输出 `provider_detail`、Windows TPM 可用性与回滚锚点状态；并已在 `192.168.2.218` 实测拿到 `tpm_present=true`、`tpm_ready=true` 和 DPAPI machine/user scope 往返成功结果。
 - 新一轮代码审查确认的 4 个代码/设计缺口已经全部收口。
-- 当前 Windows 打包链已完成 payload/install/release gate，但仍未补齐真正的 MSI 工程。
+- 当前 Windows 打包链已经补齐真实 MSI 工程，`.218` 可通过 `scripts/windows-package-verify.sh` 完成 `.msi` 构建、`msiexec /i`、bootstrap-check、watchdog 与 `msiexec /x` 闭环。
 - `W11/W15` 已完成：`ObRegisterCallbacks` 进程保护、Minifilter 路径保护、注册表真实 pre-callback 阻断与驱动完整性回执均已接入，保护面工件只反映真实已下发状态。
 - `W12` 已完成：共享脚本解码、AMSI 脚本阻断/告警链、PowerShell 4104 脚本块事件与内存快照增量已接入，`192.168.2.218` 已验证 benign script 事件捕获和官方 AMSI 测试样本阻断。
 - `W13` 已完成：开发包安装/卸载、自举自检、watchdog 状态快照、失败回滚与远端打包验证已经闭环，真机 `validate.ps1` 返回 `required_failures=[]`。
@@ -126,7 +126,7 @@ Windows 平台目标覆盖：
 | W12 | 脚本/AMSI/内存信号闭环 | done | 不允许继续把 `AmsiScript`/`MemorySensor` 固定为未实现；脚本能力不能只停留在日志健康面 | 已完成共享脚本解码、AMSI 扫描/阻断、PowerShell 4104 事件桥接、内存快照增量事件与真机验收 |
 | W13 | 打包、看门狗、自举与发布前自检 | done | 不允许继续把系统级交付等同于单个 `powershell.exe` 运行时；安装链必须显式校验驱动/服务/依赖 | 已完成开发包 manifest/install/uninstall/validate、`aegis-agentd` 首启配置与 bootstrap 检查、`aegis-watchdog --once` 状态快照，以及 `192.168.2.218` 真机安装/回滚闭环 |
 | W14 | 正式签名、兼容性矩阵与发布验证 | done | 不允许把自签名或未验签产物标记为正式发布；无签名凭据必须严格失败 | 已完成 release manifest、签名/验签脚本、安装前后 release gate、支持矩阵文档与 `192.168.2.218` 真机发布验收 |
-| W21 | Windows MSI 工程 | todo | 不允许继续把 payload/install gate 写成 MSI；必须产出真实 `.msi` 并在 `.218` 上完成 `msiexec /i` / `msiexec /x` 闭环 | 当前仓库还缺 WiX/MSI 项目与 MSI 真机验收链 |
+| W21 | Windows MSI 工程 | done | 不允许继续把 payload/install gate 写成 MSI；必须产出真实 `.msi` 并在 `.218` 上完成 `msiexec /i` / `msiexec /x` 闭环 | 已完成 MSI 构建脚本、自定义动作、`validate.ps1` / `windows-package-verify.sh` 真机验收链，`.218` 返回 `required_failures=[]` |
 
 ## 6. Windows 完成判定
 
@@ -153,6 +153,7 @@ Windows 平台目标覆盖：
 - Windows 打包、看门狗、自举与发布前自检：`done`
 - Windows 真实系统级交付：`doing`
 - Windows 正式签名、发布验证：`done`
+- Windows MSI 工程：`done`
 
 因此，本文件中的平台状态应保持：
 
@@ -180,7 +181,7 @@ Windows 平台目标覆盖：
 - `W12 = done`
 - `W13 = done`
 - `W14 = done`
-- `W21 = todo`
+- `W21 = done`
 
 ## 7. Windows 后续执行顺序
 

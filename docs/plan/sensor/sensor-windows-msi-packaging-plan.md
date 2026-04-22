@@ -1,5 +1,7 @@
 # Windows MSI 工程计划
 
+> 当前状态：`done`
+
 ## 1. 目标
 
 把当前 Windows `payload + install.ps1 + validate.ps1` 的开发包交付链升级为真正的 MSI 工程，保证：
@@ -10,11 +12,11 @@
 - MSI 卸载可清理驱动、安装目录与状态目录
 - release MSI 仍保留签名、ELAM、PPL 批准物料的严格 gate
 
-## 2. 当前缺口
+## 2. 原始缺口
 
-- 文档承诺 Windows 安装包为 `MSI`，但仓库当前实现是 payload 目录 + `install.ps1`/`validate.ps1`，不是 MSI 工程。
-- 当前 `windows-package-verify.sh` 只远端调用 `validate.ps1`，不产出 MSI。
-- 当前仓库没有 WiX/MSI 项目、MSI 构建脚本或 MSI 安装/卸载验收链。
+- 文档承诺 Windows 安装包为 `MSI`，但仓库原先实现是 payload 目录 + `install.ps1`/`validate.ps1`，不是 MSI 工程。
+- 原先 `windows-package-verify.sh` 只远端调用 `validate.ps1`，不产出 MSI。
+- 原先仓库没有 WiX/MSI 项目、MSI 构建脚本或 MSI 安装/卸载验收链。
 
 ## 3. 不妥协约束
 
@@ -28,7 +30,7 @@
 ### 4.1 MSI 项目
 
 - 新增 `packaging/windows/msi/`
-- 使用 WiX SDK 构建 `.msi`
+- 使用 WiX CLI + `WixToolset.Util.wixext` 构建真实 `.msi`
 - 定义：
   - 产品元数据
   - 安装目录
@@ -65,6 +67,7 @@
 ## 5. 交付物
 
 - `packaging/windows/msi/`
+- `scripts/windows/build-msi.ps1`
 - `packaging/windows/validate.ps1`
 - `scripts/windows-package-verify.sh`
 - `docs/plan/sensor/sensor-windows-plan.md`
@@ -76,3 +79,28 @@
 - `.218` 完成 `msiexec /i`、bootstrap-check、watchdog、`msiexec /x`
 - release MSI gate 保持严格失败
 - 文档状态同步更新
+
+## 7. 完成结果
+
+- 已新增 `scripts/windows/build-msi.ps1`，可基于 staged payload 生成真实 `AegisSensor-<channel>-x64.msi`
+- MSI 已纳入 `packaging/windows/validate.ps1` 的正式验收链，安装阶段执行 `install.ps1 -PayloadAlreadyInstalled`，卸载阶段执行 `uninstall.ps1 -SkipInstallRootCleanup -RemoveStateRoot`
+- `scripts/windows-package-verify.sh` 已收口为：
+  - 本地 `cargo vendor`
+  - tar 流同步仓库与 `vendor/`
+  - `.218` 远端构建 Rust 二进制 / 驱动
+  - `.218` 真实 `msiexec /i` / `msiexec /x`
+  - 输出纯 JSON 结果
+
+## 8. 验收记录
+
+- Windows 真机：`192.168.2.218`
+- 官方入口：`./scripts/windows-package-verify.sh`
+- 本地工件：`target/windows-package-validation/192.168.2.218.json`
+- 最新入口结果：
+  - `required_failures=[]`
+  - `msi_install_exit_code=0`
+  - `msi_uninstall_exit_code=0`
+- 远端快速复验：
+  - 主机：`192.168.2.218`
+  - 时间：`2026-04-22 15:02:40 +08:00`
+  - 结果：`required_failures=[]`

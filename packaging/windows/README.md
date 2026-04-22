@@ -1,6 +1,6 @@
 # Aegis Windows Packaging
 
-本目录保存 Windows 开发包的安装清单、安装/卸载脚本与真机验证脚本。
+本目录保存 Windows MSI / payload 双阶段打包清单、安装/卸载脚本与真机验证入口。
 
 ## 目录内容
 
@@ -9,13 +9,15 @@
 - `install.ps1`：开发包安装脚本，负责复制 payload、生成配置、安装驱动、执行首启自检与 watchdog 一次性验证
 - `uninstall.ps1`：回滚/卸载脚本，负责停止并删除驱动服务、移除已安装文件
 - `verify-release.ps1`：对 release payload 执行 receipt/CMS/Authenticode/批准文件依赖校验
-- `validate.ps1`：在 Windows 主机上完成本地构建、payload 组装、签名、安装、自检、watchdog 验证与卸载
+- `msi/`：MSI 工程说明目录
+- `validate.ps1`：在 Windows 主机上完成本地构建、payload 组装、MSI 构建、签名、安装、自检、watchdog 验证与卸载
+- `scripts/windows/build-msi.ps1`：基于 staged payload 生成真实 `.msi`，并注入安装/卸载自定义动作
 - `scripts/windows-sign-driver.ps1`：对 release payload 中的 EXE/脚本/驱动/CAT 产物完成签名并生成 detached CMS receipt
-- `scripts/windows-package-verify.sh`：从 macOS/Linux 主机通过 SSH 把仓库 payload 发到 Windows 主机，并远端调用 `validate.ps1`
+- `scripts/windows-package-verify.sh`：从 macOS/Linux 主机通过 SSH 同步仓库与 vendored crates，远端调用 `validate.ps1`
 
 ## Payload 约定
 
-安装脚本消费一个已经组装好的 payload 目录，默认结构如下：
+MSI 构建脚本消费一个已经组装好的 staged payload 目录，默认结构如下：
 
 ```text
 payload/
@@ -36,6 +38,19 @@ payload/
 - `bin/` 中的三个可执行文件必须由当前仓库源码构建得到
 - `driver/` 必须包含驱动工程目录；验证脚本会先在目标 Windows 主机上构建它
 - `scripts/` 目录中的驱动安装/卸载脚本来自仓库根目录 `scripts/`
+
+## 打包形态
+
+当前仓库维护两层打包形态：
+
+- staged payload：供 `install.ps1` / `verify-release.ps1` / `build-msi.ps1` 消费
+- 真实 MSI：由 `build-msi.ps1` 生成，使用 `msiexec /i` / `msiexec /x` 执行安装卸载
+
+MSI 自定义动作约束：
+
+- 安装阶段执行 `install.ps1 -PayloadAlreadyInstalled`
+- 卸载阶段执行 `uninstall.ps1 -SkipInstallRootCleanup -RemoveStateRoot`
+- 安装前后都保留 bootstrap-check / watchdog / release gate 的严格失败语义
 
 ## 开发包与正式包
 
@@ -76,6 +91,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\packaging\windows\validate
 验证脚本会输出一个 JSON 结果，其中：
 
 - `required_failures=[]` 表示安装、自检、watchdog 与卸载闭环通过
+- `msi_build_result.msi_path` 指向真实 MSI 产物
+- `msi_install_log_path` / `msi_uninstall_log_path` 指向 `msiexec` 日志
 - `install_result_path` 指向安装结果工件
 - `bootstrap_report_path` 与 `watchdog_snapshot_path` 指向首启自检和 watchdog 状态工件
 
@@ -106,10 +123,10 @@ AEGIS_WINDOWS_WATCHDOG_PPL_APPROVAL_FILE=/local/path/ppl-approved.txt \
 ## 已验证场景
 
 - 真机：`192.168.2.218` (`DESKTOP-TLASHJG`)
-- 验证时间：`2026-04-20 20:22:37 +08:00`
-- payload 根目录：`C:\ProgramData\Aegis\validation\windows-package-verify-20260420-200129`
+- 验证时间：`2026-04-22 14:59:40 +08:00`
+- payload 根目录：`C:\ProgramData\Aegis\validation\windows-package-verify-20260422-145307`
 - 离线工具链：`C:\ProgramData\Aegis\toolchains\1.91.0`
-- 结果：`required_failures=[]`，安装结果、自检工件、watchdog 工件全部生成
+- 结果：`required_failures=[]`，真实 MSI 构建、`msiexec /i`、自检、watchdog、`msiexec /x` 全部通过
 
 release 补充验证：
 
